@@ -274,8 +274,8 @@ fn load_elf_kernel(
 
     eprintln!(
         "[NKR]   └─ Kernel end: {:#X} ({} KiB cargados)",
-        load_result.kernel_end.raw_value(),
-        (load_result.kernel_end.raw_value() - entry) >> 10
+        load_result.kernel_end,
+        (load_result.kernel_end - entry) >> 10
     );
 
     Ok(entry)
