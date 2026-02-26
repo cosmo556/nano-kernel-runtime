@@ -1,0 +1,25 @@
+# A. Escribir el código fuente del test
+cat << 'EOF' > test-kernel.asm
+BITS 64
+SECTION .text
+global _start
+
+_start:
+    mov rsi, message
+    mov rcx, message_len
+.loop:
+    lodsb               ; Carga el siguiente byte de RSI en AL
+    out 0x3F8, al       ; Lo envía al puerto serial COM1 (0x3F8)
+    loop .loop          ; Repite hasta que RCX sea 0
+    hlt                 ; Detiene la vCPU (VMEXIT Hlt)
+
+SECTION .rodata
+message: db "¡Hola NKR! Petición desde el Ring 0 recibida.", 10
+message_len equ $ - message
+EOF
+
+# B. Ensamblar (convertir .asm a objeto .o)
+nasm -f elf64 test-kernel.asm -o test-kernel.o
+
+# C. Enlazar (Crear el ejecutable ELF estático en la dirección 0x100000)
+ld -o test-kernel.img -Ttext 0x100000 --oformat elf64-x86-64 test-kernel.o
