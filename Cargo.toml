@@ -1,0 +1,52 @@
+[package]
+name = "nkr"
+version = "0.1.0"
+edition = "2021"
+authors = ["NKR Contributors"]
+description = """
+Nano-Kernel Runtime (NKR) — Hipervisor bare-metal customizado que reemplaza Docker
+para ejecutar unikernels directamente sobre /dev/kvm sin dependencias externas.
+"""
+license = "MIT"
+readme = "README.md"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dependencias del ecosistema rust-vmm
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Todas las crates provienen del proyecto rust-vmm (https://github.com/rust-vmm),
+# la base compartida de hipervisores como Firecracker y Cloud Hypervisor.
+#
+# Política de versiones: se fijan versiones menores para garantizar
+# compatibilidad cruzada entre crates del ecosistema.
+# ══════════════════════════════════════════════════════════════════════════════
+
+[dependencies]
+
+# kvm-ioctls: Wrappers seguros sobre los ioctls de /dev/kvm.
+# Provee Kvm (fd global), VmFd (instancia de VM) y VcpuFd (hilo de ejecución).
+kvm-ioctls = "0.16"
+
+# kvm-bindings: Structs FFI que mapean 1:1 a las estructuras del kernel Linux
+# para KVM (kvm_regs, kvm_sregs, kvm_userspace_memory_region, etc.).
+# Feature "fam-wrappers": wrappers seguros para structs de longitud variable
+# como kvm_cpuid2 (necesario para CPUID passthrough).
+kvm-bindings = { version = "0.7", features = ["fam-wrappers"] }
+
+# vm-memory: Abstracción de la memoria física del guest.
+# GuestMemoryMmap crea regiones mmap anónimas que KVM mapea al espacio
+# de direcciones físicas del guest (GPA → HVA).
+# Feature "backend-mmap": habilita el backend basado en mmap(2).
+vm-memory = { version = "0.14", features = ["backend-mmap"] }
+
+# linux-loader: Parser y cargador de imágenes de kernel.
+# Soporta ELF (unikernels, kernels custom) y bzImage (kernel Linux estándar).
+# Inyecta los segmentos PT_LOAD directamente en GuestMemory.
+linux-loader = { version = "0.11", features = ["elf", "bzimage"] }
+
+[profile.release]
+opt-level = 3
+lto = true          # Link-Time Optimization — binario más pequeño y rápido
+strip = true        # Eliminar símbolos de debug del binario final
+codegen-units = 1   # Máxima optimización (sacrifica tiempo de compilación)
+panic = "abort"     # Sin stack unwinding — reduce tamaño del binario
