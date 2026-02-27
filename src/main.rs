@@ -7,13 +7,17 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::process;
 use std::convert::TryInto;
-// use std::os::unix::io::AsRawFd;
+use kvm_ioctls::IoEventAddress;
 
 use kvm_bindings::{kvm_segment, kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use linux_loader::loader::bzimage::BzImage;
 use linux_loader::loader::KernelLoader;
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+
+use std::sync::Arc;
+mod block; // Conecta nuestro nuevo archivo block.rs
+use block::VirtioBlockDevice;
 
 const GUEST_RAM_SIZE: usize = 512 << 20; // 512 MiB
 const COM1_PORT: u16 = 0x3F8;
@@ -56,8 +60,23 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     vm.create_pit2(pit_config).map_err(|e| format!("Fallo al crear PIT: {e}"))?;
     // --------------------------------------------------------
     
-    let guest_mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x0), GUEST_RAM_SIZE)])
-        .map_err(|e| format!("Fallo mmap RAM: {e}"))?;
+    // 1. Inicializar la RAM
+    let guest_mem = Arc::new(GuestMemoryMmap::<()>::from_ranges(&[
+        (GuestAddress(0), 0xA0000),             // 640 KB Base RAM
+        (GuestAddress(0x100000), 511 * 1024 * 1024), // Resto de los 512 MB
+    ]).unwrap());
+
+    // 2. Cargar el Disco Duro Virtual (Tu archivo ext4 de Odoo)
+    let block_dev = VirtioBlockDevice::new("odoo_disk.ext4", guest_mem.clone());
+    eprintln!("[NKR] Disco Virtio inicializado con Vrings asíncronos.");
+
+    // --- NUEVO: Conectar KVM a los timbres asíncronos ---
+    // Inyectar IRQ 6 cuando el disco termine de leer
+    vm.register_irqfd(&block_dev.irqfd, 6).expect("Fallo al registrar irqfd para el bloque");
+    
+    // Escuchar el "Queue Notify" (offset 0x050) de la dirección base 0xD0001000
+    vm.register_ioevent(&block_dev.ioeventfd, &IoEventAddress::Mmio(0xD0001050), 0)
+        .expect("Fallo al registrar ioeventfd para el bloque");
 
     register_guest_memory(&vm, &guest_mem)?;
     eprintln!("[NKR] RAM del guest: {} MiB mapeados", GUEST_RAM_SIZE >> 20);
@@ -135,7 +154,7 @@ fn load_initramfs(guest_mem: &GuestMemoryMmap<()>, path: &str) -> Result<u32, Bo
 }
 
 fn configure_linux_boot(guest_mem: &GuestMemoryMmap<()>, initrd_size: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let cmdline = b"console=ttyS0 panic=1 pci=off noapic nolapic clocksource=jiffies tsc=nowatchdog 8250.nr_uarts=1 virtio_mmio.device=4K@0xd0000000:5 rdinit=/init\0"
+    let cmdline = b"console=ttyS0 panic=1 pci=off noapic nolapic clocksource=jiffies tsc=nowatchdog 8250.nr_uarts=1 virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6 rdinit=/init\0";
     guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))?;
 
     // Ya no creamos el header desde cero, solo "parcheamos" el original
