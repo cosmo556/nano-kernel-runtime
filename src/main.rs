@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::process;
 use std::convert::TryInto;
+use std::os::unix::io::AsRawFd;
 
 use kvm_bindings::{kvm_segment, kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
@@ -52,7 +53,34 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     vm.create_pit2(pit_config).map_err(|e| format!("Fallo al crear PIT: {e}"))?;
-    // --------------------------------------------------------
+
+    // --- FORZAR RUTEO: Conectar el PIT (GSI 0) al PIC Master (IRQ 0) ---
+    let mut irq_routing = kvm_bindings::kvm_irq_routing {
+        nr: 16,
+        flags: 0,
+        ..Default::default()
+    };
+    
+    for i in 0..16 {
+        irq_routing.entries[i as usize] = kvm_bindings::kvm_irq_routing_entry {
+            gsi: i,
+            type_: kvm_bindings::KVM_IRQ_ROUTING_IRQCHIP,
+            u: kvm_bindings::kvm_irq_routing_entry__bindgen_ty_1 {
+                irqchip: kvm_bindings::kvm_irq_routing_irqchip {
+                    irqchip: 0, // 0 = PIC Master (El controlador antiguo)
+                    pin: i,     // GSI 0 -> Pin 0, GSI 1 -> Pin 1, etc.
+                },
+            },
+            flags: 0,
+        };
+    }
+    
+    // Inyectar el ruteo directamente a KVM
+    unsafe {
+        use std::os::unix::io::AsRawFd;
+        libc::ioctl(vm.as_raw_fd(), kvm_bindings::KVM_SET_GSI_ROUTING(), &irq_routing);
+    }
+    // -------------------------------------------------------------------
     
     let guest_mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x0), GUEST_RAM_SIZE)])
         .map_err(|e| format!("Fallo mmap RAM: {e}"))?;
@@ -70,7 +98,7 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Configurar el Protocolo de Arranque
     // NOTA: Asegúrate de que tu función configure_linux_boot() tenga el cmdline 
-    // actualizado con "noacpi noapic 8250.nr_uarts=1..." que vimos antes.
+    // actualizado con "noacpi noapic 8250.nr_uarts=1..."
     configure_linux_boot(&guest_mem, initrd_size)?;
 
     // 4. Tablas de paginación y GDT
