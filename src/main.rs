@@ -236,24 +236,30 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
             Ok(VcpuExit::IoOut(port, data)) => { 
                 if port == COM1_PORT { 
                     out.write_all(data).unwrap(); 
-                    if data.contains(&b'\n') { out.flush().ok(); }
+                    out.flush().ok(); // <-- Quitamos el IF. Forzamos el flush siempre.
                 } 
             }
             
             Ok(VcpuExit::IoIn(port, data)) => { 
                 match port {
-                    // Puerto serial
+                    // 0x3F8 (COM1 Data Register)
                     0x3F8 => data.fill(0), 
-                    0x3FD => data.fill(0x20), 
                     
-                    // Emular respuestas tontas pero válidas para teclado y PIT
-                    // Si Linux lee el teclado (0x60 o 0x64), devolvemos un estado vacío
+                    // 0x3F9 (Interrupt Enable Register)
+                    0x3F9 => data.fill(0),
+                    
+                    // 0x3FA (Interrupt Identification Register)
+                    // Devolver 1 significa "No hay interrupciones pendientes por procesar"
+                    0x3FA => data.fill(1),
+                    
+                    // 0x3FD (Line Status Register) - ¡EL PUERTO CRÍTICO!
+                    // 0x60 = La tubería está libre, puedes enviar datos ahora mismo.
+                    0x3FD => data.fill(0x60), 
+                    
+                    // Emular respuestas inofensivas para teclado y PIT
                     0x60 | 0x64 => data.fill(0), 
                     
-                    // Si Linux lee el puerto del PIT (0x40 - 0x43) o del PIC (0x20, 0x21, 0xA0, 0xA1), no devolvemos 0,
-                    // dejamos que KVM lo maneje internamente (ya que KVM emula el PIT/PIC).
-                    // Para los demás puertos "basura" que Linux intente leer, devolvemos todo en unos (0xFF).
-                    // Devolver 0xFF (en lugar de 0x00) suele significar "puerto desconectado" en x86.
+                    // Cualquier otro puerto desconocido: "Hardware desconectado" (0xFF)
                     _ => data.fill(0xFF),
                 }
             }
