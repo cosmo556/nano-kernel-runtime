@@ -220,13 +220,28 @@ fn configure_regs(vcpu: &VcpuFd, entry_addr: u64) -> Result<(), Box<dyn std::err
 }
 
 fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
-    let stdout = io::stdout(); let mut out = stdout.lock();
+    let stdout = io::stdout(); 
+    let mut out = stdout.lock();
+    
     loop {
         match vcpu.run() {
-            Ok(VcpuExit::IoOut(port, data)) => { if port == COM1_PORT { out.write_all(data).unwrap(); out.flush().ok(); } }
-            Ok(VcpuExit::IoIn(port, data)) => { if port == COM1_PORT { data.fill(0); } }
+            Ok(VcpuExit::IoOut(port, data)) => { 
+                if port == COM1_PORT { 
+                    out.write_all(data).unwrap(); 
+                    // ¡EL ACELERADOR! Solo hacemos flush cuando hay un salto de línea
+                    if data.contains(&b'\n') {
+                        out.flush().ok(); 
+                    }
+                } 
+            }
+            Ok(VcpuExit::IoIn(port, data)) => { 
+                if port == COM1_PORT { data.fill(0); } 
+            }
             Ok(VcpuExit::Hlt) => break,
-            Ok(VcpuExit::Shutdown) => { eprintln!("\n[NKR] vCPU shutdown"); break; }
+            Ok(VcpuExit::Shutdown) => { 
+                eprintln!("\n[NKR] vCPU shutdown"); 
+                break; 
+            }
             Ok(_) => {},
             Err(e) => return Err(format!("vcpu.run() falló: {e}").into()),
         }
