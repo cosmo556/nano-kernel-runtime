@@ -1,0 +1,42 @@
+# ==========================================
+# Entorno Rust / Cargo
+# ==========================================
+/target/
+**/*.rs.bk
+# Nota: Cargo.lock NO se ignora porque estamos construyendo un binario final (nkr), 
+# no una librería, garantizando compilaciones deterministas en producción.
+
+# ==========================================
+# Artefactos de Ensamblador y Linker (C/ASM)
+# ==========================================
+*.o
+*.out
+*.elf
+*.bin
+
+# ==========================================
+# Imágenes del Unikernel y Discos Virtuales
+# ==========================================
+# Evitamos subir el test-kernel.img y futuras imágenes de Odoo/Alpine
+*.img
+*.iso
+*.qcow2
+*.vmdk
+
+# ==========================================
+# Logs, Sockets y Volcados de KVM
+# ==========================================
+*.log
+*.sock
+/vmm.sock
+core
+vgcore.*
+
+# ==========================================
+# Archivos de Sistema e IDEs
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
