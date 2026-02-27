@@ -45,7 +45,6 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     let vm = kvm.create_vm().map_err(|e| format!("Fallo KVM_CREATE_VM: {e}"))?;
 
     // --- PLACA BASE VIRTUAL: Interrupciones y Reloj (PIT) ---
-    // create_irq_chip() levanta el PIC e IOAPIC, y auto-rutea el IRQ0 al temporizador.
     vm.create_irq_chip().map_err(|e| format!("Fallo al crear IRQ chip: {e}"))?;
     
     let pit_config = kvm_bindings::kvm_pit_config {
@@ -54,7 +53,7 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     };
     vm.create_pit2(pit_config).map_err(|e| format!("Fallo al crear PIT: {e}"))?;
     // --------------------------------------------------------
-
+    
     let guest_mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x0), GUEST_RAM_SIZE)])
         .map_err(|e| format!("Fallo mmap RAM: {e}"))?;
 
@@ -145,8 +144,7 @@ fn load_initramfs(guest_mem: &GuestMemoryMmap<()>, path: &str) -> Result<u32, Bo
 }
 
 fn configure_linux_boot(guest_mem: &GuestMemoryMmap<()>, initrd_size: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let cmdline = b"console=ttyS0 panic=1 pci=off noacpi noapic 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd lpj=1000000 virtio_mmio.device=4K@0xd0000000:5 init=/init\0";
-    guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))?;
+    let cmdline = b"console=ttyS0 panic=1 pci=off noacpi noapic nolapic clocksource=jiffies tsc=nowatchdog 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd virtio_mmio.device=4K@0xd0000000:5 init=/init\0";    guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))?;
 
     // Ya no creamos el header desde cero, solo "parcheamos" el original
     guest_mem.write_obj(0xFFu8, GuestAddress(ZERO_PAGE_ADDR + 0x210))?; // type_of_loader
