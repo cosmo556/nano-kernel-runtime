@@ -137,7 +137,7 @@ fn load_initramfs(guest_mem: &GuestMemoryMmap<()>, path: &str) -> Result<u32, Bo
 }
 
 fn configure_linux_boot(guest_mem: &GuestMemoryMmap<()>, initrd_size: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let cmdline = b"console=ttyS0 panic=1 pci=off tsc=reliable init=/init\0";
+    let cmdline = b"console=ttyS0 panic=1 pci=off noacpi noapic lapic=notsc clocksource=pit tsc=reliable init=/init\0";
     guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))?;
 
     // Ya no creamos el header desde cero, solo "parcheamos" el original
