@@ -135,8 +135,7 @@ fn load_initramfs(guest_mem: &GuestMemoryMmap<()>, path: &str) -> Result<u32, Bo
 }
 
 fn configure_linux_boot(guest_mem: &GuestMemoryMmap<()>, initrd_size: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 panic=1 pci=off tsc=reliable virtio_mmio.device=4K@0xd0000000:5 init=/init\0";
-    
+    let cmdline = b"console=ttyS0 panic=1 pci=off noacpi noapic nolapic clocksource=jiffies tsc=nowatchdog 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd virtio_mmio.device=4K@0xd0000000:5 init=/init\0";    
     // ¡ESTA ES LA LÍNEA CLAVE QUE FALTABA! Inyectamos el cmdline físicamente en la RAM del guest
     guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))?;
 
@@ -241,11 +240,22 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
                     if data.contains(&b'\n') { out.flush().ok(); }
                 } 
             }
+            
             Ok(VcpuExit::IoIn(port, data)) => { 
                 match port {
+                    // Puerto serial
                     0x3F8 => data.fill(0), 
                     0x3FD => data.fill(0x20), 
-                    _ => data.fill(0),
+                    
+                    // Emular respuestas tontas pero válidas para teclado y PIT
+                    // Si Linux lee el teclado (0x60 o 0x64), devolvemos un estado vacío
+                    0x60 | 0x64 => data.fill(0), 
+                    
+                    // Si Linux lee el puerto del PIT (0x40 - 0x43) o del PIC (0x20, 0x21, 0xA0, 0xA1), no devolvemos 0,
+                    // dejamos que KVM lo maneje internamente (ya que KVM emula el PIT/PIC).
+                    // Para los demás puertos "basura" que Linux intente leer, devolvemos todo en unos (0xFF).
+                    // Devolver 0xFF (en lugar de 0x00) suele significar "puerto desconectado" en x86.
+                    _ => data.fill(0xFF),
                 }
             }
             
