@@ -43,7 +43,8 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     let kvm = Kvm::new().map_err(|e| format!("Fallo al abrir /dev/kvm: {e}"))?;
     let vm = kvm.create_vm().map_err(|e| format!("Fallo KVM_CREATE_VM: {e}"))?;
 
-    // --- NUEVO: Construir la placa base virtual (Reloj e Interrupciones) ---
+    // --- PLACA BASE VIRTUAL: Interrupciones y Reloj (PIT) ---
+    // create_irq_chip() levanta el PIC e IOAPIC, y auto-rutea el IRQ0 al temporizador.
     vm.create_irq_chip().map_err(|e| format!("Fallo al crear IRQ chip: {e}"))?;
     
     let pit_config = kvm_bindings::kvm_pit_config {
@@ -51,7 +52,7 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     vm.create_pit2(pit_config).map_err(|e| format!("Fallo al crear PIT: {e}"))?;
-    // -----------------------------------------------------------------------
+    // --------------------------------------------------------
 
     let guest_mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x0), GUEST_RAM_SIZE)])
         .map_err(|e| format!("Fallo mmap RAM: {e}"))?;
@@ -68,6 +69,8 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     let initrd_size = load_initramfs(&guest_mem, &initrd_path)?;
 
     // 3. Configurar el Protocolo de Arranque
+    // NOTA: Asegúrate de que tu función configure_linux_boot() tenga el cmdline 
+    // actualizado con "noacpi noapic 8250.nr_uarts=1..." que vimos antes.
     configure_linux_boot(&guest_mem, initrd_size)?;
 
     // 4. Tablas de paginación y GDT
