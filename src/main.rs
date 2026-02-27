@@ -4,7 +4,7 @@
 
 use std::env;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::process;
 
 use kvm_bindings::{kvm_segment, kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
@@ -99,8 +99,19 @@ fn register_guest_memory(vm: &VmFd, guest_mem: &GuestMemoryMmap<()>) -> Result<(
 
 fn load_bzimage_kernel(guest_mem: &GuestMemoryMmap<()>, path: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let mut kernel_file = File::open(path)?;
+    
+    // ¡EL PARCHE CRÍTICO! Extraer el ADN original del bzImage (los primeros 4 KB)
+    // y colocarlo físicamente en la Zero Page antes de que arranque.
+    let mut header = vec![0u8; 4096];
+    kernel_file.read_exact(&mut header)?;
+    guest_mem.write_slice(&header, GuestAddress(ZERO_PAGE_ADDR))?;
+    
+    // Rebobinar el archivo a la posición 0 para que el parser lo lea completo
+    kernel_file.seek(SeekFrom::Start(0))?;
+
     let load_result = BzImage::load(guest_mem, Some(GuestAddress(KERNEL_LOAD_ADDR)), &mut kernel_file, None)
         .map_err(|e| format!("Fallo al cargar bzImage: {e}"))?;
+    
     eprintln!("[NKR] Linux bzImage cargado. Entry point: {:#X}", load_result.kernel_load.raw_value());
     Ok(load_result.kernel_load.raw_value())
 }
@@ -119,15 +130,18 @@ fn configure_linux_boot(guest_mem: &GuestMemoryMmap<()>, initrd_size: u32) -> Re
     let cmdline = b"console=ttyS0 panic=1 pci=off tsc=reliable init=/init\0";
     guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))?;
 
-    guest_mem.write_obj(0xAA55u16, GuestAddress(ZERO_PAGE_ADDR + 0x1FE))?;
-    guest_mem.write_obj(0x53726448u32, GuestAddress(ZERO_PAGE_ADDR + 0x202))?;
-    guest_mem.write_obj(0xFFu8, GuestAddress(ZERO_PAGE_ADDR + 0x210))?;
+    // Ya no creamos el header desde cero, solo "parcheamos" el original
+    guest_mem.write_obj(0xFFu8, GuestAddress(ZERO_PAGE_ADDR + 0x210))?; // type_of_loader
+    
+    // loadflags: Forzamos LOADED_HIGH (bit 0) y CAN_USE_HEAP (bit 7)
+    guest_mem.write_obj(0x81u8, GuestAddress(ZERO_PAGE_ADDR + 0x211))?;
 
+    // Punteros a nuestros datos dinámicos
     guest_mem.write_obj(INITRAMFS_ADDR as u32, GuestAddress(ZERO_PAGE_ADDR + 0x218))?;
     guest_mem.write_obj(initrd_size, GuestAddress(ZERO_PAGE_ADDR + 0x21C))?;
     guest_mem.write_obj(CMDLINE_ADDR as u32, GuestAddress(ZERO_PAGE_ADDR + 0x228))?;
 
-    // E820 Map
+    // E820 Map: El Kernel ahora sabrá exactamente que tiene 512 MB de RAM
     guest_mem.write_obj(0x0u64, GuestAddress(ZERO_PAGE_ADDR + 0x2D0))?;
     guest_mem.write_obj(0x9FC00u64, GuestAddress(ZERO_PAGE_ADDR + 0x2D8))?;
     guest_mem.write_obj(1u32, GuestAddress(ZERO_PAGE_ADDR + 0x2E0))?; 
@@ -137,7 +151,7 @@ fn configure_linux_boot(guest_mem: &GuestMemoryMmap<()>, initrd_size: u32) -> Re
     guest_mem.write_obj(high_mem_size, GuestAddress(ZERO_PAGE_ADDR + 0x2EC))?;
     guest_mem.write_obj(1u32, GuestAddress(ZERO_PAGE_ADDR + 0x2F4))?; 
 
-    guest_mem.write_obj(2u8, GuestAddress(ZERO_PAGE_ADDR + 0x1E8))?;
+    guest_mem.write_obj(2u8, GuestAddress(ZERO_PAGE_ADDR + 0x1E8))?; // e820_entries
     Ok(())
 }
 
@@ -193,10 +207,16 @@ fn configure_sregs(vcpu: &VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
 
 fn configure_regs(vcpu: &VcpuFd, entry_addr: u64) -> Result<(), Box<dyn std::error::Error>> {
     let mut regs = vcpu.get_regs()?;
+    
     regs.rip = entry_addr;
-    regs.rsi = ZERO_PAGE_ADDR; // ¡CRÍTICO PARA LINUX!
+    regs.rsi = ZERO_PAGE_ADDR;   // Linux encuentra sus boot_params aquí
+    
+    // ¡EL STACK! Le damos memoria física libre (crece de 0x7000 hacia abajo)
+    regs.rsp = ZERO_PAGE_ADDR;   
+    
     regs.rflags = 0x2;
-    vcpu.set_regs(&regs)?; Ok(())
+    vcpu.set_regs(&regs)?; 
+    Ok(())
 }
 
 fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
