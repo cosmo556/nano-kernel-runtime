@@ -137,7 +137,7 @@ fn load_initramfs(guest_mem: &GuestMemoryMmap<()>, path: &str) -> Result<u32, Bo
 }
 
 fn configure_linux_boot(guest_mem: &GuestMemoryMmap<()>, initrd_size: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let cmdline = b"console=ttyS0 panic=1 pci=off noacpi noapic lapic=notsc clocksource=pit tsc=reliable init=/init\0";
+    let cmdline = b"console=ttyS0 panic=1 pci=off noacpi noapic 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd lpj=1000000 init=/init\0";
     guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))?;
 
     // Ya no creamos el header desde cero, solo "parcheamos" el original
@@ -252,7 +252,11 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
                     // Puerto LSR: "Buffer vacío, dispara a máxima velocidad"
                     0x3FD => data.fill(0x20), 
                     
-                    _ => data.fill(0),
+                    _ => { 
+                        // Si descomentas la siguiente línea, verás qué hardware "fantasma" busca Linux
+                        // eprintln!("[NKR] Linux intentó leer el puerto fantasma: {port:#X}");
+                        data.fill(0); 
+                    }
                 }
             }
             Ok(VcpuExit::Hlt) => break,
