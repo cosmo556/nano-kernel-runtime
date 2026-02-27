@@ -51,6 +51,9 @@ vmm-sys-util = "0.12"
 # libc para algunas llamadas a nivel de sistema que requiere la red
 libc = "0.2"
 
+virtio-queue = "0.12"
+virtio-bindings = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = true          # Link-Time Optimization — binario más pequeño y rápido

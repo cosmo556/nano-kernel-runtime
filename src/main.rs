@@ -276,10 +276,28 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
                 else if addr >= 0xD0001000 && addr < 0xD0002000 {
                     let offset = addr - 0xD0001000;
                     match offset {
-                        0x000 => data.copy_from_slice(&0x74726976u32.to_le_bytes()), // "virt"
+                        0x000 => data.copy_from_slice(&0x74726976u32.to_le_bytes()), // Magic "virt"
                         0x004 => data.copy_from_slice(&2u32.to_le_bytes()),          // Version 2
                         0x008 => data.copy_from_slice(&2u32.to_le_bytes()),          // DeviceID = 2 (Block)
                         0x00C => data.copy_from_slice(&0x4E4B5200u32.to_le_bytes()), // Vendor "NKR"
+                        
+                        // Feature Bits: Le decimos a Linux que soportamos Virtio v1 moderno (Bit 32)
+                        0x010 => data.fill(0), // Features Low (0-31)
+                        0x014 => data.copy_from_slice(&1u32.to_le_bytes()), // Features High (32-63)
+                        
+                        // Tamaño máximo de tareas en la cola simultáneas (256 peticiones)
+                        0x034 => data.copy_from_slice(&256u32.to_le_bytes()), 
+                        
+                        // --- CONFIG SPACE DE VIRTIO-BLK ---
+                        // Offset 0x100: Capacidad del disco (64 bits) en sectores de 512 bytes
+                        // 2GB = 4,194,304 sectores
+                        0x100..=0x107 => {
+                            let capacity: u64 = 4_194_304; 
+                            let bytes = capacity.to_le_bytes();
+                            let idx = (offset - 0x100) as usize;
+                            let len = data.len();
+                            data.copy_from_slice(&bytes[idx..idx+len]);
+                        }
                         _ => data.fill(0),
                     }
                 }
@@ -294,11 +312,26 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
                         if status == 3 || status == 7 { eprintln!("\n[NKR] ¡Linux detectó la Tarjeta de Red!"); }
                     }
                 }
-                else if addr >= 0xD0001000 && addr < 0xD0002000 {
+                if addr >= 0xD0001000 && addr < 0xD0002000 {
                     let offset = addr - 0xD0001000;
-                    if offset == 0x070 {
-                        let status = u32::from_le_bytes(data[0..4].try_into().unwrap());
-                        if status == 3 || status == 7 { eprintln!("\n[NKR] ¡Linux detectó el Disco Duro PCI!"); }
+                    let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap()) } else { 0 };
+                    
+                    match offset {
+                        // Linux confirma en qué fase de inicialización está
+                        0x070 => {
+                            if val == 3 || val == 7 { 
+                                eprintln!("\n[NKR] ¡Linux inicializando el Disco Duro Virtio!"); 
+                            }
+                            if val == 15 { // VIRTIO_CONFIG_S_DRIVER_OK
+                                eprintln!("\n[NKR] ¡Disco Duro de 2GB listo y montado como /dev/vda!");
+                            }
+                        }
+                        // Linux nos dice dónde creó la tabla de descriptores en RAM
+                        0x080 => eprintln!("[NKR-Vring] Descriptor Table Address Low: {:#X}", val),
+                        0x084 => eprintln!("[NKR-Vring] Descriptor Table Address High: {:#X}", val),
+                        // Linux avisa que la cola está lista para usarse
+                        0x044 => if val == 1 { eprintln!("[NKR-Vring] ¡Cola de I/O activada!"); },
+                        _ => {}
                     }
                 }
             }
