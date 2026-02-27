@@ -289,31 +289,29 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd, block_dev: &mut VirtioBlockDevice) -> Result
                         _ => data.fill(0),
                     }
                 }
-                // 2. Disco Duro (0xD0001000) - DeviceID: 2
+                // 2. Disco Duro Virtio-Block (0xD0001000)
                 else if addr >= 0xD0001000 && addr < 0xD0002000 {
                     let offset = addr - 0xD0001000;
                     match offset {
                         0x000 => data.copy_from_slice(&0x74726976u32.to_le_bytes()), // Magic "virt"
                         0x004 => data.copy_from_slice(&2u32.to_le_bytes()),          // Version 2
-                        0x008 => data.copy_from_slice(&2u32.to_le_bytes()),          // DeviceID = 2 (Block)
+                        0x008 => data.copy_from_slice(&2u32.to_le_bytes()),          // Device ID = 2 (Block Device)
                         0x00C => data.copy_from_slice(&0x4E4B5200u32.to_le_bytes()), // Vendor "NKR"
+                        0x010 => data.fill(0),                                       // Features Low
+                        0x014 => data.copy_from_slice(&1u32.to_le_bytes()),          // Features High (VIRTIO_F_VERSION_1)
+                        0x034 => data.copy_from_slice(&256u32.to_le_bytes()),        // Max Queue Size
                         
-                        // Feature Bits: Le decimos a Linux que soportamos Virtio v1 moderno (Bit 32)
-                        0x010 => data.fill(0), // Features Low (0-31)
-                        0x014 => data.copy_from_slice(&1u32.to_le_bytes()), // Features High (32-63)
-                        
-                        // Tamaño máximo de tareas en la cola simultáneas (256 peticiones)
-                        0x034 => data.copy_from_slice(&256u32.to_le_bytes()), 
-                        
-                        // --- CONFIG SPACE DE VIRTIO-BLK ---
-                        // Offset 0x100: Capacidad del disco (64 bits) en sectores de 512 bytes
-                        // 2GB = 4,194,304 sectores
-                        0x100..=0x107 => {
-                            let capacity: u64 = 4_194_304; 
-                            let bytes = capacity.to_le_bytes();
-                            let idx = (offset - 0x100) as usize;
-                            let len = data.len();
-                            data.copy_from_slice(&bytes[idx..idx+len]);
+                        // ¡EL SECRETO DEL DISCO: EL ESPACIO DE CONFIGURACIÓN!
+                        // El offset 0x100 es donde Linux pregunta: "¿De qué tamaño eres?"
+                        // Nuestro disco es de 2GB. 2GB = 2147483648 bytes.
+                        // Virtio cuenta el tamaño en sectores de 512 bytes.
+                        // 2147483648 / 512 = 4194304 sectores (En hexadecimal: 0x00400000)
+                        0x100 => {
+                            if data.len() == 4 {
+                                data.copy_from_slice(&0x00400000u32.to_le_bytes());
+                            } else if data.len() == 8 {
+                                data.copy_from_slice(&0x0000000000400000u64.to_le_bytes());
+                            }
                         }
                         _ => data.fill(0),
                     }
