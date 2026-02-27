@@ -308,9 +308,15 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd, block_dev: &mut VirtioBlockDevice) -> Result
                         // 2147483648 / 512 = 4194304 sectores (En hexadecimal: 0x00400000)
                         0x100 => {
                             if data.len() == 4 {
-                                data.copy_from_slice(&0x00400000u32.to_le_bytes());
+                                data.copy_from_slice(&0x00400000u32.to_le_bytes()); // Mitad inferior
                             } else if data.len() == 8 {
                                 data.copy_from_slice(&0x0000000000400000u64.to_le_bytes());
+                            }
+                        }
+                        // NUEVO: Por si Linux lee la mitad superior por separado
+                        0x104 => {
+                            if data.len() == 4 {
+                                data.fill(0); // Los 32 bits superiores de nuestro tamaño son 0
                             }
                         }
                         _ => data.fill(0),
