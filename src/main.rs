@@ -156,12 +156,39 @@ fn write_gdt(guest_mem: &GuestMemoryMmap<()>) -> Result<(), Box<dyn std::error::
 
 fn configure_sregs(vcpu: &VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
     let mut sregs = vcpu.get_sregs()?;
-    sregs.cr0 = (1 << 0) | (1 << 31); sregs.cr3 = PML4_ADDR; sregs.cr4 = 1 << 5; sregs.efer = (1 << 8) | (1 << 10);
-    let cs = kvm_segment { base: 0, limit: 0xFFFF_FFFF, selector: 0x08, type_: 0xB, present: 1, dpl: 0, db: 0, s: 1, l: 1, g: 1, avl: 0, unusable: 0, padding: 0 };
-    let ds = kvm_segment { base: 0, limit: 0xFFFF_FFFF, selector: 0x10, type_: 0x3, present: 1, dpl: 0, db: 1, s: 1, l: 0, g: 1, avl: 0, unusable: 0, padding: 0 };
-    sregs.cs = cs; sregs.ds = ds; sregs.es = ds; sregs.fs = ds; sregs.gs = ds; sregs.ss = ds;
-    sregs.gdt.base = GDT_ADDR; sregs.gdt.limit = 31; sregs.idt.base = 0; sregs.idt.limit = 0;
-    vcpu.set_sregs(&sregs)?; Ok(())
+    
+    // ¡EL ARREGLO! Modo Protegido de 32 bits (Sin Paginación, Sin Long Mode)
+    sregs.cr0 = 1;      // Solo bit 0 (PE). Paginación (PG) = 0.
+    sregs.cr3 = 0;      // No necesitamos tablas de paginación aún
+    sregs.cr4 = 0;      // Sin extensiones físicas
+    sregs.efer = 0;     // Nada de modo 64-bit
+
+    // Descriptor de Código de 32 bits
+    let cs = kvm_segment { 
+        base: 0, limit: 0xFFFF_FFFF, selector: 0x08, type_: 0xB, present: 1, 
+        dpl: 0, 
+        db: 1, // db=1 -> Instrucciones de 32 bits
+        s: 1, 
+        l: 0,  // l=0 -> NO estamos en 64 bits
+        g: 1, avl: 0, unusable: 0, padding: 0 
+    };
+    
+    // Descriptor de Datos de 32 bits
+    let ds = kvm_segment { 
+        base: 0, limit: 0xFFFF_FFFF, selector: 0x10, type_: 0x3, present: 1, 
+        dpl: 0, db: 1, s: 1, l: 0, g: 1, avl: 0, unusable: 0, padding: 0 
+    };
+    
+    sregs.cs = cs; 
+    sregs.ds = ds; sregs.es = ds; sregs.fs = ds; sregs.gs = ds; sregs.ss = ds;
+    
+    sregs.gdt.base = GDT_ADDR; 
+    sregs.gdt.limit = 31; 
+    sregs.idt.base = 0; 
+    sregs.idt.limit = 0;
+    
+    vcpu.set_sregs(&sregs)?; 
+    Ok(())
 }
 
 fn configure_regs(vcpu: &VcpuFd, entry_addr: u64) -> Result<(), Box<dyn std::error::Error>> {
