@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write}; // <-- AÑADIR ESTO
 use std::sync::Arc;
 use vmm_sys_util::eventfd::EventFd;
-use virtio_queue::{Queue, QueueOwnedT, QueueT};
+use virtio_queue::{Descriptor, Queue, QueueOwnedT, QueueT};
 use vm_memory::{GuestMemory, GuestMemoryMmap, Bytes};
 
 pub struct VirtioBlockDevice {
