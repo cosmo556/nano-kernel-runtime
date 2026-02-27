@@ -6,6 +6,8 @@ use std::env;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::process;
+use vmm_sys_util::tap::Tap;
+use std::convert::TryInto;
 
 use kvm_bindings::{kvm_segment, kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
@@ -89,6 +91,10 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[NKR] Encendiendo MicroVM...");
     eprintln!("════════════════════════════════════════════════════════════════");
 
+    // --- CONECTAR TAP0 DEL HOST ---
+    let _tap = Tap::open_named("tap0").map_err(|e| format!("Fallo al abrir tap0: {e}"))?;
+    eprintln!("[NKR] Interfaz tap0 de GCP conectada al Hipervisor");
+
     run_vcpu_loop(&mut vcpu)?;
 
     eprintln!("════════════════════════════════════════════════════════════════");
@@ -140,7 +146,7 @@ fn load_initramfs(guest_mem: &GuestMemoryMmap<()>, path: &str) -> Result<u32, Bo
 }
 
 fn configure_linux_boot(guest_mem: &GuestMemoryMmap<()>, initrd_size: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let cmdline = b"console=ttyS0 panic=1 pci=off noacpi noapic 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd lpj=1000000 init=/init\0";
+    let cmdline = b"console=ttyS0 panic=1 pci=off noacpi noapic 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd lpj=1000000 virtio_mmio.device=4K@0xd0000000:5 init=/init\0";
     guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))?;
 
     // Ya no creamos el header desde cero, solo "parcheamos" el original
@@ -241,27 +247,54 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
             Ok(VcpuExit::IoOut(port, data)) => { 
                 if port == COM1_PORT { 
                     out.write_all(data).unwrap(); 
-                    // ¡EL ACELERADOR! Solo refrescamos la pantalla con saltos de línea
-                    if data.contains(&b'\n') {
-                        out.flush().ok(); 
-                    }
+                    if data.contains(&b'\n') { out.flush().ok(); }
                 } 
             }
             Ok(VcpuExit::IoIn(port, data)) => { 
                 match port {
-                    // Puerto RX: Sin teclas presionadas
                     0x3F8 => data.fill(0), 
-                    
-                    // Puerto LSR: "Buffer vacío, dispara a máxima velocidad"
                     0x3FD => data.fill(0x20), 
-                    
-                    _ => { 
-                        // Si descomentas la siguiente línea, verás qué hardware "fantasma" busca Linux
-                        // eprintln!("[NKR] Linux intentó leer el puerto fantasma: {port:#X}");
-                        data.fill(0); 
+                    _ => data.fill(0),
+                }
+            }
+            
+            // --- NUEVO: EMULACIÓN DE LA TARJETA VIRTIO-NET ---
+            // Cuando Linux lee la dirección 0xD0000000, nos pregunta qué hardware es.
+            Ok(VcpuExit::MmioRead(addr, data)) => {
+                if addr >= 0xD0000000 && addr < 0xD0001000 {
+                    let offset = addr - 0xD0000000;
+                    match offset {
+                        // 0x000: Magic Value ("virt" en Little Endian)
+                        0x000 => data.copy_from_slice(&0x74726976u32.to_le_bytes()), 
+                        // 0x004: Version (Virtio v2)
+                        0x004 => data.copy_from_slice(&2u32.to_le_bytes()),          
+                        // 0x008: DeviceID (1 = Tarjeta de Red)
+                        0x008 => data.copy_from_slice(&1u32.to_le_bytes()),          
+                        // 0x00C: VendorID (Inventamos uno: 0x4E4B5200 = "NKR")
+                        0x00C => data.copy_from_slice(&0x4E4B5200u32.to_le_bytes()), 
+                        // Características (Ninguna por ahora)
+                        0x010 => data.fill(0),          
+                        // Status y otros registros
+                        _ => data.fill(0),
                     }
                 }
             }
+            
+            // Cuando Linux escribe para configurar la tarjeta
+            Ok(VcpuExit::MmioWrite(addr, data)) => {
+                if addr >= 0xD0000000 && addr < 0xD0001000 {
+                    let offset = addr - 0xD0000000;
+                    if offset == 0x070 {
+                        // 0x070 es el registro de "Status". Linux nos avisa que reconoció la red.
+                        let status = u32::from_le_bytes(data[0..4].try_into().unwrap());
+                        if status == 3 || status == 7 {
+                            eprintln!("\n[NKR] ¡Linux ha montado el driver Virtio-Net!");
+                        }
+                    }
+                }
+            }
+            // ------------------------------------------------
+
             Ok(VcpuExit::Hlt) => break,
             Ok(VcpuExit::Shutdown) => { 
                 eprintln!("\n[NKR] vCPU shutdown (Kernel Panic o fin de ejecución)"); 
