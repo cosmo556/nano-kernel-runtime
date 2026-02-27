@@ -46,6 +46,7 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     let vm = kvm.create_vm().map_err(|e| format!("Fallo KVM_CREATE_VM: {e}"))?;
 
     // --- PLACA BASE VIRTUAL: Interrupciones y Reloj (PIT) ---
+    // KVM auto-configura el ruteo interno aquí. No necesitamos estructuras C inseguras.
     vm.create_irq_chip().map_err(|e| format!("Fallo al crear IRQ chip: {e}"))?;
     
     let pit_config = kvm_bindings::kvm_pit_config {
@@ -53,34 +54,7 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     vm.create_pit2(pit_config).map_err(|e| format!("Fallo al crear PIT: {e}"))?;
-
-    // --- FORZAR RUTEO: Conectar el PIT (GSI 0) al PIC Master (IRQ 0) ---
-    let mut irq_routing = kvm_bindings::kvm_irq_routing {
-        nr: 16,
-        flags: 0,
-        ..Default::default()
-    };
-    
-    for i in 0..16 {
-        irq_routing.entries[i as usize] = kvm_bindings::kvm_irq_routing_entry {
-            gsi: i,
-            type_: kvm_bindings::KVM_IRQ_ROUTING_IRQCHIP,
-            u: kvm_bindings::kvm_irq_routing_entry__bindgen_ty_1 {
-                irqchip: kvm_bindings::kvm_irq_routing_irqchip {
-                    irqchip: 0, // 0 = PIC Master (El controlador antiguo)
-                    pin: i,     // GSI 0 -> Pin 0, GSI 1 -> Pin 1, etc.
-                },
-            },
-            flags: 0,
-        };
-    }
-    
-    // Inyectar el ruteo directamente a KVM
-    unsafe {
-        use std::os::unix::io::AsRawFd;
-        libc::ioctl(vm.as_raw_fd(), kvm_bindings::KVM_SET_GSI_ROUTING(), &irq_routing);
-    }
-    // -------------------------------------------------------------------
+    // --------------------------------------------------------
     
     let guest_mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x0), GUEST_RAM_SIZE)])
         .map_err(|e| format!("Fallo mmap RAM: {e}"))?;
@@ -88,24 +62,17 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     register_guest_memory(&vm, &guest_mem)?;
     eprintln!("[NKR] RAM del guest: {} MiB mapeados", GUEST_RAM_SIZE >> 20);
 
-    // 1. Cargar el Kernel Linux (bzImage)
     let kernel_path = env::args().nth(1).unwrap();
     let entry_addr = load_bzimage_kernel(&guest_mem, &kernel_path)?;
 
-    // 2. Cargar el RAM Disk (initramfs)
     let initrd_path = env::args().nth(2).unwrap();
     let initrd_size = load_initramfs(&guest_mem, &initrd_path)?;
 
-    // 3. Configurar el Protocolo de Arranque
-    // NOTA: Asegúrate de que tu función configure_linux_boot() tenga el cmdline 
-    // actualizado con "noacpi noapic 8250.nr_uarts=1..."
     configure_linux_boot(&guest_mem, initrd_size)?;
 
-    // 4. Tablas de paginación y GDT
     write_page_tables(&guest_mem)?;
     write_gdt(&guest_mem)?;
 
-    // 5. Configurar vCPU
     let mut vcpu = vm.create_vcpu(0).map_err(|e| format!("Fallo KVM_CREATE_VCPU: {e}"))?;
     let cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
     vcpu.set_cpuid2(&cpuid)?;
@@ -116,10 +83,6 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[NKR] Encendiendo MicroVM...");
     eprintln!("════════════════════════════════════════════════════════════════");
-
-    // --- CONECTAR TAP0 DEL HOST ---
-    // let _tap = Tap::open_named("tap0").map_err(|e| format!("Fallo al abrir tap0: {e}"))?;
-    // eprintln!("[NKR] Interfaz tap0 de GCP conectada al Hipervisor");
 
     run_vcpu_loop(&mut vcpu)?;
 
@@ -172,8 +135,7 @@ fn load_initramfs(guest_mem: &GuestMemoryMmap<()>, path: &str) -> Result<u32, Bo
 }
 
 fn configure_linux_boot(guest_mem: &GuestMemoryMmap<()>, initrd_size: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let cmdline = b"console=ttyS0 panic=1 pci=off noacpi noapic nolapic clocksource=jiffies tsc=nowatchdog 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd virtio_mmio.device=4K@0xd0000000:5 init=/init\0";    guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))?;
-
+    let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 panic=1 pci=off tsc=reliable virtio_mmio.device=4K@0xd0000000:5 init=/init\0";
     // Ya no creamos el header desde cero, solo "parcheamos" el original
     guest_mem.write_obj(0xFFu8, GuestAddress(ZERO_PAGE_ADDR + 0x210))?; // type_of_loader
     
