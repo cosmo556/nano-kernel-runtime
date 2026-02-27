@@ -136,6 +136,10 @@ fn load_initramfs(guest_mem: &GuestMemoryMmap<()>, path: &str) -> Result<u32, Bo
 
 fn configure_linux_boot(guest_mem: &GuestMemoryMmap<()>, initrd_size: u32) -> Result<(), Box<dyn std::error::Error>> {
     let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 panic=1 pci=off tsc=reliable virtio_mmio.device=4K@0xd0000000:5 init=/init\0";
+    
+    // ¡ESTA ES LA LÍNEA CLAVE QUE FALTABA! Inyectamos el cmdline físicamente en la RAM del guest
+    guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))?;
+
     // Ya no creamos el header desde cero, solo "parcheamos" el original
     guest_mem.write_obj(0xFFu8, GuestAddress(ZERO_PAGE_ADDR + 0x210))?; // type_of_loader
     
