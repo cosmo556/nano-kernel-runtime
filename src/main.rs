@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::process;
 use std::convert::TryInto;
-use std::os::unix::io::AsRawFd;
+// use std::os::unix::io::AsRawFd;
 
 use kvm_bindings::{kvm_segment, kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
@@ -135,7 +135,7 @@ fn load_initramfs(guest_mem: &GuestMemoryMmap<()>, path: &str) -> Result<u32, Bo
 }
 
 fn configure_linux_boot(guest_mem: &GuestMemoryMmap<()>, initrd_size: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let cmdline = b"console=ttyS0 panic=1 pci=off noapic nolapic clocksource=jiffies tsc=nowatchdog 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd virtio_mmio.device=4K@0xd0000000:5 rdinit=/sbin/init\0";
+    let cmdline = b"console=ttyS0 panic=1 pci=off noapic nolapic clocksource=jiffies tsc=nowatchdog 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd virtio_mmio.device=4K@0xd0000000:5 rdinit=/init\0";
     guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))?;
 
     // Ya no creamos el header desde cero, solo "parcheamos" el original
@@ -242,24 +242,15 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
             
             Ok(VcpuExit::IoIn(port, data)) => { 
                 match port {
-                    // 0x3F8 (COM1 Data Register)
-                    0x3F8 => data.fill(0), 
-                    
-                    // 0x3F9 (Interrupt Enable Register)
-                    0x3F9 => data.fill(0),
-                    
-                    // 0x3FA (Interrupt Identification Register)
-                    // Devolver 1 significa "No hay interrupciones pendientes por procesar"
-                    0x3FA => data.fill(1),
-                    
-                    // 0x3FD (Line Status Register) - ¡EL PUERTO CRÍTICO!
-                    // 0x60 = La tubería está libre, puedes enviar datos ahora mismo.
-                    0x3FD => data.fill(0x60), 
-                    
-                    // Emular respuestas inofensivas para teclado y PIT
-                    0x60 | 0x64 => data.fill(0), 
-                    
-                    // Cualquier otro puerto desconocido: "Hardware desconectado" (0xFF)
+                    0x3F8 => data.fill(0), // RX Buffer
+                    0x3F9 => data.fill(0), // Interrupt Enable Register
+                    0x3FA => data.fill(1), // Interrupt Identification (Sin pendientes)
+                    0x3FB => data.fill(0), // Line Control Register
+                    0x3FC => data.fill(0), // Modem Control Register
+                    0x3FD => data.fill(0x60), // Line Status (Tubería vacía)
+                    0x3FE => data.fill(0xB0), // Modem Status (¡CABLE CONECTADO!)
+        
+                    0x60 | 0x64 => data.fill(0), // Teclado
                     _ => data.fill(0xFF),
                 }
             }
