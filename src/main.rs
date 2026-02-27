@@ -228,18 +228,26 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
             Ok(VcpuExit::IoOut(port, data)) => { 
                 if port == COM1_PORT { 
                     out.write_all(data).unwrap(); 
-                    // ¡EL ACELERADOR! Solo hacemos flush cuando hay un salto de línea
+                    // ¡EL ACELERADOR! Solo refrescamos la pantalla con saltos de línea
                     if data.contains(&b'\n') {
                         out.flush().ok(); 
                     }
                 } 
             }
             Ok(VcpuExit::IoIn(port, data)) => { 
-                if port == COM1_PORT { data.fill(0); } 
+                match port {
+                    // Puerto RX: Sin teclas presionadas
+                    0x3F8 => data.fill(0), 
+                    
+                    // Puerto LSR: "Buffer vacío, dispara a máxima velocidad"
+                    0x3FD => data.fill(0x20), 
+                    
+                    _ => data.fill(0),
+                }
             }
             Ok(VcpuExit::Hlt) => break,
             Ok(VcpuExit::Shutdown) => { 
-                eprintln!("\n[NKR] vCPU shutdown"); 
+                eprintln!("\n[NKR] vCPU shutdown (Kernel Panic o fin de ejecución)"); 
                 break; 
             }
             Ok(_) => {},
