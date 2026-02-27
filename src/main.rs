@@ -43,6 +43,16 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     let kvm = Kvm::new().map_err(|e| format!("Fallo al abrir /dev/kvm: {e}"))?;
     let vm = kvm.create_vm().map_err(|e| format!("Fallo KVM_CREATE_VM: {e}"))?;
 
+    // --- NUEVO: Construir la placa base virtual (Reloj e Interrupciones) ---
+    vm.create_irq_chip().map_err(|e| format!("Fallo al crear IRQ chip: {e}"))?;
+    
+    let pit_config = kvm_bindings::kvm_pit_config {
+        flags: 0,
+        ..Default::default()
+    };
+    vm.create_pit2(pit_config).map_err(|e| format!("Fallo al crear PIT: {e}"))?;
+    // -----------------------------------------------------------------------
+
     let guest_mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x0), GUEST_RAM_SIZE)])
         .map_err(|e| format!("Fallo mmap RAM: {e}"))?;
 
