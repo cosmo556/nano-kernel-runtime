@@ -53,6 +53,8 @@ libc = "0.2"
 
 virtio-queue = "0.12"
 virtio-bindings = "0.2"
+vhost = "0.10"
+vhost-user-backend = "0.12"
 
 [profile.release]
 opt-level = 3
