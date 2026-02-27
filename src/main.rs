@@ -75,7 +75,7 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     vm.register_irqfd(&block_dev.irqfd, 6).expect("Fallo al registrar irqfd para el bloque");
     
     // Escuchar el "Queue Notify" (offset 0x050) de la dirección base 0xD0001000
-    vm.register_ioevent(&block_dev.ioeventfd, &IoEventAddress::Mmio(0xD0001050), 0)
+    vm.register_ioevent(&block_dev.ioeventfd, &IoEventAddress::Mmio(0xD0001050), 0u64)
         .expect("Fallo al registrar ioeventfd para el bloque");
 
     register_guest_memory(&vm, &guest_mem)?;

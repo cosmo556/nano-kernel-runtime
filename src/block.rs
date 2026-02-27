@@ -1,7 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::sync::Arc;
 use vmm_sys_util::eventfd::EventFd;
-use virtio_queue::Queue;
+use virtio_queue::{Queue, QueueT};
 use vm_memory::GuestMemoryMmap;
 
 pub struct VirtioBlockDevice {
