@@ -171,7 +171,7 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[NKR] Iniciando ejecución del unikernel…");
     eprintln!("════════════════════════════════════════════════════════════════");
 
-    run_vcpu_loop(&vcpu)?;
+    run_vcpu_loop(&mut vcpu)?;
 
     eprintln!("════════════════════════════════════════════════════════════════");
     eprintln!("[NKR] VMM finalizado correctamente");
@@ -576,7 +576,7 @@ fn configure_regs(vcpu: &VcpuFd, entry_addr: u64) -> Result<(), Box<dyn std::err
 /// | Hlt             | Instrucción `hlt`                  | Terminación limpia        |
 /// | Shutdown        | Triple fault o shutdown explícito  | Terminación con warning   |
 /// | MmioRead/Write  | Acceso a GPA sin memoria mapeada   | Log warning, continuar    |
-fn run_vcpu_loop(vcpu: &VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
+fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
     // Adquirimos el lock de stdout UNA VEZ fuera del loop para evitar el overhead
     // de lock/unlock en cada byte de salida serial. Esto es seguro porque:
     //   1. Somos single-threaded (una sola vCPU)
