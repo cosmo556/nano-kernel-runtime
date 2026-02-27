@@ -67,7 +67,7 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     ]).unwrap());
 
     // 2. Cargar el Disco Duro Virtual (Tu archivo ext4 de Odoo)
-    let block_dev = VirtioBlockDevice::new("odoo_disk.ext4", guest_mem.clone());
+    let mut block_dev = VirtioBlockDevice::new("odoo_disk.ext4", guest_mem.clone());
     eprintln!("[NKR] Disco Virtio inicializado con Vrings asíncronos.");
 
     // --- NUEVO: Conectar KVM a los timbres asíncronos ---
@@ -154,7 +154,7 @@ fn load_initramfs(guest_mem: &GuestMemoryMmap<()>, path: &str) -> Result<u32, Bo
 }
 
 fn configure_linux_boot(guest_mem: &GuestMemoryMmap<()>, initrd_size: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let cmdline = b"console=ttyS0 panic=1 pci=off noapic nolapic clocksource=jiffies tsc=nowatchdog 8250.nr_uarts=1 virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6 rdinit=/init\0";
+    let cmdline = b"console=ttyS0 panic=1 pci=off noapic nolapic clocksource=jiffies tsc=nowatchdog virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6 root=/dev/vda rw init=/sbin/init\0";
     guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))?;
 
     // Ya no creamos el header desde cero, solo "parcheamos" el original
@@ -348,20 +348,13 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
                     let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap()) } else { 0 };
                     
                     match offset {
-                        // Linux confirma en qué fase de inicialización está
-                        0x070 => {
-                            if val == 3 || val == 7 { 
-                                eprintln!("\n[NKR] ¡Linux inicializando el Disco Duro Virtio!"); 
-                            }
-                            if val == 15 { // VIRTIO_CONFIG_S_DRIVER_OK
-                                eprintln!("\n[NKR] ¡Disco Duro de 2GB listo y montado como /dev/vda!");
-                            }
+                        0x070 => { /* status de inicialización */ }
+                        0x080 => eprintln!("[NKR-Vring] Tabla de descriptores mapeada en RAM: {:#X}", val),
+                        
+                        // ¡EL TIMBRE DEL HARDWARE! (Queue Notify)
+                        0x050 => {
+                            block_dev.process_queue();
                         }
-                        // Linux nos dice dónde creó la tabla de descriptores en RAM
-                        0x080 => eprintln!("[NKR-Vring] Descriptor Table Address Low: {:#X}", val),
-                        0x084 => eprintln!("[NKR-Vring] Descriptor Table Address High: {:#X}", val),
-                        // Linux avisa que la cola está lista para usarse
-                        0x044 => if val == 1 { eprintln!("[NKR-Vring] ¡Cola de I/O activada!"); },
                         _ => {}
                     }
                 }
