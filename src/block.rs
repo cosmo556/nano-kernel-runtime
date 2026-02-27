@@ -10,6 +10,7 @@ pub struct VirtioBlockDevice {
     pub ioeventfd: EventFd,
     pub irqfd: EventFd,
     pub mem: Arc<GuestMemoryMmap>,
+    pub status: u32, // <-- NUEVO: Guardaremos el estado aquí
 }
 
 impl VirtioBlockDevice {
@@ -39,6 +40,7 @@ impl VirtioBlockDevice {
             ioeventfd,
             irqfd,
             mem,
+            status: 0,
         }
     }
     // El Job Runner: Procesa las peticiones del Vring

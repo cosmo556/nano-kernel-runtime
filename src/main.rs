@@ -293,31 +293,31 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd, block_dev: &mut VirtioBlockDevice) -> Result
                 else if addr >= 0xD0001000 && addr < 0xD0002000 {
                     let offset = addr - 0xD0001000;
                     match offset {
-                        0x000 => data.copy_from_slice(&0x74726976u32.to_le_bytes()), // Magic "virt"
+                        0x000 => data.copy_from_slice(&0x74726976u32.to_le_bytes()), // "virt"
                         0x004 => data.copy_from_slice(&2u32.to_le_bytes()),          // Version 2
-                        0x008 => data.copy_from_slice(&2u32.to_le_bytes()),          // Device ID = 2 (Block Device)
+                        0x008 => data.copy_from_slice(&2u32.to_le_bytes()),          // Device ID = 2 (Block)
                         0x00C => data.copy_from_slice(&0x4E4B5200u32.to_le_bytes()), // Vendor "NKR"
                         0x010 => data.fill(0),                                       // Features Low
-                        0x014 => data.copy_from_slice(&1u32.to_le_bytes()),          // Features High (VIRTIO_F_VERSION_1)
+                        0x014 => data.copy_from_slice(&1u32.to_le_bytes()),          // Features High
                         0x034 => data.copy_from_slice(&256u32.to_le_bytes()),        // Max Queue Size
                         
-                        // ¡EL SECRETO DEL DISCO: EL ESPACIO DE CONFIGURACIÓN!
-                        // El offset 0x100 es donde Linux pregunta: "¿De qué tamaño eres?"
-                        // Nuestro disco es de 2GB. 2GB = 2147483648 bytes.
-                        // Virtio cuenta el tamaño en sectores de 512 bytes.
-                        // 2147483648 / 512 = 4194304 sectores (En hexadecimal: 0x00400000)
+                        // --- ESTA ES LA PIEZA CLAVE ---
+                        // Cuando Linux lee 0x070, espera ver el estado que él mismo escribió.
+                        // Si le devolvemos 0, Linux cree que el hardware falló.
+                        0x070 => {
+                            data.copy_from_slice(&block_dev.status.to_le_bytes());
+                        }
+
+                        // Config Space: Tamaño del disco
                         0x100 => {
                             if data.len() == 4 {
-                                data.copy_from_slice(&0x00400000u32.to_le_bytes()); // Mitad inferior
+                                data.copy_from_slice(&0x00400000u32.to_le_bytes()); 
                             } else if data.len() == 8 {
                                 data.copy_from_slice(&0x0000000000400000u64.to_le_bytes());
                             }
                         }
-                        // NUEVO: Por si Linux lee la mitad superior por separado
                         0x104 => {
-                            if data.len() == 4 {
-                                data.fill(0); // Los 32 bits superiores de nuestro tamaño son 0
-                            }
+                            if data.len() == 4 { data.fill(0); }
                         }
                         _ => data.fill(0),
                     }
@@ -353,10 +353,13 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd, block_dev: &mut VirtioBlockDevice) -> Result
                     let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap()) } else { 0 };
                     
                     match offset {
-                        0x070 => { /* status de inicialización */ }
+                        // ¡GUARDAMOS EL ESTADO QUE LINUX NOS ENVÍA!
+                        0x070 => { 
+                            block_dev.status = val;
+                            if val == 15 { eprintln!("[NKR-BLOCK] ¡DRIVER_OK! Linux está listo para usar el disco."); }
+                        }
                         0x080 => eprintln!("[NKR-Vring] Tabla de descriptores mapeada en RAM: {:#X}", val),
                         
-                        // ¡EL TIMBRE DEL HARDWARE! (Queue Notify)
                         0x050 => {
                             block_dev.process_queue();
                         }
