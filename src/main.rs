@@ -149,7 +149,7 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     // ═══ 6. Crear y configurar vCPU 0 ════════════════════════════════════
     // KVM_CREATE_VCPU devuelve un fd que representa un hilo de ejecución
     // del procesador virtual. En v0.1.0 usamos una sola vCPU (ID=0).
-    let vcpu = vm.create_vcpu(0).map_err(|e| format!("Fallo KVM_CREATE_VCPU(0): {e}"))?;
+    let mut vcpu = vm.create_vcpu(0).map_err(|e| format!("Fallo KVM_CREATE_VCPU(0): {e}"))?;
 
     // Pasar las hojas CPUID del host al guest. Sin esto, el kernel podría
     // intentar usar instrucciones no soportadas o detectar un CPU inválido.
