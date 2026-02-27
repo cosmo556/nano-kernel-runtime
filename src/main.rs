@@ -135,8 +135,7 @@ fn load_initramfs(guest_mem: &GuestMemoryMmap<()>, path: &str) -> Result<u32, Bo
 }
 
 fn configure_linux_boot(guest_mem: &GuestMemoryMmap<()>, initrd_size: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let cmdline = b"console=ttyS0 panic=1 pci=off noacpi noapic nolapic clocksource=jiffies tsc=nowatchdog 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd virtio_mmio.device=4K@0xd0000000:5 init=/init\0";    
-    // ¡ESTA ES LA LÍNEA CLAVE QUE FALTABA! Inyectamos el cmdline físicamente en la RAM del guest
+    let cmdline = b"console=ttyS0 panic=1 pci=off noacpi noapic nolapic clocksource=jiffies tsc=nowatchdog 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6 init=/init\0";    // ¡ESTA ES LA LÍNEA CLAVE QUE FALTABA! Inyectamos el cmdline físicamente en la RAM del guest
     guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))?;
 
     // Ya no creamos el header desde cero, solo "parcheamos" el original
@@ -262,20 +261,25 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
             // --- NUEVO: EMULACIÓN DE LA TARJETA VIRTIO-NET ---
             // Cuando Linux lee la dirección 0xD0000000, nos pregunta qué hardware es.
             Ok(VcpuExit::MmioRead(addr, data)) => {
+                // 1. Tarjeta de Red (0xD0000000) - DeviceID: 1
                 if addr >= 0xD0000000 && addr < 0xD0001000 {
                     let offset = addr - 0xD0000000;
                     match offset {
-                        // 0x000: Magic Value ("virt" en Little Endian)
-                        0x000 => data.copy_from_slice(&0x74726976u32.to_le_bytes()), 
-                        // 0x004: Version (Virtio v2)
-                        0x004 => data.copy_from_slice(&2u32.to_le_bytes()),          
-                        // 0x008: DeviceID (1 = Tarjeta de Red)
-                        0x008 => data.copy_from_slice(&1u32.to_le_bytes()),          
-                        // 0x00C: VendorID (Inventamos uno: 0x4E4B5200 = "NKR")
-                        0x00C => data.copy_from_slice(&0x4E4B5200u32.to_le_bytes()), 
-                        // Características (Ninguna por ahora)
-                        0x010 => data.fill(0),          
-                        // Status y otros registros
+                        0x000 => data.copy_from_slice(&0x74726976u32.to_le_bytes()), // "virt"
+                        0x004 => data.copy_from_slice(&2u32.to_le_bytes()),          // Version 2
+                        0x008 => data.copy_from_slice(&1u32.to_le_bytes()),          // DeviceID = 1 (Net)
+                        0x00C => data.copy_from_slice(&0x4E4B5200u32.to_le_bytes()), // Vendor "NKR"
+                        _ => data.fill(0),
+                    }
+                }
+                // 2. Disco Duro (0xD0001000) - DeviceID: 2
+                else if addr >= 0xD0001000 && addr < 0xD0002000 {
+                    let offset = addr - 0xD0001000;
+                    match offset {
+                        0x000 => data.copy_from_slice(&0x74726976u32.to_le_bytes()), // "virt"
+                        0x004 => data.copy_from_slice(&2u32.to_le_bytes()),          // Version 2
+                        0x008 => data.copy_from_slice(&2u32.to_le_bytes()),          // DeviceID = 2 (Block)
+                        0x00C => data.copy_from_slice(&0x4E4B5200u32.to_le_bytes()), // Vendor "NKR"
                         _ => data.fill(0),
                     }
                 }
@@ -286,11 +290,15 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
                 if addr >= 0xD0000000 && addr < 0xD0001000 {
                     let offset = addr - 0xD0000000;
                     if offset == 0x070 {
-                        // 0x070 es el registro de "Status". Linux nos avisa que reconoció la red.
                         let status = u32::from_le_bytes(data[0..4].try_into().unwrap());
-                        if status == 3 || status == 7 {
-                            eprintln!("\n[NKR] ¡Linux ha montado el driver Virtio-Net!");
-                        }
+                        if status == 3 || status == 7 { eprintln!("\n[NKR] ¡Linux detectó la Tarjeta de Red!"); }
+                    }
+                }
+                else if addr >= 0xD0001000 && addr < 0xD0002000 {
+                    let offset = addr - 0xD0001000;
+                    if offset == 0x070 {
+                        let status = u32::from_le_bytes(data[0..4].try_into().unwrap());
+                        if status == 3 || status == 7 { eprintln!("\n[NKR] ¡Linux detectó el Disco Duro PCI!"); }
                     }
                 }
             }
