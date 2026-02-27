@@ -23,6 +23,8 @@
 *.iso
 *.qcow2
 *.vmdk
+*.cpio.gz
+*.ext4
 
 # ==========================================
 # Logs, Sockets y Volcados de KVM
