@@ -3,7 +3,7 @@ use std::io::{Read, Seek, SeekFrom, Write}; // <-- AÑADIR ESTO
 use std::sync::Arc;
 use vmm_sys_util::eventfd::EventFd;
 use virtio_queue::{Descriptor, Queue, QueueOwnedT, QueueT};
-use vm_memory::{GuestMemory, GuestMemoryMmap, Bytes};
+use vm_memory::{GuestMemoryMmap, Bytes};
 
 pub struct VirtioBlockDevice {
     pub file: File,
@@ -47,64 +47,70 @@ impl VirtioBlockDevice {
     pub fn process_queue(&mut self) {
         let mem = self.mem.as_ref();
 
-        // Iteramos sobre los descriptores disponibles en el Vring
-        while let Some(mut chain) = self.queue.iter(mem).unwrap().next() {
-            
-            // 1. HEADER: Contiene el tipo de petición (Read/Write) y el sector
-            let head: Descriptor = chain.next().expect("Fallo al leer header del disco");
+        // 1. CREAMOS EL ITERADOR FUERA DEL BUCLE
+        // Esto es vital para avanzar por la cola y no procesar siempre lo mismo
+        let mut iter = self.queue.iter(mem).unwrap();
+
+        while let Some(mut chain) = iter.next() {
+            // Guardamos el head_index de la CADENA. Este es el ID que Linux espera.
+            let head_index = chain.head_index();
+
+            // 1. HEADER
+            let head: Descriptor = chain.next().expect("Fallo al leer header");
             let mut header_data = [0u8; 16];
             mem.read_slice(&mut header_data, head.addr()).unwrap();
             
             let request_type = u32::from_le_bytes(header_data[0..4].try_into().unwrap());
             let sector = u64::from_le_bytes(header_data[8..16].try_into().unwrap());
 
-            // 2. DATA: El buffer de memoria donde Linux espera los datos (o donde los envía)
-            let data_desc: Descriptor = chain.next().expect("Fallo al leer data descriptor");
+            // 2. DATA
+            let data_desc: Descriptor = chain.next().expect("Fallo al leer data");
             
-            // 3. STATUS: El byte donde informamos a Linux si la operación fue exitosa (0 = OK)
-            let status_desc: Descriptor = chain.next().expect("Fallo al leer status descriptor");
+            // 3. STATUS
+            let status_desc: Descriptor = chain.next().expect("Fallo al leer status");
+
+            let mut len_written = 0u32;
 
             match request_type {
-                0 => { // VIRTIO_BLK_T_IN (Lectura)
+                0 => { // LECTURA (IN)
                     let offset = sector * 512;
                     let mut buffer = vec![0u8; data_desc.len() as usize];
                     
-                    // Buscamos el sector en el archivo .ext4 y leemos
                     self.file.seek(SeekFrom::Start(offset)).unwrap();
                     self.file.read_exact(&mut buffer).unwrap();
                     
-                    // Volcamos el contenido del archivo directamente a la RAM del Guest
                     mem.write_slice(&buffer, data_desc.addr()).unwrap();
-                    
-                    // Escribimos Éxito (0) en el descriptor de status
                     mem.write_obj(0u8, status_desc.addr()).unwrap();
+                    
+                    // En lecturas, informamos a Linux cuántos bytes escribimos en su RAM
+                    len_written = data_desc.len() + 1; 
                 }
-                1 => { // VIRTIO_BLK_T_OUT (Escritura)
+                1 => { // ESCRITURA (OUT)
                     let offset = sector * 512;
                     let mut buffer = vec![0u8; data_desc.len() as usize];
                     
-                    // Leemos de la RAM del Guest lo que Linux quiere guardar
                     mem.read_slice(&mut buffer, data_desc.addr()).unwrap();
                     
-                    // Lo escribimos físicamente en nuestro archivo odoo_disk.ext4
                     self.file.seek(SeekFrom::Start(offset)).unwrap();
                     self.file.write_all(&buffer).unwrap();
                     
                     mem.write_obj(0u8, status_desc.addr()).unwrap();
+                    
+                    // En escrituras, solo escribimos el byte de status (1 byte)
+                    len_written = 1;
                 }
                 _ => {
-                    // Para peticiones desconocidas (como Flush), respondemos OK por ahora
                     mem.write_obj(0u8, status_desc.addr()).unwrap();
+                    len_written = 1;
                 }
             }
 
-            // Notificamos a la cola que hemos procesado la cadena de descriptores
-            // Importante usar head.id() para referenciar el inicio de la cadena
-            self.queue.add_used(mem, head.id(), data_desc.len()).unwrap();
+            // 2. USAMOS chain.head_index() (o nuestra variable head_index)
+            // Esto le dice a Linux: "He terminado con la cadena que empezaba en este índice"
+            self.queue.add_used(mem, head_index, len_written).unwrap();
         }
 
-        // ¡EL TOQUE FINAL! Inyectamos la interrupción (IRQ 6) 
-        // Esto le dice a Linux: "Oye, ya terminé de leer, mira la RAM".
+        // Notificación de hardware terminada
         self.irqfd.write(1).expect("Fallo al inyectar IRQ");
     }
 }
