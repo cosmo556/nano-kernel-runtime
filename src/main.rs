@@ -34,8 +34,9 @@ const PD_ADDR: u64 = 0xB000;
 const GDT_ADDR: u64 = 0x500;
 
 fn main() {
-    if env::args().len() < 3 {
-        eprintln!("Uso: sudo ./target/release/nkr <bzImage> <initramfs.cpio.gz>");
+    // Ahora solo exigimos 2 argumentos: el ejecutable [0] y el kernel [1]
+    if env::args().len() < 2 {
+        eprintln!("Uso: sudo ./target/release/nkr <bzImage>");
         process::exit(1);
     }
 
@@ -84,10 +85,10 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     let kernel_path = env::args().nth(1).unwrap();
     let entry_addr = load_bzimage_kernel(&guest_mem, &kernel_path)?;
 
-    let initrd_path = env::args().nth(2).unwrap();
-    let initrd_size = load_initramfs(&guest_mem, &initrd_path)?;
+    // let initrd_path = env::args().nth(2).unwrap();
+    // let initrd_size = load_initramfs(&guest_mem, &initrd_path)?;
 
-    configure_linux_boot(&guest_mem, initrd_size)?;
+    configure_linux_boot(&guest_mem, 0)?;
 
     write_page_tables(&guest_mem)?;
     write_gdt(&guest_mem)?;
