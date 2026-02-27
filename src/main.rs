@@ -135,7 +135,7 @@ fn load_initramfs(guest_mem: &GuestMemoryMmap<()>, path: &str) -> Result<u32, Bo
 }
 
 fn configure_linux_boot(guest_mem: &GuestMemoryMmap<()>, initrd_size: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let cmdline = b"console=ttyS0 panic=1 pci=off noapic nolapic clocksource=jiffies tsc=nowatchdog 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd virtio_mmio.device=4K@0xd0000000:5 rdinit=/init\0";
+    let cmdline = b"console=ttyS0 panic=1 pci=off noapic nolapic clocksource=jiffies tsc=nowatchdog virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0002000:7 rdinit=/init\0";
     guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))?;
 
     // Ya no creamos el header desde cero, solo "parcheamos" el original
@@ -305,10 +305,10 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
                         0x000 => data.copy_from_slice(&0x74726976u32.to_le_bytes()), // "virt"
                         0x004 => data.copy_from_slice(&2u32.to_le_bytes()),          // Version 2
                         0x008 => data.copy_from_slice(&3u32.to_le_bytes()),          // DeviceID = 3 (Console)
-                        0x00C => data.copy_from_slice(&0x4E4B5200u32.to_le_bytes()), // Vendor "NKR"
+                        0x00C => data.copy_from_slice(&0x4E4B5200u32.to_le_bytes()), // Vendor
                         0x010 => data.fill(0), // Features Low
                         0x014 => data.copy_from_slice(&1u32.to_le_bytes()), // Features High
-                        0x034 => data.copy_from_slice(&256u32.to_le_bytes()), // Queue Size
+                        0x034 => data.copy_from_slice(&256u32.to_le_bytes()), // Max Queue Size
                         _ => data.fill(0),
                     }
                 }
@@ -346,17 +346,16 @@ fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
                         _ => {}
                     }
                 }
-                // 3. Consola Virtio (0xD0002000) - NUEVO
+                // 3. Consola Virtio (0xD0002000)
                 else if addr >= 0xD0002000 && addr < 0xD0003000 {
                     let offset = addr - 0xD0002000;
                     let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap()) } else { 0 };
                     
                     if offset == 0x070 && (val == 3 || val == 7) {
                         eprintln!("\n[NKR] ¡Linux detectó la Consola Virtio (hvc0)!");
-                    } 
-                    // 0x050 es el "Queue Notify". Si Linux escribe aquí, es porque puso un mensaje en la RAM compartida.
-                    else if offset == 0x050 {
-                        eprintln!("[NKR-Vring] ¡Zumbido en hvc0! Linux envió texto al espacio de usuario.");
+                    } else if offset == 0x050 {
+                        // 0x050 es Queue Notify. Si entra aquí, ¡hay texto en la RAM!
+                        eprintln!("[NKR-Vring] >>> ¡ZUMBIDO! Linux ha dejado texto en la cola Virtio. <<<");
                     }
                 }
             }
