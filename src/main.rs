@@ -18,7 +18,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::process;
 
-use kvm_bindings::{kvm_segment, kvm_userspace_memory_region};
+use kvm_bindings::{kvm_segment, kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use linux_loader::loader::KernelLoader;
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
@@ -54,9 +54,9 @@ const GDT_ADDR: u64 = 0x500;
 /// Ruta por defecto de la imagen del unikernel.
 const DEFAULT_KERNEL_PATH: &str = "test-kernel.img";
 
-/// Máximo de entradas CPUID a solicitar al host KVM.
-/// 256 es suficiente para cubrir todas las hojas estándar + extended.
-const CPUID_MAX_ENTRIES: usize = 512;
+// KVM_MAX_CPUID_ENTRIES se importa directamente de kvm-bindings.
+// Es el máximo definido por el kernel Linux (256 en la mayoría de versiones).
+// Se usa como tope para get_supported_cpuid(); valores mayores causan ENOMEM.
 
 // =============================================================================
 // Punto de Entrada
@@ -153,8 +153,9 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
 
     // Pasar las hojas CPUID del host al guest. Sin esto, el kernel podría
     // intentar usar instrucciones no soportadas o detectar un CPU inválido.
+    // KVM_MAX_CPUID_ENTRIES (de kvm-bindings) es el máximo que acepta el kernel.
     let cpuid = kvm
-        .get_supported_cpuid(CPUID_MAX_ENTRIES)
+        .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
         .map_err(|e| format!("Fallo KVM_GET_SUPPORTED_CPUID: {e}"))?;
     vcpu.set_cpuid2(&cpuid)
         .map_err(|e| format!("Fallo KVM_SET_CPUID2: {e}"))?;

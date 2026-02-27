@@ -25,13 +25,14 @@ readme = "README.md"
 
 # kvm-ioctls: Wrappers seguros sobre los ioctls de /dev/kvm.
 # Provee Kvm (fd global), VmFd (instancia de VM) y VcpuFd (hilo de ejecución).
-kvm-ioctls = "0.16"
+kvm-ioctls = "0.19"
 
 # kvm-bindings: Structs FFI que mapean 1:1 a las estructuras del kernel Linux
 # para KVM (kvm_regs, kvm_sregs, kvm_userspace_memory_region, etc.).
 # Feature "fam-wrappers": wrappers seguros para structs de longitud variable
 # como kvm_cpuid2 (necesario para CPUID passthrough).
-kvm-bindings = { version = "0.7", features = ["fam-wrappers"] }
+# v0.10 expone KVM_MAX_CPUID_ENTRIES, el máximo definido por el kernel.
+kvm-bindings = { version = "0.10", features = ["fam-wrappers"] }
 
 # vm-memory: Abstracción de la memoria física del guest.
 # GuestMemoryMmap crea regiones mmap anónimas que KVM mapea al espacio
