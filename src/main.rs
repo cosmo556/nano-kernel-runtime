@@ -56,7 +56,7 @@ const DEFAULT_KERNEL_PATH: &str = "test-kernel.img";
 
 /// Máximo de entradas CPUID a solicitar al host KVM.
 /// 256 es suficiente para cubrir todas las hojas estándar + extended.
-const CPUID_MAX_ENTRIES: usize = 256;
+const CPUID_MAX_ENTRIES: usize = 512;
 
 // =============================================================================
 // Punto de Entrada
