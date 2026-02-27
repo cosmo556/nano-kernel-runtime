@@ -6,7 +6,6 @@ use std::env;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::process;
-use vmm_sys_util::tap::Tap;
 use std::convert::TryInto;
 
 use kvm_bindings::{kvm_segment, kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
@@ -92,8 +91,8 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("════════════════════════════════════════════════════════════════");
 
     // --- CONECTAR TAP0 DEL HOST ---
-    let _tap = Tap::open_named("tap0").map_err(|e| format!("Fallo al abrir tap0: {e}"))?;
-    eprintln!("[NKR] Interfaz tap0 de GCP conectada al Hipervisor");
+    // let _tap = Tap::open_named("tap0").map_err(|e| format!("Fallo al abrir tap0: {e}"))?;
+    // eprintln!("[NKR] Interfaz tap0 de GCP conectada al Hipervisor");
 
     run_vcpu_loop(&mut vcpu)?;
 
