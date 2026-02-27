@@ -44,7 +44,7 @@ impl VirtioBlockDevice {
     // El Job Runner: Procesa las peticiones del Vring
     pub fn process_queue(&mut self) {
         // Leemos la memoria RAM compartida para ver qué pide el Kernel
-        let mem = self.mem.as_ref();
+        let _mem = self.mem.as_ref();
         
         // Simulación: Aquí es donde la librería virtio-queue extrae los descriptores.
         // Un descriptor de disco tiene 3 partes:

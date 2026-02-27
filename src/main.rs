@@ -103,7 +103,7 @@ fn run_vmm() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[NKR] Encendiendo MicroVM...");
     eprintln!("════════════════════════════════════════════════════════════════");
 
-    run_vcpu_loop(&mut vcpu)?;
+    run_vcpu_loop(&mut vcpu, &mut block_dev)?;
 
     eprintln!("════════════════════════════════════════════════════════════════");
     eprintln!("[NKR] VMM finalizado correctamente");
@@ -246,7 +246,7 @@ fn configure_regs(vcpu: &VcpuFd, entry_addr: u64) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-fn run_vcpu_loop(vcpu: &mut VcpuFd) -> Result<(), Box<dyn std::error::Error>> {
+fn run_vcpu_loop(vcpu: &mut VcpuFd, block_dev: &mut VirtioBlockDevice) -> Result<(), Box<dyn std::error::Error>> {
     let stdout = io::stdout(); 
     let mut out = stdout.lock();
     
