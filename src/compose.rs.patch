@@ -1,0 +1,11 @@
+--- compose.rs2023-10-10
++++ compose.rs2023-10-10
+@@ -69,8 +69,8 @@
+     }
+ }
+ 
+-fn default_size_gb() -> u32 {
+-    2
++fn default_size_mb() -> u32 {
++    2048
+ }

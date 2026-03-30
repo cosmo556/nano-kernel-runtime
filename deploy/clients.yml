@@ -1,0 +1,70 @@
+# =============================================================================
+# NKR Multi-Tenant — Registro de Clientes
+# =============================================================================
+#
+# Este archivo define todos los clientes Odoo. Los scripts mt-*.sh lo leen
+# para generar discos, configs, compose y nginx automáticamente.
+#
+# Para agregar un cliente:
+#   1. Agregar entrada aquí
+#   2. sudo ./deploy/mt-provision.sh <nombre>   (crea disco, config, nginx)
+#   3. sudo ./deploy/mt-compose-gen.sh           (regenera nkr-compose.yml)
+#   4. sudo nkr compose down && sudo nkr compose up -f nkr-compose.yml -d
+#
+# =============================================================================
+
+# ── Configuración global (defaults para todos los clientes) ──
+global:
+  # Rutas
+  kernel: ./bzImage
+  pg_initramfs: /opt/nkr/initramfs/pg_initramfs.cpio.gz
+  odoo_initramfs: /opt/nkr/initramfs/odoo_initramfs.cpio.gz
+  base_disk: /opt/nkr/disks/odoo-base.ext4
+  disk_dir: /opt/nkr/disks
+  data_dir: /opt/nkr/data
+  config_dir: /opt/nkr/config
+  modules_dir: /opt/nkr/modules
+
+  # PostgreSQL compartido (1 instancia para todos los clientes)
+  pg_ram: 2048
+  pg_chrs: 2
+  pg_user: odoo
+  pg_password: odoo
+
+  # Defaults Odoo por cliente (pueden override por cliente)
+  odoo_ram: 256
+  odoo_chrs: 1
+  odoo_admin_passwd: admin
+  odoo_disk_size_gb: 4
+
+  # nginx (instalado en el host)
+  nginx_sites_dir: /etc/nginx/sites-available
+  nginx_enabled_dir: /etc/nginx/sites-enabled
+
+# ── Clientes ──
+# Campos:
+#   name:     Identificador único (sin espacios, lowercase)
+#   domain:   Dominio público del cliente
+#   db_name:  Nombre de la base de datos en PostgreSQL
+#   ram:      (opcional) RAM en MB — override del default
+#   chrs:     (opcional) Chrs de CPU — override del default
+#
+# El vm_id se asigna automáticamente: 2 + posición en la lista
+# (vm_id=1 está reservado para PostgreSQL)
+clients:
+  - name: ejemplo1
+    domain: ejemplo1.midominio.com
+    db_name: ejemplo1_prod
+
+  - name: ejemplo2
+    domain: ejemplo2.midominio.com
+    db_name: ejemplo2_prod
+    ram: 512
+    chrs: 2
+
+# ── Plantilla para copiar ──
+# - name: nuevo_cliente
+#   domain: nuevo.midominio.com
+#   db_name: nuevo_prod
+#   ram: 256
+#   chrs: 1

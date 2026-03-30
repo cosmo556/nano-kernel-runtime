@@ -1,498 +1,684 @@
-# AI-README — NKR (Nano-Kernel Runtime) v0.1.0
+# AI-README — Guía para IAs que trabajen en este proyecto
 
-> **Propósito de este archivo:** Documento de contexto para que cualquier agente de IA
-> pueda entender la arquitectura, tomar decisiones informadas y continuar el desarrollo
-> del proyecto sin ambigüedad. No es documentación de usuario.
+> **Este archivo es una referencia técnica completa para cualquier IA (Copilot, Claude, GPT, etc.) que asista en el desarrollo de NKR. Léelo antes de hacer cualquier cambio.**
 
 ---
 
-## 1. Identidad del Proyecto
+## 0. Contexto de Negocio — Por qué existe NKR
 
-| Campo            | Valor                                                        |
-|------------------|--------------------------------------------------------------|
-| **Nombre**       | NKR — Nano-Kernel Runtime                                    |
-| **Versión**      | 0.1.0 (fundacional)                                          |
-| **Lenguaje**     | Rust (edition 2021)                                          |
-| **Target**       | `x86_64-unknown-linux-gnu` (Ubuntu 22.04+)                   |
-| **Licencia**     | MIT                                                          |
-| **Binario**      | `nkr` — único ejecutable distribuible                        |
-| **Dependencia**  | Solo `/dev/kvm` del kernel Linux (sin QEMU, sin Firecracker) |
+### El Problema
 
-## 2. Misión
+El autor mantiene **~50 clientes con ~50 instancias de Odoo** en producción sobre Docker. Esta arquitectura tiene problemas críticos de escalabilidad:
 
-Reemplazar Docker como runtime de ejecución para cargas de trabajo que requieren:
-- **Latencia cero** en arranque (sin overhead de init, systemd, ni userspace Linux)
-- **Aislamiento por hardware** (VM con EPT/NPT, no namespaces/cgroups)
-- **Superficie de ataque mínima** (unikernel: un solo binario, sin shell, sin FS)
-- **Distribución trivial** (un binario `nkr` + una imagen `.img` = deployment completo)
+| Problema Docker                    | Impacto                                                                     | Solución NKR                                      |
+|------------------------------------|-----------------------------------------------------------------------------|---------------------------------------------------|
+| **Disco: imagen Odoo pesa ~1.5 GB** | 50 instancias × 1.5 GB = **~75 GB** solo en imágenes (sin datos)           | Disco ext4 compartible + deltas mínimos           |
+| **RAM: ~1 GB por instancia Odoo**  | 50 × 1 GB = **50 GB de RAM** (imposible en servidor de 16-32 GB)           | Micro-VMs con RAM exclusiva y ajustada al mínimo  |
+| **CPU compartido sin exclusividad** | Picos de uso llegan al 100% → **colas de espera** entre usuarios de distintos clientes | Modelo de **chrs** (CPU pinning exclusivo): cada VM tiene % de core garantizado |
+| **Reinicio de stack: ~3 minutos**  | Cada deploy/actualización requiere restart; **clientes no toleran 3 min de downtime** | Hot-update de módulos (~5s downtime) sin reiniciar VM |
+| **Deploy lento (GitHub → restart)**| Ciclo: push → pull repo → restart contenedores → **minutos de espera**     | Sync módulos en disco + restart solo de Odoo (~5s) |
+| **Networking: 1 PG + 1 Odoo por cliente** | 50 clientes = **100 contenedores** con 50 nginx configs                    | **1 PostgreSQL compartido** + N Odoos + **1 nginx** global |
 
-## 3. Arquitectura v0.1.0
+### Arquitectura Objetivo
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    Host Linux (Ubuntu)                     │
-│                                                           │
-│  ┌─────────────────────────────────────────────────────┐  │
-│  │                 NKR Process (nkr)                    │  │
-│  │                                                     │  │
-│  │  ┌───────────┐   ┌──────────────┐   ┌───────────┐  │  │
-│  │  │  KVM API  │   │ GuestMemory  │   │ ELF Loader│  │  │
-│  │  │ /dev/kvm  │   │  (mmap 512M) │   │  (linux-  │  │  │
-│  │  │ kvm-ioctls│   │  vm-memory   │   │  loader)  │  │  │
-│  │  └─────┬─────┘   └──────┬───────┘   └─────┬─────┘  │  │
-│  │        │                │                  │        │  │
-│  │        ▼                ▼                  ▼        │  │
-│  │  ┌──────────────────────────────────────────────┐   │  │
-│  │  │               vCPU 0 Run Loop                │   │  │
-│  │  │  VMENTER → ejecutar guest → VMEXIT → handle  │   │  │
-│  │  │                                              │   │  │
-│  │  │  IoOut(0x3F8) ──► stdout (consola serial)    │   │  │
-│  │  │  Hlt          ──► exit(0)                    │   │  │
-│  │  │  Shutdown      ──► exit(1)                   │   │  │
-│  │  └──────────────────────────────────────────────┘   │  │
-│  └─────────────────────────────────────────────────────┘  │
-│                                                           │
-│  ┌─────────────────────────────────────────────────────┐  │
-│  │              KVM (kernel module)                     │  │
-│  │  EPT/NPT  │  VMCS  │  IRQ routing  │  MSR bitmap   │  │
-│  └─────────────────────────────────────────────────────┘  │
-│                                                           │
-│  ┌─────────────────────────────────────────────────────┐  │
-│  │              Hardware (Intel VT-x / AMD-V)          │  │
-│  └─────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────┘
+Servidor (16-32 GB RAM, KVM habilitado)
+│
+├── 1× PostgreSQL (micro-VM, 1-2 GB RAM)
+│   └── Todas las bases de datos de los 50 clientes
+│
+├── N× Odoo (micro-VMs, ~256-512 MB RAM c/u)
+│   ├── cliente-1 (id=2, IP 10.0.0.3, puerto interno 8069)
+│   ├── cliente-2 (id=3, IP 10.0.0.4, puerto interno 8069)
+│   ├── ...
+│   └── cliente-50 (id=51, IP 10.0.0.52, puerto interno 8069)
+│
+├── nginx (instalado directo en el host, NO en micro-VM)
+│   └── Proxy reverso + SSL (Let's Encrypt), routea por dominio → IP interna del Odoo
+│
+└── Puertos expuestos al exterior: SOLO 80, 443, 5566 (SSH)
+    Todos los demás puertos CERRADOS
 ```
 
-## 4. Estructura de Archivos
+### Flujo de Deploy (Objetivo)
+
+```
+Desarrollador push a GitHub
+        ↓
+Webhook → git pull en /opt/nkr/modules/
+        ↓
+sudo ./deploy/update.sh
+        ↓
+Sync módulos al disco Odoo (mount + rsync)
+        ↓
+Restart solo Odoo (~5 segundos)
+        ↓
+Cliente operativo de nuevo
+```
+
+### Prioridades del Proyecto
+
+1. **Reducir uso de disco** — Compartir kernel y base del filesystem entre instancias
+2. **Reducir uso de RAM** — Micro-VMs con RAM mínima y exclusiva (no overcommit)
+3. **Garantizar CPU** — Chrs exclusivos para evitar colas de espera entre clientes
+4. **Minimizar downtime** — Hot-update de módulos en <10 segundos
+5. **Consolidar infraestructura** — 1 PG + N Odoos + nginx en el host (no 50×2 contenedores)
+6. **Seguridad de red** — Solo puertos 80, 443, 5566 expuestos; todo lo demás interno en `nkr0`
+
+---
+
+## 1. ¿Qué es NKR?
+
+**Nano-Kernel Runtime (NKR)** es un hipervisor bare-metal escrito en Rust que reemplaza Docker para ejecutar contenedores como **micro-VMs** directamente sobre `/dev/kvm`, sin dependencias externas (no usa QEMU, libvirt ni containerd).
+
+Cada "contenedor" es una VM completa con:
+- Kernel Linux real (bzImage)
+- Disco ext4 (rootfs extraído de imágenes OCI/Docker Hub)
+- Red VirtIO con TAP backend y bridge (`nkr0`)
+- Aislamiento total a nivel de hardware (KVM)
+
+**Caso de uso principal:** Plataforma multi-tenant de Odoo 17 con ~50 clientes en un servidor de 16-32 GB, reemplazando Docker por micro-VMs con recursos garantizados (CPU, RAM) y deploys de ~5 segundos.
+
+---
+
+## 2. Stack Tecnológico
+
+| Componente         | Tecnología                                                  |
+|--------------------|-------------------------------------------------------------|
+| Lenguaje           | Rust (edition 2021)                                         |
+| Hipervisor         | KVM directo (`/dev/kvm`) via `kvm-ioctls`                   |
+| Memoria guest      | `vm-memory` (GuestMemoryMmap)                               |
+| Carga de kernel    | `linux-loader` (bzImage)                                    |
+| Dispositivos I/O   | VirtIO-MMIO (bloque, red) — implementación propia           |
+| CLI                | `clap` v4 (derive)                                          |
+| Serialización      | `serde` + `serde_yaml` + `serde_json`                       |
+| Networking         | TAP devices + bridge `nkr0` + iptables (NAT/port-forward)   |
+| Build de discos    | Docker como motor de build → export → disco ext4            |
+| Sistema operativo  | Requiere Linux con KVM habilitado                           |
+| Binario final      | `target/release/nkr` (~2-4 MB, LTO + strip)                |
+
+---
+
+## 3. Estructura del Proyecto
 
 ```
 nano-kernel-runtime/
-├── Cargo.toml          # Manifiesto con dependencias rust-vmm fijadas
-├── README.md           # Documentación de usuario (overview público)
-├── AI-README.md        # ← ESTE ARCHIVO (contexto para IAs)
-└── src/
-    └── main.rs         # VMM completo: init → memoria → loader → vCPU → loop
+├── Cargo.toml              # Dependencias Rust (rust-vmm ecosystem)
+├── bzImage                 # Kernel Linux pre-compilado para las VMs
+├── nkr-compose.yml         # Definición del stack Odoo+PG (como docker-compose)
+├── Nkrfile.odoo            # Dockerfile para construir disco Odoo
+├── Nkrfile.pg              # Dockerfile para construir disco PostgreSQL
+├── Nkrfile.nginx           # Dockerfile para proxy reverso nginx+certbot
+│
+├── src/                    # ═══ Código Rust principal ═══
+│   ├── main.rs             # Entry point — dispatch de subcomandos CLI (~87 líneas)
+│   ├── cli.rs              # Definición de CLI con clap (Run, Ps, Stop, Compose, Pull, Build) (~137 líneas)
+│   ├── vmm.rs              # Motor VMM completo (~1130 líneas):
+│   │                         - Creación de VM KVM (IRQ chip, PIT, memory)
+│   │                         - Boot protocol Linux x86_64 (page tables, GDT, zero page)
+│   │                         - Dispositivos VirtIO-MMIO (bloque + red)
+│   │                         - Bridge nkr0 auto-setup (ensure_bridge)
+│   │                         - Volúmenes (inject pre-boot / extract post-shutdown)
+│   │                         - Variables de entorno (/etc/nkr-env)
+│   │                         - Port forwarding (iptables DNAT/SNAT)
+│   │                         - CPU pinning (modelo de "chrs")
+│   │                         - Bucle vCPU con emulación MMIO
+│   │                         - Shutdown limpio (SIGTERM handler)
+│   ├── block.rs            # VirtIO Block Device (~205 líneas, lectura/escritura sectores 512B)
+│   ├── net.rs              # VirtIO Net Device (~286 líneas, TAP backend, RX thread, TX queue)
+│   ├── compose.rs          # Orquestador multi-servicio YAML (~792 líneas):
+│   │                         - up/down/ps, healthchecks, auto-build
+│   │                         - NKR Data Directory (/mnt/nkr o NKR_DATA_DIR)
+│   │                         - Snapshots CoW (cp --reflink=auto)
+│   │                         - Resolución inteligente de disco/kernel/initramfs
+│   │                         - Rotación de logs (10 MB máx, 3 rotados)
+│   │                         - Modo daemon con PID file (/tmp/nkr-compose.pid)
+│   ├── pull.rs             # Descarga imagen OCI → disco ext4 (~108 líneas, docker create/export)
+│   ├── build.rs            # Construye disco ext4 desde Nkrfile (~163 líneas, docker build + export)
+│   └── state.rs            # Tracking de VMs activas en /tmp/nkr-vms/*.json (~215 líneas)
+│
+├── deploy/                 # ═══ Scripts de deploy para producción (Odoo 17) ═══
+│   ├── setup.sh            # Setup inicial: descarga imágenes, crea discos, initramfs
+│   ├── start.sh            # Inicia PG + Odoo como VMs independientes
+│   ├── stop.sh             # Detiene stack (SIGTERM → SIGKILL fallback)
+│   ├── update.sh           # Hot-update de módulos Odoo (~262 líneas):
+│   │                         - Modo default: sync + restart (~5s downtime)
+│   │                         - --test: probar en puerto 8070 sin tocar prod
+│   │                         - --rollback: restaurar backup anterior
+│   │                         - --update-db: forzar -u all en Odoo
+│   │                         - Backup automático antes de actualizar
+│   ├── clients.yml         # Registro de clientes multi-tenant (YAML)
+│   ├── mt-common.sh        # Funciones comunes para parsear clients.yml
+│   ├── mt-provision.sh     # Provisionar clientes: disco CoW, config Odoo, nginx
+│   └── config/
+│       └── odoo.conf       # Config Odoo inyectada vía --volume
+│
+├── tools/                  # ═══ Utilidades ═══
+│   ├── setup-net.sh        # Script para crear bridge/TAP manualmente
+│   ├── initramfs/          # Initramfs base con init script para guests (~189 líneas)
+│   │   └── init            # Script init del guest (módulos, red, switch_root)
+│   ├── mods/               # Módulos del kernel para initramfs (6.6.117-0-virt)
+│   └── modules/            # Directorio para módulos Odoo custom
+│
+└── target/                 # Build output (no editar)
+    └── release/nkr         # Binario final compilado
 ```
 
-## 5. Dependencias y Rol de Cada Crate
+---
 
-| Crate            | Versión | Feature          | Rol en NKR                                                    |
-|------------------|---------|------------------|---------------------------------------------------------------|
-| `kvm-ioctls`     | 0.19    | —                | Wrappers seguros sobre ioctls de /dev/kvm (Kvm, VmFd, VcpuFd)|
-| `kvm-bindings`   | 0.10    | `fam-wrappers`   | Structs FFI del kernel (kvm_regs, kvm_sregs, cpuid2, etc.)    |
-| `vm-memory`      | 0.14    | `backend-mmap`   | GuestMemoryMmap: RAM del guest como mmap anónimo              |
-| `linux-loader`   | 0.11    | `elf`, `bzimage` | Carga de imágenes ELF/bzImage en GuestMemory                  |
+## 4. Arquitectura del VMM (vmm.rs)
 
-### Grafo de dependencias relevante:
-```
-nkr
-├── kvm-ioctls ──► kvm-bindings (re-exporta structs)
-├── kvm-bindings
-├── vm-memory
-└── linux-loader ──► vm-memory (GuestMemory trait)
-```
+### Layout de Memoria del Guest (x86_64)
 
-## 6. Flujo de Ejecución Detallado
+| Dirección       | Contenido                        |
+|-----------------|----------------------------------|
+| `0x0500`        | GDT (Global Descriptor Table)    |
+| `0x7000`        | Zero Page (boot params)          |
+| `0x9000`        | PML4 (Page Map Level 4)          |
+| `0xA000`        | PDPT                             |
+| `0xB000`        | PD (Page Directory, 2MB pages)   |
+| `0x20000`       | Kernel command line              |
+| `0x100000`      | Kernel bzImage load address      |
+| `0x0800_0000`   | Initramfs load address           |
 
-```
-main()
-  └─► run_vmm()
-        ├─► [1] Kvm::new()                    // open("/dev/kvm")
-        ├─► [2] kvm.create_vm()               // KVM_CREATE_VM → VmFd
-        ├─► [3] GuestMemoryMmap::from_ranges() // mmap(512 MiB)
-        ├─► [4] register_guest_memory()        // KVM_SET_USER_MEMORY_REGION
-        ├─► [5] load_elf_kernel()              // linux-loader: ELF → GuestMemory
-        ├─► [6] write_page_tables()            // Identity map 1 GiB (2 MiB pages)
-        ├─► [7] write_gdt()                    // Null + Code64 + Data
-        ├─► [8] vm.create_vcpu(0)              // KVM_CREATE_VCPU
-        ├─► [9] vcpu.set_cpuid2()              // Passthrough CPUID del host
-        ├─► [10] configure_sregs()             // CR0/CR3/CR4/EFER + CS/DS + GDTR
-        ├─► [11] configure_regs()              // RIP=entry_point, RFLAGS=0x2
-        └─► [12] run_vcpu_loop()               // VMENTER/VMEXIT loop
-                  ├─ IoOut(0x3F8) → stdout
-                  ├─ IoIn(0x3F8)  → fill(0)
-                  ├─ Hlt          → break OK
-                  ├─ Shutdown     → break OK
-                  └─ other        → Err
-```
+### Mapa MMIO de Dispositivos VirtIO
 
-## 7. Mapa de Memoria del Guest (GPA Space)
+| Dirección         | Dispositivo                    | IRQ |
+|-------------------|--------------------------------|-----|
+| `0xD000_0000`     | VirtIO-Net (red)               | 5   |
+| `0xD000_1000`     | VirtIO-Block disco 0 (root)    | 6   |
+| `0xD000_2000`     | VirtIO-Block disco 1           | 7   |
+| `0xD000_3000`     | VirtIO-Block disco 2           | 8   |
+| ... (+0x1000)     | Discos adicionales             | +1  |
 
-```
-0x0000_0000 ┌──────────────────────────────┐
-            │  Zona reservada (IVT legacy) │  ← No usada en modo largo
-0x0000_0500 ├──────────────────────────────┤
-            │  GDT (4 entries × 8 bytes)   │  ← GDTR.base apunta aquí
-0x0000_0520 ├──────────────────────────────┤
-            │  (libre)                     │
-0x0000_9000 ├──────────────────────────────┤
-            │  PML4 Table (4 KiB)          │  ← CR3 apunta aquí
-0x0000_A000 ├──────────────────────────────┤
-            │  PDPT Table (4 KiB)          │
-0x0000_B000 ├──────────────────────────────┤
-            │  PD Table (4 KiB, 512 × 2M)  │
-0x0000_C000 ├──────────────────────────────┤
-            │  (libre hasta kernel load)   │
-            │  ...                         │
-0x0010_0000 ├──────────────────────────────┤  ← 1 MiB: zona típica de carga ELF
-            │  Kernel ELF segments         │
-            │  (PT_LOAD 0, 1, ...)         │
-            │  ...                         │
-            │  Entry point (e_entry) ──────│──► RIP inicial de la vCPU
-            │  ...                         │
-0x2000_0000 ├──────────────────────────────┤  ← 512 MiB: fin de la RAM del guest
-            │  (no mapeado — MMIO exits)   │
-            └──────────────────────────────┘
-```
+### Registros VirtIO-MMIO (offsets comunes)
 
-## 8. Constantes Clave y Justificación
+| Offset  | Registro             | Dirección |
+|---------|----------------------|-----------|
+| `0x000` | MagicValue           | Read      |
+| `0x004` | Version              | Read      |
+| `0x008` | DeviceID             | Read      |
+| `0x010` | DeviceFeatures       | Read      |
+| `0x014` | DeviceFeaturesSel    | Write     |
+| `0x020` | DriverFeatures       | Write     |
+| `0x030` | QueueSel             | Write     |
+| `0x034` | QueueNumMax          | Read      |
+| `0x038` | QueueNum             | Write     |
+| `0x044` | QueueReady           | R/W       |
+| `0x050` | QueueNotify          | Write     |
+| `0x060` | InterruptStatus      | Read      |
+| `0x064` | InterruptACK         | Write     |
+| `0x070` | Status               | R/W       |
+| `0x080` | QueueDescLow         | Write     |
+| `0x084` | QueueDescHigh        | Write     |
+| `0x090` | QueueAvailLow        | Write     |
+| `0x094` | QueueAvailHigh       | Write     |
+| `0x0A0` | QueueUsedLow         | Write     |
+| `0x0A4` | QueueUsedHigh        | Write     |
+| `0x100+`| Device Config Space  | Read      |
 
-| Constante         | Valor       | Justificación                                              |
-|-------------------|-------------|-------------------------------------------------------------|
-| `GUEST_RAM_SIZE`  | 512 MiB     | Suficiente para unikernels típicos (<100 MiB). Configurable.|
-| `COM1_PORT`       | 0x3F8       | Puerto serial estándar x86. Más simple que virtio-console.  |
-| `PML4_ADDR`       | 0x9000      | Zona baja libre. No colisiona con BDA (0x400) ni kernel.    |
-| `PDPT_ADDR`       | 0xA000      | Contigua a PML4 para localidad de caché.                    |
-| `PD_ADDR`         | 0xB000      | 512 entries × 2 MiB = 1 GiB de identity mapping.           |
-| `GDT_ADDR`        | 0x500       | Justo después de BDA (0x400-0x4FF) legacy.                  |
-| `KVM_MAX_CPUID_ENTRIES`| 256   | Importado de kvm-bindings. Máximo del kernel Linux para CPUID.|
+### Red (Networking)
 
-## 9. Requisitos del Unikernel (Guest)
+- Bridge: `nkr0` con IP `10.0.0.1/24`
+- Cada VM tiene IP `10.0.0.{vm_id + 1}` (ej: vm_id=1 → 10.0.0.2)
+- TAP auto-creado: `nkr-tap{vm_id}` conectado al bridge
+- MAC: `52:54:00:12:34:{vm_id}`
+- NAT/Masquerade para salida a internet
+- Port forwarding via iptables DNAT/SNAT
 
-Para que el unikernel funcione con NKR v0.1.0, debe:
+### Volúmenes
 
-1. **Formato**: ELF estático x86_64 (no PIE, no dinámico)
-2. **Entry point**: definido en `e_entry` del ELF header
-3. **Memoria**: segmentos PT_LOAD con `p_paddr` dentro de [0, 512 MiB)
-4. **Sin colisión**: no mapear en 0x0-0xFFFF (zona de page tables y GDT)
-5. **Consola**: escribir en puerto I/O 0x3F8 (`out dx, al` con DX=0x3F8)
-6. **Terminación**: ejecutar `hlt` para salida limpia
-7. **Stack**: configurar RSP en su propio `_start` (NKR no lo inicializa)
-8. **Sin interrupciones**: no depender de PIC/APIC (no hay IDT ni IRQ chip)
+- **Pre-boot:** el disco se monta con `mount -o loop`, se copian archivos host→guest
+- **Post-shutdown:** los volúmenes marcados `:rw` se extraen guest→host
+- Formato: `host_path:guest_path` (ro) o `host_path:guest_path:rw`
 
-### Ejemplo mínimo de unikernel (nasm):
-```nasm
-; test-kernel.asm — Unikernel mínimo para NKR
-; Compilar: nasm -f elf64 test-kernel.asm -o test-kernel.o
-;           ld -o test-kernel.img -Ttext 0x100000 --oformat elf64-x86-64 test-kernel.o
-BITS 64
-SECTION .text
-global _start
+### Variables de Entorno
 
-_start:
-    ; Escribir "Hello from NKR!\n" byte a byte en COM1
-    mov rsi, message
-    mov rcx, message_len
-.loop:
-    lodsb               ; AL = [RSI], RSI++
-    out 0x3F8, al       ; Escribir byte en COM1
-    loop .loop           ; CX--, si CX != 0 → .loop
-    hlt                  ; Señalar al VMM que terminamos
+- Se escriben en `/etc/nkr-env` dentro del disco root antes del boot
+- El initramfs hace `source /etc/nkr-env`
+- Formato CLI: `--env KEY=VALUE`
 
-SECTION .rodata
-message: db "Hello from NKR!", 10  ; 10 = '\n'
-message_len equ $ - message
-```
+---
 
-## 10. Compilación y Ejecución
+## 5. Comandos CLI
 
 ```bash
-# Compilar NKR (modo release para máximo rendimiento)
+# Ejecutar una micro-VM
+sudo nkr run --disk odoo.ext4 --ram 1024 --chrs 2 --id 1 \
+  --kernel bzImage --port 8069:8069 \
+  --volume ./odoo.conf:/etc/odoo/odoo.conf \
+  --env DB_HOST=10.0.0.2
+
+# Listar VMs activas
+sudo nkr ps
+
+# Detener una VM
+sudo nkr stop 1
+
+# Descargar imagen Docker Hub → disco ext4
+sudo nkr pull postgres:15 postgres.ext4 --size-gb 2
+
+# Construir disco desde Nkrfile
+sudo nkr build -f Nkrfile.odoo -o odoo.ext4 --size-gb 4
+
+# Orquestar stack multi-servicio
+sudo nkr compose up -f nkr-compose.yml -d   # daemon mode
+sudo nkr compose ps
+sudo nkr compose down
+```
+
+---
+
+## 6. Modelo de CPU: "Chrs"
+
+- 1 chr = 20% de un core físico (5 chrs = 1 core completo)
+- Se implementa vía `sched_setaffinity` (CPU pinning)
+- Los chrs son exclusivos: la VM se pinea a cores dedicados
+- `cores_needed = ceil(chrs / 5)`
+
+---
+
+## 7. Formato Compose (nkr-compose.yml)
+
+```yaml
+services:
+  nombre_servicio:
+    disks: ["/ruta/disco.ext4"]        # Obligatorio: primer disco = root
+    ram: 512                            # MB de RAM (default: 512)
+    chrs: 1                             # Chrs de CPU (default: 1)
+    id: 1                               # ID de VM (default: índice+1)
+    kernel: ./bzImage                   # Se resuelve: local → /mnt/nkr/kernel/ → junto a nkr
+    initramfs: /ruta/initramfs.cpio.gz  # Se resuelve: explícito → local → /mnt/nkr/initramfs/ → auto-detect
+    ports: ["8069:8069"]
+    volumes: ["host:guest:rw"]
+    environment:                        # Se inyectan como /etc/nkr-env
+      KEY: value
+    build:                              # Auto-build si disco no existe
+      nkrfile: Nkrfile.odoo
+      context: "."
+      size_gb: 4
+    healthcheck:
+      port: 8069
+      initial_delay: 20
+      interval: 5
+      retries: 15
+```
+
+### Ejemplo real (nkr-compose.yml actual)
+
+```yaml
+services:
+  db:
+    disks:
+      - /opt/nkr/disks/postgres.ext4
+    build:
+      nkrfile: Nkrfile.pg
+      size_gb: 2
+    initramfs: /opt/nkr/initramfs/pg_initramfs.cpio.gz
+    kernel: ./bzImage
+    ram: 512
+    chrs: 1
+    ports:
+      - "5432:5432"
+    volumes:
+      - "/opt/nkr/data/pg:/var/lib/postgresql/data:rw"
+    healthcheck:
+      port: 5432
+      initial_delay: 15
+      interval: 5
+      retries: 12
+
+  odoo:
+    disks:
+      - /opt/nkr/disks/odoo-prod.ext4
+    build:
+      nkrfile: Nkrfile.odoo
+      size_gb: 4
+    initramfs: /opt/nkr/initramfs/odoo_initramfs.cpio.gz
+    kernel: ./bzImage
+    ram: 1024
+    chrs: 2
+    ports:
+      - "8069:8069"
+    volumes:
+      - "/opt/nkr/config/odoo.conf:/etc/odoo/odoo.conf"
+      - "/opt/nkr/modules:/mnt/extra-addons"
+      - "/opt/nkr/data/filestore:/var/lib/odoo:rw"
+    healthcheck:
+      port: 8069
+      initial_delay: 20
+      interval: 5
+      retries: 15
+```
+
+### Resolución de recursos en Compose (compose.rs)
+
+Compose resuelve rutas de disco, kernel e initramfs con esta prioridad:
+
+| Recurso     | Orden de búsqueda                                                        |
+|-------------|--------------------------------------------------------------------------|
+| **Disco**   | Ruta en YAML → `<yaml_dir>/<nombre>` → `/mnt/nkr/images/<nombre>`       |
+| **Kernel**  | Explícito en YAML → `<yaml_dir>/bzImage` → `/mnt/nkr/kernel/bzImage` → junto al binario `nkr` |
+| **Initramfs** | Explícito en YAML → `<yaml_dir>/<servicio>_initramfs.cpio.gz` → `/mnt/nkr/initramfs/<servicio>_initramfs.cpio.gz` → auto-generar desde disco |
+
+### NKR Data Directory
+
+```
+/mnt/nkr/                  # Default (override con NKR_DATA_DIR env var)
+├── images/                # Discos ext4 base
+├── initramfs/             # Initramfs por servicio
+├── kernel/                # bzImage
+└── snapshots/             # Snapshots CoW por stack
+```
+
+### Snapshots CoW
+
+Si el disco base existe, Compose crea un snapshot por servicio usando `cp --reflink=auto` para Copy-on-Write en filesystems que lo soportan (btrfs, xfs). Esto permite compartir el filesystem base entre múltiples instancias sin duplicar espacio en disco.
+
+---
+
+## 8. Estado de VMs (/tmp/nkr-vms/)
+
+Cada VM activa crea un JSON en `/tmp/nkr-vms/{vm_id}.json`:
+
+```json
+{
+  "vm_id": 1,
+  "pid": 12345,
+  "ram_mb": 512,
+  "chrs": 1,
+  "disks": ["postgres.ext4"],
+  "guest_ip": "10.0.0.2",
+  "ports": ["5432:5432"],
+  "tap_name": "nkr-tap1",
+  "started_at": 1709308800
+}
+```
+
+`nkr ps` lee estos archivos. `nkr stop` envía SIGTERM al PID (con fallback a SIGKILL después de 3s).
+
+---
+
+## 9. Build de Discos
+
+Tanto `nkr pull` como `nkr build` **usan Docker como motor** únicamente para generar el filesystem:
+
+1. `docker create` / `docker build` → contenedor/imagen
+2. `docker export` → tarball del filesystem
+3. `truncate` + `mkfs.ext4` → disco vacío
+4. `mount -o loop` + `tar -xf` → contenido extraído
+5. Resultado: archivo `.ext4` listo para `nkr run --disk`
+
+**Docker NO se usa en tiempo de ejecución**, solo para construir discos.
+
+---
+
+## 10. Reglas y Convenciones para IAs
+
+### Al modificar código:
+
+1. **Lenguaje del código:** Los comentarios, nombres de funciones y mensajes de log están en **español** (ej: `eprintln!("[NKR] Error fatal: {e}")`). Mantén esta convención.
+
+2. **Mensajes de log:** Usan prefijos entre corchetes: `[NKR]`, `[NKR-BLOCK]`, `[NKR-NET]`, `[NKR-VOL]`, `[NKR-ENV]`, `[NKR-COMPOSE]`, `[NKR-PULL]`, `[NKR-BUILD]`, `[NKR-HEALTH]`, `[NKR-GUEST]`. Usa el prefijo apropiado para cada módulo.
+
+3. **Error handling:** Se usa `Box<dyn std::error::Error>` como tipo de error genérico. Las funciones retornan `Result<(), Box<dyn std::error::Error>>`.
+
+4. **Dependencias:** Todas las crates de virtualización vienen del ecosistema [rust-vmm](https://github.com/rust-vmm) (Firecracker, Cloud Hypervisor). Las versiones están fijadas en `Cargo.toml` para compatibilidad cruzada.
+
+5. **Permisos:** El binario requiere **root/sudo** para operar (acceso a `/dev/kvm`, `mount`, `iptables`, TAP devices).
+
+6. **No hay multithreading en vCPU:** Hay un solo vCPU por VM. El único thread extra es el de RX en `net.rs` (lee paquetes del TAP).
+
+7. **Sin QEMU/libvirt:** Todo es implementación propia directa sobre KVM. No proponer soluciones que dependan de QEMU.
+
+8. **VirtIO-MMIO (no PCI):** Los dispositivos usan transporte MMIO, no PCI. El kernel guest se configura con `pci=off`.
+
+### Al modificar la CLI:
+
+- Los subcomandos están en `cli.rs` usando `clap derive`
+- El dispatch está en `main.rs`
+- Los defaults están documentados en los `#[arg()]` attributes
+
+### Al modificar networking:
+
+- El bridge `nkr0` se auto-crea en `vmm.rs::ensure_bridge()`
+- TAPs se auto-crean como `nkr-tap{vm_id}`
+- Subnet fijo: `10.0.0.0/24`, gateway `10.0.0.1`
+- Port forwarding usa iptables (PREROUTING DNAT + OUTPUT DNAT + MASQUERADE)
+
+### Al modificar VirtIO:
+
+- Block device: cola única de 256 entradas, sectores de 512 bytes
+- Net device: 2 colas (RX=0, TX=1) de 256 entradas, header de 12 bytes
+- Feature negotiation: VIRTIO_F_VERSION_1 (bit 32)
+- El guest notifica vía QueueNotify (offset 0x050), el host inyecta IRQs vía irqfd
+
+### Al modificar compose:
+
+- Los servicios se ordenan alfabéticamente para IDs determinísticos
+- Auto-build: si `build:` está definido y el disco no existe, se construye
+- Health checks son TCP (no HTTP), corren en threads separados
+- Modo daemon: re-ejecuta `nkr compose up` como proceso background con logs en `logs/nkr-compose.log`
+
+---
+
+## 11. Compilación y Ejecución
+
+```bash
+# Compilar (release, optimizado)
 cargo build --release
 
-# Ejecutar con kernel por defecto (test-kernel.img en directorio actual)
-sudo ./target/release/nkr
+# El binario queda en target/release/nkr (~2-4 MB)
+# Ejecutar:
+sudo ./target/release/nkr run --disk mi_disco.ext4
 
-# Ejecutar con ruta explícita al unikernel
-sudo ./target/release/nkr /path/to/my-unikernel.img
-
-# Nota: `sudo` necesario por permisos de /dev/kvm.
-# Alternativa sin sudo: agregar usuario al grupo kvm:
-#   sudo usermod -aG kvm $USER && newgrp kvm
+# Setup completo de Odoo:
+sudo ./deploy/setup.sh   # Primera vez
+sudo ./deploy/start.sh   # Iniciar stack
+sudo ./deploy/stop.sh    # Detener stack
+sudo ./deploy/update.sh  # Actualizar módulos Odoo
 ```
 
-## 11. Diagnóstico de Errores Comunes
+### Deploy Multi-Tenant
 
-| Error                                    | Causa probable                          | Solución                                      |
-|------------------------------------------|-----------------------------------------|-----------------------------------------------|
-| `Fallo al abrir /dev/kvm`               | KVM no habilitado o sin permisos        | `modprobe kvm_intel` + `chmod 666 /dev/kvm`   |
-| `Fallo KVM_CREATE_VM`                    | Límite de FDs alcanzado                 | `ulimit -n 65536`                             |
-| `Fallo al cargar ELF`                    | Imagen no es ELF x86_64 o es PIE       | Verificar con `readelf -h imagen.img`         |
-| `vCPU shutdown (triple fault)`           | Excepción en guest sin IDT              | Verificar que el kernel no genera excepciones |
-| `vcpu.run() falló`                       | Registros mal configurados              | Verificar CR0/CR3/CR4/EFER y segmentos        |
-| `MMIO write no manejado`                 | Guest accede fuera de RAM mapeada       | Verificar que PT_LOAD cabe en 512 MiB         |
+```bash
+# Agregar cliente en deploy/clients.yml, luego:
+sudo ./deploy/mt-provision.sh                # Provisionar TODOS los clientes
+sudo ./deploy/mt-provision.sh cliente1        # Provisionar solo uno
+sudo ./deploy/mt-provision.sh --base          # Solo crear disco base Odoo
 
-## 12. Roadmap de Desarrollo
-
-### v0.2.0 — Dispositivos Virtuales Básicos
-- [ ] Emulación completa de UART 16550 (TX + RX + interrupts)
-- [ ] IRQ chip (KVM_CREATE_IRQCHIP) para interrupciones de hardware
-- [ ] PIT (KVM_CREATE_PIT2) para timer ticks
-- [ ] Soporte para bzImage (kernel Linux estándar) además de ELF
-- [ ] Boot params / zero page para kernels Linux
-
-### v0.3.0 — Block Device & Networking
-- [ ] virtio-blk para montar filesystem del unikernel (read-only)
-- [ ] virtio-net con TAP backend para networking
-- [ ] MMIO transport para dispositivos virtio (sin PCI)
-- [ ] Configuración vía archivo TOML o flags CLI
-
-### v0.4.0 — Multi-vCPU & Memory Hotplug
-- [ ] Soporte para N vCPUs (SMP)
-- [ ] APIC routing para distribución de interrupts
-- [ ] Memory hotplug: ajustar RAM del guest dinámicamente
-- [ ] Huge pages (2M/1G) para reducir TLB misses
-
-### v0.5.0 — API & Orquestación
-- [ ] API REST/gRPC para gestión de VMs (`nkr start/stop/status`)
-- [ ] Snapshots: guardar/restaurar estado de VM (live migration base)
-- [ ] Métricas: latencia de VMEXIT, throughput de I/O
-- [ ] Rate limiting y QoS para dispositivos virtio
-
-### v1.0.0 — Producción
-- [ ] Seccomp filters para reducir superficie de ataque del VMM
-- [ ] Jailer: sandbox del proceso nkr con namespaces/cgroups
-- [ ] Compatibilidad OCI: ejecutar imágenes de contenedor como unikernels
-- [ ] Integración con Kubernetes (CRI runtime)
-- [ ] Documentación completa + benchmarks vs Docker/Firecracker
-
-## 13. Decisiones de Diseño Fundamentales
-
-### ¿Por qué NO QEMU?
-QEMU es un emulador generalista con >2M líneas de código. NKR necesita sub-milisegundo
-de boot time y superficie de ataque mínima. Cada línea de código de QEMU es un potencial CVE.
-
-### ¿Por qué rust-vmm y no bindings directos a KVM?
-rust-vmm provee abstracciones zero-cost que eliminan errores comunes (wrong ioctl number,
-buffer overflows en CPUID, memory region misalignment). Las mismas crates las usa Firecracker
-en producción en AWS Lambda — están battle-tested.
-
-### ¿Por qué identity mapping y no un page table completo?
-En v0.1.0, el unikernel corre en ring 0 con GVA == GPA. Esto simplifica radicalmente
-el debugging (las direcciones que ves en los dumps son las mismas que en el guest).
-Futuras versiones pueden implementar ASLR y separación user/kernel si se necesita.
-
-### ¿Por qué no configurar RSP?
-Cada unikernel tiene su propio layout de memoria. Configurar RSP desde el VMM requeriría
-conocer el linker script del guest. Es más limpio que _start configure su propio stack.
-
-### ¿Por qué serial (port I/O 0x3F8) y no virtio-console?
-Port I/O es el mecanismo más simple posible (una instrucción `out`, un VMEXIT, print).
-No requiere descriptores, virt queues, ni drivers en el guest. Perfecto para v0.1.0.
-
-## 14. Convenciones de Código
-
-- **Idioma de comentarios**: Español (el equipo es hispanohablante)
-- **Manejo de errores**: `Result<T, Box<dyn Error>>` con `.map_err()` descriptivo
-- **Sin `unwrap()` excesivo**: usar `.map_err()` o `.expect("mensaje técnico")`
-- **Logs**: `eprintln!("[NKR] ...")` para logs del VMM, `stdout` exclusivo para el guest
-- **Constantes**: SCREAMING_SNAKE_CASE con docstring explicando la justificación
-- **Funciones**: una función por responsabilidad, documentada con `///`
-
-## 15. Contexto para Continuación por IA
-
-Cuando continúes el desarrollo de NKR, ten en cuenta:
-
-1. **Compilación cruzada**: el proyecto SOLO compila en Linux x86_64 (depende de /dev/kvm)
-2. **Permisos**: se necesita acceso a /dev/kvm (root o grupo kvm)
-3. **Testing**: para probar, necesitas un unikernel ELF x86_64 (ver ejemplo en sección 9)
-4. **Prioridad**: el siguiente paso lógico es v0.2.0 (UART 16550 completa + IRQ chip)
-5. **No romper**: el bucle de vcpu.run() es el hot path — cualquier overhead ahí es crítico
-6. **Single binary**: NKR debe seguir siendo un único binario sin dependencias de runtime
-7. **Compatibilidad de crates**: al actualizar versiones, verificar cross-compatibility
-   del ecosistema rust-vmm (especialmente kvm-ioctls ↔ kvm-bindings)
-
-## 16. Documentación Técnica del Código (extraída de main.rs)
-
-Esta sección contiene toda la documentación inline que originalmente vivía como comentarios
-en `src/main.rs`. Se extrajo para mantener el código fuente limpio y la documentación
-centralizada.
-
-### 16.1 Descripción General del Archivo
-
-NKR (Nano-Kernel Runtime) v0.1.0 — Virtual Machine Monitor Fundacional.
-Hipervisor bare-metal que se comunica directamente con /dev/kvm para ejecutar
-unikernels (.img) sin dependencias externas (sin QEMU, sin Firecracker).
-
-Arquitectura: VMM single-process, single-vCPU, consola serial por port I/O.
-
-Flujo de ejecución:
-```
-/dev/kvm → VM fd → GuestMemory (mmap) → ELF loader → vCPU (sregs+regs)
-→ vcpu.run() loop → IoOut(0x3F8) → stdout del host
+# Cada provisión genera:
+#   - Disco CoW desde base (/opt/nkr/disks/<cliente>.ext4)
+#   - Config Odoo personalizada (/opt/nkr/config/<cliente>.conf)
+#   - Config nginx con proxy reverso (/etc/nginx/sites-available/nkr-<cliente>)
 ```
 
-### 16.2 Constantes de Arquitectura x86_64
+### Actualización de Módulos Odoo
 
-- **`GUEST_RAM_SIZE` (512 MiB)**: RAM del guest por defecto. Suficiente para la mayoría de unikernels. Configurable vía CLI en futuras versiones.
-
-- **`COM1_PORT` (0x3F8)**: Puerto I/O del COM1 estándar (UART 16550). El unikernel escribe bytes aquí (`out 0x3F8, al`) para salida de consola. El VMM intercepta el VMEXIT tipo IoOut y redirige el byte a stdout del host.
-
-- **Tablas de paginación (`PML4_ADDR=0x9000`, `PDPT_ADDR=0xA000`, `PD_ADDR=0xB000`)**: Direcciones físicas para las tablas de paginación identity-mapped. Se ubican en la zona baja de memoria (<64 KiB) para evitar colisión con el kernel que típicamente se carga en direcciones más altas (>1 MiB). Estructura de 4 niveles (obligatoria para modo largo x86_64): PML4 (0x9000) → PDPT (0xA000) → PD (0xB000) → páginas de 2 MiB.
-
-- **`GDT_ADDR` (0x500)**: Dirección donde se escribe la Global Descriptor Table en memoria del guest. La GDT es requerida por el hardware x86_64 aunque la segmentación esté efectivamente flat en modo largo. Ubicada en zona baja para no colisionar.
-
-- **`KVM_MAX_CPUID_ENTRIES`**: Se importa directamente de kvm-bindings. Es el máximo definido por el kernel Linux (256 en la mayoría de versiones). Se usa como tope para `get_supported_cpuid()`; valores mayores causan ENOMEM.
-
-### 16.3 Función `run_vmm()`
-
-Orquesta el ciclo de vida completo del VMM:
-1. Apertura de /dev/kvm
-2. Creación de la VM (espacio de direcciones aislado)
-3. Asignación de memoria física del guest (mmap)
-4. Carga del kernel ELF en la memoria del guest
-5. Escritura de tablas de paginación y GDT
-6. Creación y configuración de la vCPU 0
-7. Ejecución del bucle vcpu.run()
-
-**Paso 1 — Abrir /dev/kvm**: `Kvm::new()` ejecuta `open("/dev/kvm")` y verifica la versión de la API. Si falla, es porque KVM no está disponible en el host.
-
-**Paso 2 — Crear VM**: `KVM_CREATE_VM` devuelve un file descriptor que representa una VM completa con su propio espacio de direcciones físicas (GPA space), IRQ routing, y conjunto de vCPUs. Cada VM es un sandbox de hardware aislado.
-
-**Paso 3 — Memoria del guest**: `GuestMemoryMmap::from_ranges()` crea un `mmap(2)` anónimo de `GUEST_RAM_SIZE` bytes. Este bloque de memoria del host se convertirá en la "RAM física" que el guest percibe. KVM traduce GPA → HVA en hardware via EPT/NPT.
-
-**Paso 4 — Registrar memoria en KVM**: Establece el shadow page table o configura EPT/NPT para que los accesos del guest a GPA [0, GUEST_RAM_SIZE) se traduzcan a la HVA del mmap.
-
-**Paso 5 — Preparar entorno x86_64**: Antes de arrancar la vCPU, se escriben en la "RAM" del guest las estructuras de datos que el procesador consulta al arrancar:
-  - Tablas de paginación identity-mapped: GVA == GPA para el primer GiB. Sin paginación activa, no se puede entrar en modo largo.
-  - GDT: el hardware requiere al menos un descriptor de código (CS) y uno de datos. En modo largo la segmentación es flat, pero la GDT no puede estar ausente.
-
-**Paso 6 — Crear vCPU**: `KVM_CREATE_VCPU` devuelve un fd que representa un hilo de ejecución del procesador virtual. En v0.1.0 usamos una sola vCPU (ID=0). Se pasan las hojas CPUID del host al guest — sin esto, el kernel podría intentar usar instrucciones no soportadas o detectar un CPU inválido.
-
-### 16.4 Función `register_guest_memory()`
-
-Registra todas las regiones de `GuestMemoryMmap` en el file descriptor de la VM. Por cada región, emite el ioctl `KVM_SET_USER_MEMORY_REGION` que instruye a KVM a mapear un rango de Guest Physical Addresses (GPA) a la Host Virtual Address (HVA) del mmap anónimo correspondiente.
-
-En v0.1.0 solo tenemos una región contigua [0, 512 MiB), pero el código está preparado para múltiples regiones (e.g., separar low-mem de high-mem, o crear huecos para MMIO en futuras versiones).
-
-**SAFETY**: La región de memoria está respaldada por un mmap válido que permanece vivo durante toda la ejecución de la VM. El mmap no se comparte con otros procesos ni se libera prematuramente. `as_ptr()` devuelve la HVA del inicio del mmap de esta región; KVM usa esta dirección para configurar EPT/NPT.
-
-### 16.5 Función `load_elf_kernel()`
-
-Carga un binario ELF desde `path` en la memoria física del guest. Utiliza `linux-loader` que:
-1. Parsea el ELF header (`e_ident`, `e_entry`, `e_phoff`)
-2. Itera sobre los Program Headers tipo `PT_LOAD`
-3. Copia cada segmento a la GPA especificada en `p_paddr`
-4. Retorna el entry point (`e_entry`) como `kernel_load`
-
-El entry point es la dirección donde el unikernel espera que la CPU comience a ejecutar instrucciones (primer byte del `_start` o `main`).
-
-**Parámetros de carga**:
-- `kernel_start = None`: sin offset adicional, usar las GPAs del ELF tal cual. Los unikernels típicamente se linkean a direcciones absolutas que coinciden con su posición deseada en la memoria física del guest.
-- `highmem_start_address = None`: sin restricción de zona alta. Todo el espacio de direcciones del guest es válido para carga.
-- `kernel_load` contiene `e_entry` del ELF: la dirección virtual donde el procesador debe comenzar la ejecución. Con identity mapping, GVA == GPA.
-
-### 16.6 Función `write_page_tables()`
-
-Escribe las tablas de paginación de 4 niveles para identity mapping del primer GiB de memoria física.
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ CR3 ──► PML4 (0x9000)                                      │
-│           └─ [0] ──► PDPT (0xA000)                         │
-│                        └─ [0] ──► PD (0xB000)              │
-│                                    ├─ [0]   → 0x00000000   │
-│                                    ├─ [1]   → 0x00200000   │
-│                                    ├─ ...                   │
-│                                    └─ [511] → 0x3FE00000   │
-│                                                             │
-│  512 entradas × 2 MiB = 1 GiB identity-mapped              │
-└─────────────────────────────────────────────────────────────┘
+```bash
+sudo ./deploy/update.sh              # Producción: sync + restart (~5s downtime)
+sudo ./deploy/update.sh --test       # Probar en puerto 8070 sin tocar producción
+sudo ./deploy/update.sh --rollback   # Restaurar backup anterior de módulos
+sudo ./deploy/update.sh --update-db  # Actualizar + forzar -u all en Odoo
 ```
 
-Cada entrada PDE usa el bit PS (Page Size) para indicar páginas de 2 MiB, eliminando la necesidad de un cuarto nivel (Page Table). Esto simplifica el setup y es suficiente para el rango de memoria que usamos.
+Flujo del update:
+1. Backup automático de módulos actuales (mantiene últimos 5)
+2. Stop Odoo (PG sigue corriendo)
+3. Rsync de módulos con `__manifest__.py` desde `/opt/nkr/modules/` al disco
+4. Restart Odoo → ~5 segundos de downtime total
 
-Identity mapping (GVA == GPA) es necesario porque el kernel recién cargado no tiene su propio MMU setup y espera que las direcciones virtuales coincidan con las físicas al menos durante el bootstrap.
+---
 
-**Bits de las entradas**:
-- PML4[0]: apunta a la PDPT. Present (bit 0) + Read/Write (bit 1) = 0x3
-- PDPT[0]: apunta al Page Directory. Mismos bits: Present + Read/Write.
-- PD[0..511]: cada entrada mapea 2 MiB de memoria física. bit 0 (P) = Present, bit 1 (RW) = Read/Write, bit 7 (PS) = Page Size (indica 2 MiB, no hay nivel PT). 0x83 = P | RW | PS. La dirección física base de cada página es i × 2 MiB. Con identity mapping, GVA 0x00400000 → GPA 0x00400000.
+## 12. Archivos Importantes que NO debes modificar sin contexto
 
-### 16.7 Función `write_gdt()`
+| Archivo         | Razón                                                  |
+|-----------------|--------------------------------------------------------|
+| `bzImage`       | Kernel pre-compilado. No es código fuente.             |
+| `*.ext4`        | Discos binarios de VMs. Se generan con pull/build.     |
+| `init`          | Script de init del guest (tools/initramfs/init)        |
+| `target/`       | Output de compilación Rust. No editar manualmente.     |
 
-Escribe una GDT mínima en la memoria del guest. En modo largo x86_64, la segmentación está efectivamente deshabilitada (todo es flat, base=0, limit=max), pero el hardware REQUIERE una GDT válida con al menos un descriptor de código para CS.
+---
 
-**Layout de la GDT**:
+## 13. Problemas Comunes y Debugging
 
-| Offset | Descriptor                                       |
-|--------|--------------------------------------------------|
-| 0x00   | Null (requerido por arquitectura Intel/AMD)      |
-| 0x08   | Code64: L=1, D=0, P=1, DPL=0, Execute/Read      |
-| 0x10   | Data: G=1, DB=1, P=1, DPL=0, Read/Write         |
-| 0x18   | Reservado (padding para alineación)               |
+- **"Fallo al abrir /dev/kvm":** KVM no habilitado o sin permisos. Verificar: `ls -la /dev/kvm`.
+- **"Fallo ip tuntap add":** Requiere root. Ejecutar con `sudo`.
+- **VM se queda sin responder:** Verificar que el initramfs tiene los módulos correctos (`virtio_blk.ko`, `virtio_net.ko`, `ext4.ko`).
+- **Port forwarding no funciona:** Verificar que `ip_forward=1` y que no hay reglas iptables conflictivas.
+- **Disco muy pequeño:** Usar `--size-gb` en pull/build para aumentar tamaño.
+- **VM arranca pero el servicio no inicia:** El initramfs hace `switch_root` al disco ext4. El disco debe tener un `/sbin/init` ejecutable (systemd o similar). Si no lo tiene, NKR crea un wrapper `/sbin/nkr-init` que busca el init del sistema.
 
-El selector de CS (0x08) referencia el descriptor Code64 con L=1, que le dice al procesador que ejecute en modo 64-bit completo.
+---
 
-**Codificación de descriptores** (Referencia: Intel SDM Vol. 3A, Sección 3.4.5):
-- `[0x00] 0x0000_0000_0000_0000` — Null descriptor, obligatorio, el procesador lo ignora.
-- `[0x08] 0x00AF_9A00_0000_FFFF` — Code segment 64-bit: Base=0, Limit=0xFFFFF (con G=1 → 4 GiB efectivos), P=1 (present), DPL=0 (ring 0), S=1 (code/data), Type=0xA (exec/read), L=1 (long mode), D=0 (debe ser 0 cuando L=1).
-- `[0x10] 0x00CF_9200_0000_FFFF` — Data segment: Base=0, Limit=0xFFFFF (con G=1 → 4 GiB), P=1, DPL=0, S=1, Type=0x2 (read/write), DB=1 (operaciones de 32-bit), G=1 (granularidad 4 KiB).
-- `[0x18] 0x0000_0000_0000_0000` — Reservado, padding para alineación a 32 bytes.
+## 13.1 Flujo de Boot del Guest (initramfs → rootfs)
 
-### 16.8 Función `configure_sregs()`
+El init del guest (`tools/initramfs/init`, ~189 líneas) sigue este flujo:
 
-Configura los Special Registers (sregs) para arrancar en modo largo x86_64.
+```
+1. mount /proc, /sys, /dev + redirect a /dev/console
+2. insmod: crc32c, libcrc32c, crc16, mbcache, jbd2, ext4, virtio_blk, failover, net_failover, virtio_net
+   (módulos del kernel 6.6.117-0-virt en /lib/modules/)
+3. Esperar /dev/vda (hasta 3s, intervalos de 100ms)
+4. Parsear nkr.ip=X.X.X.X del kernel cmdline (default: 10.0.0.2)
+5. mount /dev/vda → /newroot (ext4)
+6. mount /dev/vdb,vdc,vdd,vde → /newroot/mnt/disk0,disk1...
+7. Mover /proc,/sys,/dev a /newroot + montar tmpfs en /run y /tmp
+8. Generar /etc/nkr-net.sh (script de red con IP y gateway)
+9. Crear /etc/resolv.conf (DNS 8.8.8.8, 8.8.4.4)
+10. Configurar red ANTES de switch_root (via chroot temporal)
+11. Buscar init real: /sbin/init → /usr/sbin/init → systemd → entrypoint Docker
+12. Crear /sbin/nkr-init wrapper:
+    - Ejecuta /etc/nkr-net.sh
+    - Source /etc/nkr-env (variables de entorno NKR)
+    - Exec init real del sistema
+    - Fallback: sleep loop si no hay init
+13. exec switch_root /newroot /sbin/nkr-init
+```
 
-El procesador x86_64 tiene múltiples "puertas" que deben abrirse en orden para transicionar de Real Mode → Protected Mode → Long Mode:
+**Importante:** El disco ext4 (creado por `nkr pull` o `nkr build`) debe contener un sistema de archivos completo (rootfs). Docker export genera exactamente esto.
 
-1. `CR0.PE = 1` → Activar Protected Mode
-2. `CR4.PAE = 1` → Habilitar Physical Address Extension (>4 GiB)
-3. `CR3 = &PML4` → Apuntar a las tablas de paginación
-4. `EFER.LME = 1` → Habilitar Long Mode Enable
-5. `CR0.PG = 1` → Activar paginación (esto activa LMA automáticamente)
-6. `CS.L = 1, CS.D=0` → Ejecutar en modo 64-bit
+**Emergency shell:** Si `/dev/vda` no aparece o el mount falla, el initramfs cae a un shell de emergencia (`/bin/sh`) con diagnósticos.
 
-KVM permite saltar directamente al estado final sin pasar por la transición secuencial, ya que configuramos todos los registros antes del primer `vcpu.run()`.
+---
 
-**Control Registers**:
-- **CR0**: bit 0 (PE) = Protected Mode Enable, bit 31 (PG) = Paging Enable. Sin estos bits, el procesador está en Real Mode (16-bit).
-- **CR3**: dirección física de la tabla PML4 (raíz del árbol de paginación). El hardware la consulta en cada acceso a memoria para traducir GVA → GPA.
-- **CR4**: bit 5 (PAE) = Physical Address Extension — obligatorio para modo largo. Sin PAE, la paginación opera en modo legacy 32-bit (2 niveles).
-- **EFER** (Extended Feature Enable Register, MSR 0xC0000080): bit 8 (LME) = Long Mode Enable — solicita transición a modo largo. bit 10 (LMA) = Long Mode Active — confirmación de que estamos en 64-bit. LMA se activa automáticamente por el hardware cuando PG=1 y LME=1, pero KVM requiere que lo configuremos explícitamente.
+## 14. Roadmap / Trabajo Pendiente
 
-**Code Segment (selector 0x08)**: CS define el modo de ejecución. En modo largo: L=1, D=0 → modo 64-bit completo (operandos de 64-bit, RIP de 64-bit). L=1, D=1 → comportamiento indefinido (PROHIBIDO). L=0, D=1 → modo compatibilidad 32-bit dentro de long mode.
+### Prioridad Alta (bloquean producción multi-tenant)
 
-**Data Segments (selector 0x10)**: En modo largo, DS/ES/FS/GS/SS son efectivamente ignorados por el hardware (base siempre tratada como 0, excepto FS y GS que pueden tener base != 0 vía MSRs). Pero KVM valida que tengan descriptores presentes y válidos.
+- ~~**Multi-tenant Odoo:** Soporte para N instancias de Odoo apuntando a 1 PostgreSQL compartido~~ **✅ IMPLEMENTADO**
+  - ✅ `deploy/clients.yml` — registro centralizado de clientes
+  - ✅ `deploy/mt-common.sh` — funciones comunes (parse YAML, calcular IDs/IPs)
+  - ✅ `deploy/mt-provision.sh` — provisionar disco CoW, config Odoo, config nginx por cliente
+  - ⬜ `deploy/mt-compose-gen.sh` — generar nkr-compose.yml multi-tenant (pendiente)
+  - ⬜ Probar flujo completo end-to-end con múltiples clientes
+- ~~**Nginx único como gateway:**~~ **✅ IMPLEMENTADO** (auto-generación de configs nginx en mt-provision.sh)
+  - ✅ Genera config por dominio → IP interna de cada Odoo
+  - ✅ Soporte WebSocket/longpolling
+  - ✅ Template HTTPS con Let's Encrypt (comentado, listo para activar)
+  - ⬜ Let's Encrypt automático (requiere `certbot --nginx` manual por ahora)
+- ~~**Optimización de RAM:**~~ **✅ IMPLEMENTADO** en configs generadas
+  - ✅ `workers=0` (modo threaded) + `limit_memory_hard=512MB` + `limit_memory_soft=400MB`
+  - ✅ Default 256 MB RAM por instancia Odoo en clients.yml
+- ~~**Optimización de disco:**~~ **✅ IMPLEMENTADO**
+  - ✅ `cp --reflink=auto` en mt-provision.sh (CoW real en btrfs/xfs)
+  - ✅ `ensure_snapshot()` en compose.rs para snapshots automáticos
+  - ✅ Resolución de disco base compartido (`/mnt/nkr/images/`)
+- ~~**Hot-update de módulos:**~~ **✅ IMPLEMENTADO** en `deploy/update.sh`
+  - ✅ Modo default (~5s downtime): sync + restart
+  - ✅ `--test`: probar en puerto 8070
+  - ✅ `--rollback`: restaurar backup anterior
+  - ✅ `--update-db`: forzar actualización de base de datos
+  - ✅ Backup automático (mantiene últimos 5)
+  - ⬜ Hot-update masivo para N instancias secuencialmente
 
-**GDT Register**: GDTR apunta al inicio de la GDT en la RAM del guest. limit = (4 entradas × 8 bytes) - 1 = 31.
+### Prioridad Media (mejoran operación)
 
-**IDT Register**: En v0.1.0 no configuramos una IDT. Si el unikernel genera una excepción sin IDT válida, se producirá un triple fault → `VcpuExit::Shutdown`. Futuras versiones deben configurar al menos vectores de excepción básicos.
+- **VirtIO Console** (`0xD0002000`): stub implementado, falta funcionalidad real
+- **Múltiples vCPUs:** Actualmente solo 1 vCPU por VM
+- **VirtIO-FS:** Para volúmenes compartidos más eficientes (actual: copy pre/post-boot)
+- **Métricas/Monitoring:** Dashboard de uso de RAM/CPU/disco por VM
+- **Backup automatizado:** Snapshot de discos ext4 + dump de PostgreSQL por cliente
+- **Scaling automático:** Agregar/quitar instancias Odoo sin editar YAML manualmente
 
-### 16.9 Función `configure_regs()`
+### Prioridad Baja (nice-to-have)
 
-Configura los registros generales de la vCPU.
+- **Live migration:** Mover VMs entre servidores
+- **Snapshots en caliente:** Sin detener la VM
+- **Tests unitarios:** No hay tests automatizados
 
-- **RIP**: Entry point del kernel ELF (donde comienza la ejecución). Debe coincidir con `e_entry` del ELF + cualquier offset aplicado.
-- **RFLAGS**: bit 1 es reservado y SIEMPRE debe estar en 1 (Intel SDM Vol. 1). Todos los demás flags en 0: IF=0 (interrupciones deshabilitadas, no tenemos IDT ni PIC/APIC), DF=0 (dirección de strings hacia adelante), TF=0 (sin single-step tracing).
-- **RSP**: Deliberadamente no se configura. Razones: (1) El unikernel puede tener su propio linker script que define `_stack_top`. (2) Asignar un stack arbitrario podría colisionar con el kernel cargado. (3) Muchos unikernels configuran RSP como primera instrucción en `_start`. Si necesitas un stack pre-configurado (e.g., para kernels Linux): `regs.rsp = GUEST_RAM_SIZE as u64 - 0x1000` (Tope de RAM - guard page).
+---
 
-### 16.10 Función `run_vcpu_loop()`
+## 15. Deploy Multi-Tenant — Registro de Clientes (clients.yml)
 
-Bucle de ejecución de la vCPU — corazón del VMM.
+Archivo `deploy/clients.yml` define todos los clientes y la configuración global:
 
-Cada iteración:
-1. `vcpu.run()` ejecuta VMLAUNCH/VMRESUME en hardware
-2. La CPU ejecuta instrucciones del guest a velocidad nativa
-3. Cuando ocurre un evento que requiere intervención del host (VMEXIT), KVM retorna al userspace con un `VcpuExit` que describe el motivo
-4. El VMM maneja el evento y decide si continuar o terminar
+```yaml
+global:
+  kernel: ./bzImage
+  pg_initramfs: /opt/nkr/initramfs/pg_initramfs.cpio.gz
+  odoo_initramfs: /opt/nkr/initramfs/odoo_initramfs.cpio.gz
+  base_disk: /opt/nkr/disks/odoo-base.ext4
+  disk_dir: /opt/nkr/disks
+  data_dir: /opt/nkr/data
+  config_dir: /opt/nkr/config
+  modules_dir: /opt/nkr/modules
+  pg_ram: 2048              # RAM para PostgreSQL compartido
+  pg_chrs: 2
+  odoo_ram: 256             # Default RAM por instancia Odoo
+  odoo_chrs: 1
+  odoo_disk_size_gb: 4
+  nginx_sites_dir: /etc/nginx/sites-available
+  nginx_enabled_dir: /etc/nginx/sites-enabled
 
-**VMEXITs manejados en v0.1.0**:
+clients:
+  - name: cliente1
+    domain: cliente1.midominio.com
+    db_name: cliente1_prod
+  - name: cliente2
+    domain: cliente2.midominio.com
+    db_name: cliente2_prod
+    ram: 512                # Override del default
+    chrs: 2
+```
 
-| Exit            | Causa                              | Acción                    |
-|-----------------|------------------------------------|--------------------------|
-| IoOut(0x3F8)    | `out 0x3F8, al` en el guest        | Byte → stdout del host    |
-| IoIn(0x3F8)     | `in al, 0x3F8` en el guest         | Retorna 0x0 (sin input)   |
-| Hlt             | Instrucción `hlt`                  | Terminación limpia        |
-| Shutdown        | Triple fault o shutdown explícito  | Terminación con warning   |
-| MmioRead/Write  | Acceso a GPA sin memoria mapeada   | Log warning, continuar    |
+### Asignación de IDs
 
-**Lock de stdout**: Se adquiere UNA VEZ fuera del loop para evitar el overhead de lock/unlock en cada byte de salida serial. Esto es seguro porque: (1) Somos single-threaded (una sola vCPU). (2) Los mensajes diagnósticos usan `eprintln!` (stderr, lock separado).
+- `vm_id=1` → PostgreSQL (IP `10.0.0.2`)
+- `vm_id=2+` → Clientes Odoo en orden de lista (IP `10.0.0.{vm_id + 1}`)
 
-**Detalles por exit**:
-- **IoOut (COM1)**: La instrucción `out dx, al` con DX=0x3F8 causa un VMEXIT tipo IoOut. El array `data` contiene el/los byte(s) escritos. Se redirigen directamente a stdout sin buffering. Otros puertos (0x3F9-0x3FF para control de UART, 0x60/0x64 para teclado PS/2) se ignoran silenciosamente. En v0.2.0 se puede agregar un bus de I/O con dispatch.
-- **IoIn (COM1)**: `in al, dx` con DX=0x3F8. El guest está leyendo el Receive Buffer Register o el Line Status Register del UART. Sin emulación completa de 16550, retornamos 0x00 (sin datos disponibles). Un UART real retornaría el Line Status en puerto +5.
-- **Hlt**: El guest ejecutó `hlt`. En un unikernel, esto típicamente significa "trabajo completado, no hay más que hacer".
-- **Shutdown (Triple fault)**: El guest generó una excepción, no había IDT, la excepción de "no hay handler" generó otra excepción, y la tercera excepción anidada causa shutdown del procesador.
-- **MMIO**: El guest intentó acceder a una dirección física que no tiene memoria RAM mapeada. En un VMM completo, estas direcciones se usan para dispositivos virtuales (virtio-net, etc.).
-- **Error en vcpu.run()**: Condición irrecuperable. Causas típicas: registros configurados de forma inconsistente (e.g., PG=1 sin CR3 válido), memoria del guest no cubre las direcciones que el kernel intenta acceder, bug en KVM o el kernel del host.
+### Scripts Multi-Tenant
+
+| Script              | Función                                                              |
+|---------------------|----------------------------------------------------------------------|
+| `mt-common.sh`      | Funciones bash: `yaml_global()`, `parse_clients()`, `get_client()`, `get_vm_id()`, `vm_ip()`, `print_client_table()` |
+| `mt-provision.sh`   | Provisiona clientes: disco CoW, config Odoo, config nginx + reload   |
+| `clients.yml`       | Registro YAML de clientes con defaults y overrides                   |
+
+### Estructura de directorios en producción
+
+```
+/opt/nkr/
+├── disks/              # Discos ext4
+│   ├── odoo-base.ext4  # Disco base (se crea una vez con nkr build)
+│   ├── postgres.ext4
+│   ├── cliente1.ext4   # CoW desde base
+│   └── cliente2.ext4
+├── config/             # Configs Odoo por cliente
+│   ├── cliente1.conf
+│   └── cliente2.conf
+├── data/               # Datos persistentes
+│   ├── pg/             # PostgreSQL data
+│   ├── cliente1/filestore/
+│   └── cliente2/filestore/
+├── modules/            # Módulos Odoo compartidos
+├── initramfs/          # Initramfs por servicio
+│   ├── pg_initramfs.cpio.gz
+│   └── odoo_initramfs.cpio.gz
+└── backups/            # Backups de módulos (update.sh)
+```
+
+---
+
+*Última actualización: 2026-03-03*

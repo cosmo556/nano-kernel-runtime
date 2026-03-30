@@ -1,0 +1,188 @@
+#!/bin/sh
+# =============================================================================
+# NKR Guest Init — Initramfs genérico para micro-VMs
+# =============================================================================
+# Este script:
+#   1. Monta filesystems virtuales (/proc, /sys, /dev)
+#   2. Carga módulos del kernel (ext4, virtio_blk, virtio_net)
+#   3. Monta el disco root (/dev/vda) en /newroot
+#   4. Configura red (IP desde kernel cmdline: nkr.ip=X.X.X.X)
+#   5. Inyecta DNS y variables de entorno
+#   6. Hace switch_root al rootfs real → ejecuta /sbin/init del disco
+# =============================================================================
+
+export PATH=/bin:/sbin
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+
+# Redirect output to serial console
+exec > /dev/console 2>&1
+
+echo "[NKR-GUEST] init started"
+
+# ── 1. Cargar módulos del kernel ──
+M="/lib/modules/6.6.117-0-virt"
+for mod in crc32c_generic.ko crc32c-intel.ko libcrc32c.ko crc16.ko mbcache.ko jbd2.ko ext4.ko virtio_blk.ko failover.ko net_failover.ko virtio_net.ko; do
+    [ -f "$M/$mod" ] && insmod "$M/$mod" 2>/dev/null
+done
+echo "[NKR-GUEST] modules loaded"
+
+# Esperar a que /dev/vda aparezca (virtio_blk puede tardar un instante)
+WAIT=0
+while [ ! -b /dev/vda ] && [ $WAIT -lt 30 ]; do
+    sleep 0.1
+    WAIT=$((WAIT + 1))
+done
+
+if [ ! -b /dev/vda ]; then
+    echo "[NKR-GUEST] ERROR: /dev/vda not found after 3s"
+    echo "[NKR-GUEST] Available block devices:"
+    ls -la /dev/vd* /dev/sd* 2>/dev/null
+    echo "[NKR-GUEST] Falling back to emergency shell"
+    exec /bin/sh
+fi
+
+echo "[NKR-GUEST] /dev/vda ready"
+
+# ── 2. Parsear parámetros del kernel cmdline ──
+CMDLINE=$(cat /proc/cmdline)
+GUEST_IP=""
+for param in $CMDLINE; do
+    case "$param" in
+        nkr.ip=*) GUEST_IP="${param#nkr.ip=}" ;;
+    esac
+done
+
+if [ -z "$GUEST_IP" ]; then
+    GUEST_IP="10.0.0.2"
+    echo "[NKR-GUEST] using default IP: $GUEST_IP"
+fi
+GATEWAY="10.0.0.1"
+
+# ── 3. Montar disco root ──
+echo "[NKR-GUEST] mounting /dev/vda → /newroot"
+mkdir -p /newroot
+mount -t ext4 /dev/vda /newroot
+
+if [ $? -ne 0 ]; then
+    echo "[NKR-GUEST] ERROR: failed to mount /dev/vda"
+    exec /bin/sh
+fi
+
+# Montar discos adicionales si existen (/dev/vdb → /newroot/mnt/disk1, etc.)
+DISK_IDX=0
+for dev in /dev/vdb /dev/vdc /dev/vdd /dev/vde; do
+    if [ -b "$dev" ]; then
+        MOUNT_POINT="/newroot/mnt/disk${DISK_IDX}"
+        mkdir -p "$MOUNT_POINT"
+        mount -t ext4 "$dev" "$MOUNT_POINT" 2>/dev/null && \
+            echo "[NKR-GUEST] mounted $dev → /mnt/disk${DISK_IDX}"
+        DISK_IDX=$((DISK_IDX + 1))
+    fi
+done
+
+# ── 4. Preparar filesystems virtuales en newroot ──
+mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/run /newroot/tmp
+mount --move /proc /newroot/proc
+mount --move /sys /newroot/sys
+mount --move /dev /newroot/dev
+mount -t tmpfs tmpfs /newroot/run
+mount -t tmpfs tmpfs /newroot/tmp
+
+# ── 5. Configurar red dentro del newroot ──
+# Crear script de red que se ejecuta al inicio del rootfs real
+mkdir -p /newroot/etc
+cat > /newroot/etc/nkr-net.sh << NETSCRIPT
+#!/bin/sh
+# Auto-generado por NKR initramfs
+ip link set lo up
+if [ -d /sys/class/net/eth0 ]; then
+    ip link set eth0 up
+    ip addr add ${GUEST_IP}/24 dev eth0
+    ip route add default via ${GATEWAY}
+fi
+NETSCRIPT
+chmod +x /newroot/etc/nkr-net.sh
+
+# Configurar DNS
+cat > /newroot/etc/resolv.conf << DNS
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+DNS
+
+# ── 6. Cargar variables de entorno (si /etc/nkr-env existe en el disco) ──
+# Las variables se inyectan pre-boot por vmm.rs y se sourcearán por el init del rootfs
+
+# ── 7. Configurar red ANTES del switch_root ──
+# (necesario porque switch_root pierde el initramfs)
+if [ -d /newroot/sys/class/net/eth0 ]; then
+    # Ya está en /newroot/proc, usar chroot temporal
+    chroot /newroot /bin/sh -c "
+        ip link set lo up 2>/dev/null
+        ip link set eth0 up 2>/dev/null
+        ip addr add ${GUEST_IP}/24 dev eth0 2>/dev/null
+        ip route add default via ${GATEWAY} 2>/dev/null
+    " 2>/dev/null
+    echo "[NKR-GUEST] eth0 configured: ${GUEST_IP}/24 gw ${GATEWAY}"
+fi
+
+# ── 8. Determinar init del rootfs ──
+INIT=""
+for candidate in /newroot/sbin/init /newroot/usr/sbin/init /newroot/usr/lib/systemd/systemd /newroot/lib/systemd/systemd; do
+    if [ -x "$candidate" ]; then
+        INIT="${candidate#/newroot}"
+        break
+    fi
+done
+
+# Si no hay init binario, buscar un script (contenedores Docker suelen tener entrypoint)
+if [ -z "$INIT" ]; then
+    # Intentar leer CMD/ENTRYPOINT de la imagen Docker (si existe metadata)
+    if [ -f /newroot/.dockerenv ] || [ -f /newroot/etc/nkr-env ]; then
+        # Crear un init wrapper que sourcee env vars y ejecute el servicio
+        INIT="/sbin/nkr-init"
+    fi
+fi
+
+if [ -z "$INIT" ] && [ ! -x "/newroot/sbin/nkr-init" ]; then
+    echo "[NKR-GUEST] WARNING: No init found in rootfs"
+    echo "[NKR-GUEST] Available candidates:"
+    ls -la /newroot/sbin/init /newroot/usr/sbin/init /newroot/usr/lib/systemd/systemd 2>/dev/null
+    echo "[NKR-GUEST] Dropping to shell on rootfs"
+    exec chroot /newroot /bin/sh
+fi
+
+# ── 9. Crear nkr-init wrapper (genérico) ──
+# Este wrapper se ejecuta como PID 1 en el rootfs real.
+# Sourcear env vars, configurar red, y ejecutar el init real del sistema.
+if [ ! -x "/newroot/sbin/nkr-init" ]; then
+    cat > /newroot/sbin/nkr-init << 'NKRINIT'
+#!/bin/sh
+# NKR Init Wrapper — PID 1 en el rootfs
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Configurar red
+/etc/nkr-net.sh 2>/dev/null
+
+# Cargar variables de entorno NKR
+[ -f /etc/nkr-env ] && . /etc/nkr-env
+
+# Ejecutar init real del sistema
+for init in /usr/lib/systemd/systemd /lib/systemd/systemd /sbin/init; do
+    [ -x "$init" ] && exec "$init"
+done
+
+# Si no hay init del sistema, mantener PID 1 vivo
+echo "[NKR-GUEST] No system init found, keeping PID 1 alive"
+while true; do sleep 3600; done
+NKRINIT
+    chmod +x /newroot/sbin/nkr-init
+    INIT="/sbin/nkr-init"
+fi
+
+echo "[NKR-GUEST] switch_root → ${INIT}"
+
+# ── 10. switch_root al disco real ──
+exec switch_root /newroot "$INIT"

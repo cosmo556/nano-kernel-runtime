@@ -1,0 +1,20 @@
+# =============================================================================
+# Nkrfile.pgbouncer — PgBouncer connection pooler para NKR (Alpine)
+# =============================================================================
+# Construye: sudo nkr build -f Nkrfile.pgbouncer -o pgbouncer.ext4 --size-gb 1
+# =============================================================================
+
+FROM alpine:3.18
+
+# Instalar pgbouncer y crear usuario postgres
+RUN apk add --no-cache pgbouncer && \
+    addgroup -S postgres && adduser -S postgres -G postgres
+
+# Crear el directorio de pid y asegurar permisos
+RUN mkdir -p /var/run/postgresql && chown -R postgres:postgres /var/run/postgresql
+
+# Crear el directorio de logs
+RUN mkdir -p /var/log/postgresql && chown -R postgres:postgres /var/log/postgresql
+
+# Exponer el puerto por defecto de pgbouncer
+EXPOSE 6432

@@ -1,0 +1,38 @@
+# =============================================================================
+# Nkrfile — Odoo 17 para NKR
+# =============================================================================
+# Construye: sudo nkr build -f Nkrfile.odoo -o odoo.ext4 --size-gb 4
+#
+# Personaliza: agrega tus dependencias Python, paquetes del sistema,
+# y archivos de configuración aquí.
+# =============================================================================
+
+FROM odoo:17.0
+
+USER root
+
+# ── Dependencias Python adicionales (descomenta las que necesites) ──
+# RUN pip3 install --no-cache-dir \
+#     phonenumbers \
+#     python-barcode \
+#     num2words \
+#     xlsxwriter \
+#     vobject \
+#     qrcode
+
+# ── Paquetes del sistema (descomenta si necesitas) ──
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#     wkhtmltopdf \
+#     && rm -rf /var/lib/apt/lists/*
+
+# ── Configuración Odoo ──
+COPY deploy/config/odoo.conf /etc/odoo/odoo.conf
+RUN chown odoo:odoo /etc/odoo/odoo.conf
+
+# ── Directorio para módulos custom ──
+RUN mkdir -p /mnt/extra-addons && chown odoo:odoo /mnt/extra-addons
+
+# ── (Opcional) Copiar módulos directamente al disco ──
+# COPY ./modules/ /mnt/extra-addons/
+
+USER odoo
