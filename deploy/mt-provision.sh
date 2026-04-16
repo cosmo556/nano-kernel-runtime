@@ -62,7 +62,7 @@ create_base_disk() {
 
 provision_client() {
     local client_name="$1"
-    IFS='|' read -r name domain db_name ram chrs <<< "$(get_client "$client_name")"
+    IFS='|' read -r name domain db_name ram chrs stmt_timeout conn_limit <<< "$(get_client "$client_name")"
 
     if [[ -z "$name" ]]; then
         error "Cliente '$client_name' no encontrado en $CLIENTS_YML"
@@ -236,6 +236,10 @@ NGINXCONF
         warn "  $NGINX_SITES no existe — nginx no instalado, omitiendo config"
     fi
 
+    # ── 5. Límites PostgreSQL por base de datos ──
+    info "  Aplicando límites DB multi-tenant..."
+    inject_db_limits "$db_name" "${stmt_timeout:-60000}" "${conn_limit:-10}"
+
     info "  ✓ $name provisionado"
 }
 
@@ -264,7 +268,7 @@ else
     info "Provisionando $total cliente(s)..."
     echo ""
 
-    while IFS='|' read -r name domain db_name ram chrs; do
+    while IFS='|' read -r name domain db_name ram chrs stmt_timeout conn_limit; do
         provision_client "$name"
         echo ""
     done <<< "$(parse_clients)"

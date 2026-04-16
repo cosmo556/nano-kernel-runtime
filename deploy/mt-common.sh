@@ -33,36 +33,49 @@ yaml_global() {
 }
 
 # ── Leer lista de clientes ──
-# Retorna líneas con formato: name|domain|db_name|ram|chrs
-# ram y chrs usan defaults globales si no están definidos
+# Retorna líneas con formato: name|domain|db_name|ram|chrs|stmt_timeout|conn_limit
+# Campos opcionales usan defaults globales si no están definidos en el cliente
 parse_clients() {
     local default_ram=$(yaml_global "odoo_ram")
     local default_chrs=$(yaml_global "odoo_chrs")
+    local default_stmt=$(yaml_global "db_statement_timeout")
+    local default_conn=$(yaml_global "db_conn_limit")
+    # Valores de seguridad si no están definidos en clients.yml aún
+    [[ -z "$default_stmt" ]] && default_stmt=60000
+    [[ -z "$default_conn" ]] && default_conn=10
 
-    awk -v def_ram="$default_ram" -v def_chrs="$default_chrs" '
+    awk -v def_ram="$default_ram" -v def_chrs="$default_chrs" \
+        -v def_stmt="$default_stmt" -v def_conn="$default_conn" '
         /^clients:/ { in_clients=1; next }
         /^[a-z]/ && !/^  / && !/^  -/ { in_clients=0 }
         !in_clients { next }
 
         /^  - name:/ {
             if (name != "") {
-                ram = (client_ram != "") ? client_ram : def_ram
-                chrs = (client_chrs != "") ? client_chrs : def_chrs
-                print name "|" domain "|" db_name "|" ram "|" chrs
+                ram   = (client_ram   != "") ? client_ram   : def_ram
+                chrs  = (client_chrs  != "") ? client_chrs  : def_chrs
+                stmt  = (client_stmt  != "") ? client_stmt  : def_stmt
+                conn  = (client_conn  != "") ? client_conn  : def_conn
+                print name "|" domain "|" db_name "|" ram "|" chrs "|" stmt "|" conn
             }
-            name = $3; domain = ""; db_name = ""; client_ram = ""; client_chrs = ""
+            name = $3; domain = ""; db_name = ""
+            client_ram = ""; client_chrs = ""; client_stmt = ""; client_conn = ""
             next
         }
-        /^    domain:/ { domain = $2; next }
-        /^    db_name:/ { db_name = $2; next }
-        /^    ram:/ { client_ram = $2; next }
-        /^    chrs:/ { client_chrs = $2; next }
+        /^    domain:/              { domain     = $2; next }
+        /^    db_name:/             { db_name    = $2; next }
+        /^    ram:/                 { client_ram  = $2; next }
+        /^    chrs:/                { client_chrs = $2; next }
+        /^    db_statement_timeout:/ { client_stmt = $2; next }
+        /^    db_conn_limit:/       { client_conn = $2; next }
 
         END {
             if (name != "") {
-                ram = (client_ram != "") ? client_ram : def_ram
-                chrs = (client_chrs != "") ? client_chrs : def_chrs
-                print name "|" domain "|" db_name "|" ram "|" chrs
+                ram   = (client_ram   != "") ? client_ram   : def_ram
+                chrs  = (client_chrs  != "") ? client_chrs  : def_chrs
+                stmt  = (client_stmt  != "") ? client_stmt  : def_stmt
+                conn  = (client_conn  != "") ? client_conn  : def_conn
+                print name "|" domain "|" db_name "|" ram "|" chrs "|" stmt "|" conn
             }
         }
     ' "$CLIENTS_YML"
@@ -74,7 +87,7 @@ count_clients() {
 }
 
 # ── Obtener datos de un cliente por nombre ──
-# Uso: IFS='|' read -r name domain db_name ram chrs <<< "$(get_client cliente1)"
+# Uso: IFS='|' read -r name domain db_name ram chrs stmt_timeout conn_limit <<< "$(get_client cliente1)"
 get_client() {
     parse_clients | grep "^$1|"
 }
@@ -97,6 +110,41 @@ get_vm_id() {
 
 # ── IP del guest dado vm_id ──
 vm_ip() { echo "10.0.0.$(($1 + 1))"; }
+
+# ── Aplicar límites multi-tenant a una base de datos en PostgreSQL ──
+# Uso: inject_db_limits <db_name> <stmt_timeout_ms> <conn_limit>
+# Requiere que la VM PostgreSQL (10.0.0.2:5432) esté corriendo.
+inject_db_limits() {
+    local db_name="$1"
+    local stmt_timeout="${2:-60000}"
+    local conn_limit="${3:-10}"
+    local pg_host="10.0.0.2"
+    local pg_port="5432"
+    local pg_user
+    pg_user=$(yaml_global "pg_user")
+    local pg_pass
+    pg_pass=$(yaml_global "pg_password")
+
+    # Esperar a que PostgreSQL esté listo (máx 30 intentos × 1s)
+    local attempts=0
+    while ! PGPASSWORD="$pg_pass" pg_isready -h "$pg_host" -p "$pg_port" \
+              -U "$pg_user" -q 2>/dev/null; do
+        attempts=$((attempts + 1))
+        if [[ $attempts -ge 30 ]]; then
+            warn "  PostgreSQL no disponible en ${pg_host}:${pg_port} — omitiendo límites para $db_name"
+            return 0
+        fi
+        sleep 1
+    done
+
+    PGPASSWORD="$pg_pass" psql -h "$pg_host" -p "$pg_port" -U "$pg_user" \
+        -d postgres -q \
+        -c "ALTER DATABASE \"${db_name}\" SET statement_timeout = '${stmt_timeout}ms';" \
+        -c "ALTER DATABASE \"${db_name}\" CONNECTION LIMIT ${conn_limit};" \
+        2>/dev/null \
+    && info "  DB límites aplicados: timeout=${stmt_timeout}ms, conexiones=${conn_limit}" \
+    || warn "  No se pudieron aplicar límites DB para $db_name (¿aún no existe? se reintentará en la próxima provisión)"
+}
 
 # ── Rutas por cliente ──
 client_disk()   { echo "$(yaml_global disk_dir)/${1}.ext4"; }

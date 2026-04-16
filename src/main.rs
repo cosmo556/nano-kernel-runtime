@@ -15,12 +15,19 @@ mod build;
 mod state;
 mod initramfs;
 mod registry;
+mod metrics;
+mod seccomp;
+mod pmem;
+mod balloon;
+mod virtio_fs;
+mod console;
+mod cell;
 
 fn main() {
     let args = cli::parse();
 
     match args.command {
-        cli::Command::Run { hash, name, ram, chrs, id, disk, kernel, initramfs, port, volume, env, tap } => {
+        cli::Command::Run { hash, name, ram, chrs, id, disk, kernel, initramfs, port, volume, env, tap, share, rootfs, pmem, balloon_mb, burst, cell_id } => {
             let vm_hash = hash.unwrap_or_else(|| {
                 let nanos = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -62,6 +69,12 @@ fn main() {
                 volumes: volume,
                 env_vars: env,
                 tap_name: tap,
+                shares: share,
+                rootfs,
+                use_pmem: pmem,
+                balloon_mb,
+                burst,
+                cell_id,
             };
 
             if let Err(e) = vmm::run(config) {
@@ -118,6 +131,57 @@ fn main() {
             }
         }
 
+        cli::Command::Stats { filter } => {
+            let vms = state::list_vms();
+            let filtered: Vec<_> = if filter.is_empty() {
+                vms
+            } else {
+                vms.into_iter()
+                    .filter(|v| {
+                        v.name == filter
+                            || v.hash == filter
+                            || v.vm_id.to_string() == filter
+                    })
+                    .collect()
+            };
+            metrics::print_stats_table(&filtered);
+        }
+
+        cli::Command::Ksm { action } => {
+            match action.as_str() {
+                "on" => match metrics::ksm_enable() {
+                    Ok(()) => {
+                        eprintln!("[KSM] Activado con parámetros optimizados para Odoo");
+                        metrics::print_ksm_status();
+                    }
+                    Err(e) => {
+                        eprintln!("[KSM] Error: {e}");
+                        process::exit(1);
+                    }
+                },
+                "off" => match metrics::ksm_disable() {
+                    Ok(()) => eprintln!("[KSM] Desactivado"),
+                    Err(e) => {
+                        eprintln!("[KSM] Error: {e}");
+                        process::exit(1);
+                    }
+                },
+                "status" | "" => metrics::print_ksm_status(),
+                _ => {
+                    eprintln!("[KSM] Acción desconocida: '{}'. Usar: on, off, status", action);
+                    process::exit(1);
+                }
+            }
+        }
+
+        cli::Command::Serve { port } => {
+            metrics::start_prometheus_server(port);
+            eprintln!("[NKR] Servidor de métricas iniciado. Ctrl+C para detener.");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
+
         cli::Command::Build { file, output, size_mb, context, name, no_initramfs } => {
             if output != "auto" || no_initramfs {
                 // Modo legacy: salida explícita
@@ -142,6 +206,106 @@ fn main() {
                 if let Err(e) = build::build_and_generate(&file, &nvm_name, size_mb, &context) {
                     eprintln!("[NKR-BUILD] Error: {e}");
                     process::exit(1);
+                }
+            }
+        }
+
+        cli::Command::Cell { action } => {
+            match action {
+                cli::CellAction::Create { name, odoo_version } => {
+                    match cell::create_cell(&name, odoo_version.as_deref()) {
+                        Ok(config) => {
+                            if let Err(e) = cell::ensure_cell_bridge(config.cell_id) {
+                                eprintln!("[NKR-CELL] WARN: bridge no creado ({e}). Ejecuta con sudo antes de 'cell up'.");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[NKR-CELL] Error: {e}");
+                            process::exit(1);
+                        }
+                    }
+                }
+
+                cli::CellAction::Ls => {
+                    cell::print_cell_table();
+                }
+
+                cli::CellAction::Up { name, detach } => {
+                    let config = match cell::load_cell(&name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("[NKR-CELL] {e}");
+                            process::exit(1);
+                        }
+                    };
+                    if let Err(e) = cell::ensure_cell_bridge(config.cell_id) {
+                        eprintln!("[NKR-CELL] Error creando bridge: {e}");
+                        process::exit(1);
+                    }
+                    let compose_path = cell::cell_compose_path(&name);
+                    if !compose_path.exists() {
+                        eprintln!("[NKR-CELL] No existe {}. Genera el compose antes de 'cell up'.",
+                            compose_path.display());
+                        process::exit(1);
+                    }
+                    let compose_str = compose_path.to_string_lossy().to_string();
+                    if let Err(e) = compose::compose_up(&compose_str, detach) {
+                        eprintln!("[NKR-CELL] Error en compose up: {e}");
+                        process::exit(1);
+                    }
+                }
+
+                cli::CellAction::Down { name } => {
+                    let config = match cell::load_cell(&name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("[NKR-CELL] {e}");
+                            process::exit(1);
+                        }
+                    };
+                    let compose_path = cell::cell_compose_path(&name);
+                    let compose_str = compose_path.to_string_lossy().to_string();
+                    if compose_path.exists() {
+                        let _ = compose::compose_down(&compose_str);
+                    } else {
+                        // Sin compose: detener todas las VMs con ese cell_id
+                        for vm in state::list_vms() {
+                            if vm.cell_id == config.cell_id {
+                                let _ = state::stop_vm(vm.vm_id);
+                            }
+                        }
+                    }
+                }
+
+                cli::CellAction::Ps { name } => {
+                    let vms = state::list_vms();
+                    let filtered: Vec<_> = match name.as_deref() {
+                        Some(cell_name) => {
+                            let cid = cell::lookup_cell_id(cell_name).unwrap_or(0);
+                            vms.into_iter().filter(|v| v.cell_id == cid).collect()
+                        }
+                        None => vms,
+                    };
+                    if filtered.is_empty() {
+                        eprintln!("[NKR] No hay micro-VMs activas para ese filtro");
+                    } else {
+                        // Reutilizar tabla de estado
+                        state::print_vm_table();
+                    }
+                }
+
+                cli::CellAction::Destroy { name } => {
+                    match cell::destroy_cell(&name) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            eprintln!("[NKR-CELL] Célula '{}' no existe en el registry", name);
+                            process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("[NKR-CELL] Error: {e}");
+                            process::exit(1);
+                        }
+                    }
                 }
             }
         }

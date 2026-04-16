@@ -1,18 +1,23 @@
 // =============================================================================
 // NKR VirtIO-Net — Dispositivo de red con TAP backend
 // =============================================================================
+//
+// Feature B: TX usa io_uring para escrituras al fd del TAP en lote.
+// RX mantiene el hilo bloqueante existente (cambio mínimo de riesgo).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 use std::thread;
 
-//// Imports over
+use libc;
 
+use io_uring::{IoUring, opcode, types};
 use vmm_sys_util::eventfd::EventFd;
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
-use vm_memory::{GuestMemoryMmap, Bytes};
+use vm_memory::{Bytes, GuestMemoryMmap};
 
 /// MAC address de 6 bytes
 type MacAddr = [u8; 6];
@@ -49,6 +54,13 @@ pub struct VirtioNetDevice {
 
     // Config
     pub mac: MacAddr,
+
+    // Feature B — io_uring TX: None si el kernel no lo soporta
+    tx_ring: Option<IoUring>,
+    // Buffer de paquetes TX en vuelo (user_data → bytes del paquete)
+    // Necesitamos retener el Vec mientras io_uring lo procesa
+    tx_pending: std::collections::HashMap<u64, Vec<u8>>,
+    tx_next_ud: u64,
 }
 
 impl VirtioNetDevice {
@@ -88,6 +100,12 @@ impl VirtioNetDevice {
             status: 0,
         }));
 
+        // Feature B — io_uring TX ring
+        let tx_ring = match IoUring::new(64) {
+            Ok(r)  => { eprintln!("[NKR-NET] io_uring TX activo"); Some(r) }
+            Err(e) => { eprintln!("[NKR-NET] io_uring TX no disponible ({e}), usando write síncrono"); None }
+        };
+
         let net_dev = VirtioNetDevice {
             tap_file,
             state: state.clone(),
@@ -107,6 +125,9 @@ impl VirtioNetDevice {
             used_low: [0, 0],
             used_high: [0, 0],
             mac,
+            tx_ring,
+            tx_pending: std::collections::HashMap::new(),
+            tx_next_ud: 0,
         };
 
         if let Some(mut file) = tap_file_for_thread {
@@ -115,7 +136,22 @@ impl VirtioNetDevice {
             
             thread::spawn(move || {
                 let mut buf = [0u8; 65536];
+                let raw_fd = file.as_raw_fd();
                 loop {
+                    // poll con timeout de 200ms para poder detectar SHUTDOWN_REQUESTED
+                    let mut pfd = libc::pollfd {
+                        fd: raw_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let ret = unsafe { libc::poll(&mut pfd, 1, 200) };
+                    if ret < 0 { break; } // error en poll
+                    if ret == 0 {
+                        // timeout: comprobar si se pidió apagado
+                        if crate::vmm::SHUTDOWN_REQUESTED.load(Ordering::SeqCst) { break; }
+                        continue;
+                    }
+                    if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 { break; }
                     match file.read(&mut buf) {
                         Ok(n) if n > 0 => {
                             let mut st = state_clone.lock().unwrap();
@@ -229,13 +265,17 @@ impl VirtioNetDevice {
         eprintln!("[NKR-NET] Dispositivo reseteado");
     }
 
-    /// Procesa paquetes TX: lee de la cola del guest → escribe al TAP
+    /// Procesa paquetes TX: lee de la cola del guest → escribe al TAP.
+    /// Feature B: usa io_uring Write si disponible; fallback a write_all síncrono.
     pub fn process_tx(&mut self) {
         let is_ready = { self.state.lock().unwrap().queue_ready[1] };
         if !is_ready { return; }
 
+        let tap_fd = self.tap_file.as_ref()
+            .and_then(|arc| arc.lock().ok().map(|f| f.as_raw_fd()));
+
         let mem = self.mem.as_ref();
-        let mut used_results = Vec::new();
+        let mut used_results: Vec<(u16, u32)> = Vec::new();
 
         {
             let mut iter = match self.queue_tx.iter(mem) {
@@ -247,7 +287,7 @@ impl VirtioNetDevice {
                 let head_index = chain.head_index();
                 let mut total_len = 0u32;
 
-                // Leer todos los descriptors de la cadena y concatenar
+                // Leer descriptors y concatenar el paquete completo
                 let mut packet = Vec::new();
                 while let Some(desc) = chain.next() {
                     let mut buf = vec![0u8; desc.len() as usize];
@@ -256,18 +296,59 @@ impl VirtioNetDevice {
                     total_len += desc.len();
                 }
 
-                // Los primeros 12 bytes son el virtio-net header, los datos empiezan después
+                // Los primeros 12 bytes son la cabecera virtio-net
                 if packet.len() > 12 {
-                    if let Some(ref tap_arc) = self.tap_file {
+                    let payload = packet[12..].to_vec();
+
+                    if let (Some(fd), Some(ref mut ring)) = (tap_fd, self.tx_ring.as_mut()) {
+                        // Ruta io_uring: submission asíncrona
+                        let ud = self.tx_next_ud;
+                        self.tx_next_ud += 1;
+
+                        let entry = opcode::Write::new(
+                            types::Fd(fd),
+                            payload.as_ptr(),
+                            payload.len() as u32,
+                        )
+                        .build()
+                        .user_data(ud);
+
+                        // Guardar buffer para mantenerlo vivo hasta que io_uring lo procese
+                        self.tx_pending.insert(ud, payload);
+
+                        unsafe {
+                            let mut sq = ring.submission_shared();
+                            if sq.push(&entry).is_err() {
+                                // SQ lleno: enviar directamente de forma síncrona
+                                self.tx_pending.remove(&ud);
+                                if let Some(ref tap_arc) = self.tap_file {
+                                    if let Ok(mut tap) = tap_arc.lock() {
+                                        let _ = tap.write_all(&packet[12..]);
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(ref tap_arc) = self.tap_file {
+                        // Fallback síncrono
                         if let Ok(mut tap) = tap_arc.lock() {
-                            let _ = tap.write_all(&packet[12..]);
+                            let _ = tap.write_all(&payload);
                         }
                     }
-                } else {
+                } else if !packet.is_empty() {
                     eprintln!("[NKR-NET] WARN: TX packet too small: {} bytes", packet.len());
                 }
 
                 used_results.push((head_index, total_len));
+            }
+        } // drop iter borrow
+
+        // Submitear lote io_uring TX
+        if let Some(ref mut ring) = self.tx_ring {
+            let _ = ring.submit();
+            // Drena completions para liberar buffers pendientes
+            ring.completion().sync();
+            for cqe in ring.completion() {
+                self.tx_pending.remove(&cqe.user_data());
             }
         }
 

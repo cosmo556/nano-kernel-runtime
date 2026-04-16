@@ -33,6 +33,15 @@ pub struct VmState {
     pub ports: Vec<String>,
     pub tap_name: String,
     pub started_at: u64, // Unix timestamp
+    /// VirtIO-PMEM + DAX activo (ahorra ~200 MB de page cache duplicada)
+    #[serde(default)]
+    pub use_pmem: bool,
+    /// MB actualmente inflados en el balloon (devueltos al host)
+    #[serde(default)]
+    pub balloon_mb: u32,
+    /// Cell ID (0 = legacy, 1-254 = cell con bridge aislado)
+    #[serde(default)]
+    pub cell_id: u8,
 }
 
 /// Registra una VM activa escribiendo su estado a disco
@@ -139,8 +148,8 @@ pub fn stop_vm(vm_id: u8) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("No se pudo enviar SIGTERM a PID {}: {}", state.pid, err).into());
     }
 
-    // Esperar brevemente a que termine
-    for _ in 0..30 {
+    // Esperar hasta 20 s (dar margen al VMM para cleanup antes de SIGKILL)
+    for _ in 0..200 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if !is_pid_alive(state.pid) {
             unregister_vm(vm_id);
@@ -220,7 +229,8 @@ pub fn print_vm_table() {
             uptime_str);
     }
 
-    eprintln!("╚═════╩══════════════╩════════════════════╩════════╩═══════╩══════╩════════════════╩═══════════════════╩═══════════╩══════════╝");    eprintln!("[NKR] {} VM(s) activa(s)", vms.len());
+    eprintln!("╚═════╩══════════════╩════════════════════╩════════╩═══════╩══════╩════════════════╩═══════════════════╩═══════════╩══════════╝");
+    eprintln!("[NKR] {} VM(s) activa(s) — usa 'nkr stats' para CPU%/RAM real/red/disco en vivo", vms.len());
 }
 
 // =============================================================================

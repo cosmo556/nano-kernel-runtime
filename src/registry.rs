@@ -3,13 +3,14 @@
 // =============================================================================
 //
 // Cada NVM (nombre) recibe un ID numérico estable que determina:
-//   - IP del guest:   10.0.0.(id + 1)
-//   - TAP device:     nkr-tap{id}
-//   - MAC address:    52:54:00:12:34:{id}
+//   - IP del guest:   10.0.{cell_id}.{vm_id + 1}
+//   - TAP device:     nkr-c{cell_id}-tap{vm_id}
+//   - MAC address:    52:54:00:{cell_id}:34:{vm_id}
 //
 // El registro se persiste en /mnt/nkr/registry.json para garantizar que
 // el mismo nombre siempre obtenga la misma IP, incluso tras reinicios.
 //
+// IDs son cell-scoped: la key es "cell_name/vm_name" (o "vm_name" para legacy cell_id=0).
 // Rango de IDs: 2..254 (1 reservado internamente, 0 descartado)
 // =============================================================================
 
@@ -64,14 +65,27 @@ impl Registry {
         Ok(())
     }
 
-    /// Conjunto de IDs ya asignados
+    /// Conjunto de IDs ya asignados (global, legacy)
+    #[allow(dead_code)]
     fn used_ids(&self) -> Vec<u8> {
         self.entries.values().cloned().collect()
     }
 
-    /// Siguiente ID libre en el rango [MIN_ID, MAX_ID]
-    fn next_free_id(&self) -> Option<u8> {
-        let used = self.used_ids();
+    /// IDs usados dentro del scope de una cell (prefijo "cell_name/")
+    /// Si scope=None, devuelve IDs sin prefijo "/" (legacy cell_id=0).
+    fn used_ids_in_scope(&self, scope: Option<&str>) -> Vec<u8> {
+        self.entries.iter().filter_map(|(k, v)| {
+            let in_scope = match scope {
+                Some(cell) => k.starts_with(&format!("{}/", cell)),
+                None => !k.contains('/'),
+            };
+            if in_scope { Some(*v) } else { None }
+        }).collect()
+    }
+
+    /// Siguiente ID libre dentro del scope de una cell
+    fn next_free_id_in_scope(&self, scope: Option<&str>) -> Option<u8> {
+        let used = self.used_ids_in_scope(scope);
         (MIN_ID..=MAX_ID).find(|id| !used.contains(id))
     }
 }
@@ -80,29 +94,43 @@ impl Registry {
 // API pública
 // =============================================================================
 
-/// Resuelve el ID para un nombre dado.
+/// Resuelve el ID para un nombre dado, opcionalmente scoped por cell.
 /// Si ya tiene un ID asignado, lo retorna. Si no, asigna el siguiente libre.
+/// Con cell_name=Some("nazcatex"), la key es "nazcatex/vm_name".
+/// Con cell_name=None, la key es "vm_name" (legacy, cell_id=0).
 pub fn resolve_id(name: &str) -> Result<u8, Box<dyn std::error::Error>> {
+    resolve_id_scoped(None, name)
+}
+
+/// Versión cell-scoped de resolve_id
+pub fn resolve_id_scoped(cell_name: Option<&str>, name: &str) -> Result<u8, Box<dyn std::error::Error>> {
     let mut reg = Registry::load();
 
-    // Normalizar nombre (lowercase, trim)
-    let key = name.trim().to_lowercase();
-    if key.is_empty() {
+    let vm_key = name.trim().to_lowercase();
+    if vm_key.is_empty() {
         return Err("El nombre del NVM no puede estar vacío".into());
     }
+
+    // Key scoped: "cell/vm" o "vm" (legacy)
+    let key = match cell_name {
+        Some(cell) => format!("{}/{}", cell.trim().to_lowercase(), vm_key),
+        None => vm_key.clone(),
+    };
 
     if let Some(&id) = reg.entries.get(&key) {
         return Ok(id);
     }
 
-    // Asignar nuevo ID
-    let new_id = reg.next_free_id()
+    // Asignar nuevo ID (scoped por cell — cada cell tiene su propia subnet)
+    let scope_key = cell_name.map(|c| c.trim().to_lowercase());
+    let new_id = reg.next_free_id_in_scope(scope_key.as_deref())
         .ok_or("No hay IDs disponibles (rango 2-254 agotado)")?;
 
     reg.entries.insert(key.clone(), new_id);
     reg.save()?;
 
-    eprintln!("[NKR-REGISTRY] Nuevo: '{}' → id={} (IP=10.0.0.{})", name, new_id, new_id + 1);
+    let cell_id = cell_name.and_then(|c| crate::cell::lookup_cell_id(c)).unwrap_or(0);
+    eprintln!("[NKR-REGISTRY] Nuevo: '{}' → id={} (IP={})", key, new_id, id_to_ip(cell_id, new_id));
 
     Ok(new_id)
 }
@@ -110,17 +138,38 @@ pub fn resolve_id(name: &str) -> Result<u8, Box<dyn std::error::Error>> {
 /// Registra un nombre con un ID específico (para backward-compat con id: explícito).
 /// Si el nombre ya tenía otro ID, lo actualiza. Si el ID ya está en uso por
 /// otro nombre, devuelve error.
+#[allow(dead_code)]
 pub fn register_explicit(name: &str, id: u8) -> Result<(), Box<dyn std::error::Error>> {
-    let mut reg = Registry::load();
-    let key = name.trim().to_lowercase();
+    register_explicit_scoped(None, name, id)
+}
 
-    // Verificar si otro nombre ya tiene ese ID
+/// Versión cell-scoped de register_explicit
+pub fn register_explicit_scoped(cell_name: Option<&str>, name: &str, id: u8) -> Result<(), Box<dyn std::error::Error>> {
+    let mut reg = Registry::load();
+    let vm_key = name.trim().to_lowercase();
+
+    let key = match cell_name {
+        Some(cell) => format!("{}/{}", cell.trim().to_lowercase(), vm_key),
+        None => vm_key,
+    };
+
+    // Verificar conflicto de ID SOLO dentro del mismo scope de cell
+    // (IDs entre cells distintas NO colisionan: viven en subnets separadas)
+    let scope_prefix: Option<String> = cell_name.map(|c| format!("{}/", c.trim().to_lowercase()));
     for (existing_name, &existing_id) in &reg.entries {
-        if existing_id == id && *existing_name != key {
+        if existing_id != id || *existing_name == key {
+            continue;
+        }
+        let same_scope = match &scope_prefix {
+            Some(p) => existing_name.starts_with(p),
+            None => !existing_name.contains('/'),
+        };
+        if same_scope {
+            let cell_id = cell_name.and_then(|c| crate::cell::lookup_cell_id(c)).unwrap_or(0);
             return Err(format!(
-                "Conflicto de ID: '{}' ya usa id={} (IP=10.0.0.{}). \
+                "Conflicto de ID: '{}' ya usa id={} (IP={}). \
                  No se puede asignar a '{}'. Elimina el id: del compose o cambia el otro.",
-                existing_name, id, id + 1, name
+                existing_name, id, id_to_ip(cell_id, id), name
             ).into());
         }
     }
@@ -135,6 +184,7 @@ pub fn register_explicit(name: &str, id: u8) -> Result<(), Box<dyn std::error::E
 }
 
 /// Devuelve el ID asignado a un nombre, si existe
+#[allow(dead_code)]
 pub fn lookup(name: &str) -> Option<u8> {
     let reg = Registry::load();
     let key = name.trim().to_lowercase();
@@ -142,6 +192,7 @@ pub fn lookup(name: &str) -> Option<u8> {
 }
 
 /// Lista todos los registros (para debug/info)
+#[allow(dead_code)]
 pub fn list_all() -> Vec<(String, u8)> {
     let reg = Registry::load();
     let mut entries: Vec<(String, u8)> = reg.entries.into_iter().collect();
@@ -150,6 +201,7 @@ pub fn list_all() -> Vec<(String, u8)> {
 }
 
 /// Elimina un nombre del registro
+#[allow(dead_code)]
 pub fn remove(name: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let mut reg = Registry::load();
     let key = name.trim().to_lowercase();
@@ -160,7 +212,7 @@ pub fn remove(name: &str) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(removed)
 }
 
-/// IP del guest para un ID dado
-pub fn id_to_ip(id: u8) -> String {
-    format!("10.0.0.{}", id + 1)
+/// IP del guest para un cell_id + vm_id: 10.0.{cell_id}.{vm_id+1}
+pub fn id_to_ip(cell_id: u8, vm_id: u8) -> String {
+    format!("10.0.{}.{}", cell_id, vm_id + 1)
 }
