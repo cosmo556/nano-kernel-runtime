@@ -49,15 +49,9 @@ pub fn pull_image(image: &str, dest: &str, size_mb: u32) -> Result<(), Box<dyn E
     // Limpiar contenedor
     let _ = Command::new("docker").args(["rm", &container_id]).status();
 
-    // 3. Crear archivo de disco vacío
+    // 3. Crear archivo de disco vacío (+C en btrfs antes de allocate)
     eprintln!("[NKR-PULL] 3/5 Creando disco ext4 '{}' ({} MB)...", dest, size_mb);
-    let size_bytes = (size_mb as u64) * 1024 * 1024;
-    
-    // Fallback manual a fs::File si truncate falla
-    if Command::new("truncate").args(["-s", &format!("{}M", size_mb), dest]).status().is_err() {
-        let file = fs::File::create(dest)?;
-        file.set_len(size_bytes)?;
-    }
+    crate::fsutil::create_ext4_disk(dest, size_mb)?;
 
     // 4. Formatear y montar
     let mkfs_status = Command::new("mkfs.ext4")
@@ -186,7 +180,7 @@ pub fn pull_and_generate(
     }
 
     // 3. Generar initramfs
-    let initramfs_path = initramfs::generate_initramfs(&name, &disk_path, docker_cmd.as_deref())?;
+    let initramfs_path = initramfs::generate_initramfs(&name, &disk_path, docker_cmd.as_deref(), None)?;
 
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
     eprintln!("║ 🚀 NVM listo para usar                                      ║");

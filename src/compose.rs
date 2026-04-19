@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::TcpStream;
 use std::thread;
-use std::io::{Write, BufRead, BufReader};
+use std::io::{Read, Write, BufRead, BufReader};
 use std::time::Duration;
 use std::process::Stdio;
 use std::os::unix::process::CommandExt;
@@ -46,8 +46,9 @@ pub struct ServiceConfig {
     pub chrs: u32,
     /// ID explícito de la VM (opcional, default: índice+1)
     pub id: Option<u8>,
-    /// Nombre amigable del contenedor (equivale a --name)
-    pub nvm_name: Option<String>,
+    /// Nombre amigable de la NKR (equivale a --name). Clave lógica del servicio:
+    /// deriva rutas de instancia, nombre de DB, backend nginx.
+    pub nkr_name: Option<String>,
     #[serde(default)]
     pub ports: Vec<String>,
     #[serde(default)]
@@ -66,7 +67,9 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub environment: HashMap<String, String>,
     /// Activar VirtIO-PMEM+DAX para el disco principal (default: true).
-    /// Reduce ~150-200 MB de page cache duplicada por instancia.
+    /// Bypasa page-cache del guest: ahorra ~150-200 MB/VM en Odoos.
+    /// Para desactivar (discos muy grandes con acceso aleatorio saturando host
+    /// page-cache), poner `pmem: false` explícito en el compose.
     #[serde(default = "default_pmem")]
     pub pmem: bool,
     /// Activar burst de CPU (default: true): permite usar CPU sobrante de otros CHRs.
@@ -74,10 +77,12 @@ pub struct ServiceConfig {
     pub burst: bool,
 }
 
-// PMEM desactivado por defecto: con ≥20 VMs, mapear el disco entero (ej. 6 GB) por VM
-// agota la RAM del host antes que la RAM anónima de los guests.
-// Activar solo con pocos VMs y discos < 2 GB: pmem: true en el compose.
-fn default_pmem() -> bool { false }
+// PMEM+DAX activo por defecto desde v1.4 (post-migración btrfs+C).
+// Reduce la duplicación page-cache (host + guest) que es la mayor fuga de RAM
+// al escalar a 110 VMs en 32 GB. Con +C el backing es estable y no fragmenta.
+// Desactivar con `pmem: false` solo para backing > 4 GB con acceso random
+// que saturaría host page-cache por VM.
+fn default_pmem() -> bool { true }
 fn default_burst() -> bool { true }
 
 /// Configuración de build para un servicio (Nkrfile)
@@ -112,9 +117,9 @@ pub struct HealthCheck {
     pub retries: u32,
 }
 
-fn default_initial_delay() -> u64 { 10 }
-fn default_interval() -> u64 { 5 }
-fn default_retries() -> u32 { 40 }  // 40 × 5s = 200s — cubre crash-recovery de postgres
+fn default_initial_delay() -> u64 { 3 }
+fn default_interval() -> u64 { 2 }
+fn default_retries() -> u32 { 60 }  // 60 × 2s = 120s — cubre crash-recovery de postgres con sondeo fino
 
 fn default_ram() -> u32 { 512 }
 fn default_chrs() -> u32 { 1 }
@@ -683,7 +688,7 @@ pub fn compose_up(yaml_path: &str, detach: bool) -> Result<(), Box<dyn std::erro
                 disk_path_owned.as_str()
             } else { "" };
             eprintln!("[NKR-COMPOSE] Regenerando initramfs para '{}' (kernel nuevo o initramfs ausente)...", name);
-            match initramfs::generate_initramfs(name, disk_path, None) {
+            match initramfs::generate_initramfs(name, disk_path, None, Some(&svc.environment)) {
                 Ok(path) => {
                     eprintln!("[NKR-COMPOSE] ✅ Initramfs regenerado: {}", path);
                     svc.initramfs = Some(path);
@@ -743,6 +748,22 @@ pub fn compose_up(yaml_path: &str, detach: bool) -> Result<(), Box<dyn std::erro
             if !disk_path.exists() {
                 let _ = fs::create_dir_all(&data_dir);
                 eprintln!("[NKR-COMPOSE] Creando disco dedicado para volumen :rw → {}", disk_path.display());
+
+                // En btrfs: crear archivo vacío + chattr +C ANTES de allocate para
+                // evitar fragmentación catastrófica por CoW en writes random del guest
+                // (PG 8K pages, filestore, etc.). Sin +C, 2 GB se fragmentan en ~500k
+                // extents en semanas.
+                if crate::fsutil::detect_fs(&disk_path) == crate::fsutil::FsKind::Btrfs {
+                    let _ = std::fs::File::create(&disk_path);
+                    let chattr = std::process::Command::new("chattr")
+                        .args(["+C", &disk_path.to_string_lossy()]).status();
+                    if chattr.map(|s| s.success()).unwrap_or(false) {
+                        eprintln!("[NKR-COMPOSE] btrfs: chattr +C aplicado a {}", disk_path.display());
+                    } else {
+                        eprintln!("[NKR-COMPOSE] WARN: chattr +C falló en {} — sufrirá fragmentación CoW", disk_path.display());
+                    }
+                }
+
                 // 2 GB sparse + pre-allocated extents → sin fragmentación futura
                 let fallocate = std::process::Command::new("fallocate")
                     .args(["-l", "2G", &disk_path.to_string_lossy()])
@@ -788,10 +809,13 @@ pub fn compose_up(yaml_path: &str, detach: bool) -> Result<(), Box<dyn std::erro
     }
 
     // Overrides de archivos individuales (host es un archivo).
-    // El rootfs compartido es VirtIO-FS RO → inject_volumes no corre.
-    // Estrategia: staging dir por servicio en .nkr-data/<svc>-overrides/, montado RO
-    // vía VirtIO-FS en /tmp/nkr-overrides; initramfs hace bind-mount de cada archivo.
+    // Se aplica también si el primer disco es .ext4 (vmm lo convertirá a RootFS
+    // compartido VirtIO-FS RO y inject_volumes no correrá). Así el archivo queda
+    // externo en el host y editable sin tocar la imagen.
     for (name, svc) in services.iter_mut() {
+        let will_become_shared_rootfs = svc.rootfs.is_some()
+            || svc.disks.first().map_or(false, |d| d.ends_with(".ext4"));
+        if !will_become_shared_rootfs { continue; }
         let service_tag = sanitize_component(name);
         let stage_dir = data_dir.join(format!("{}-overrides", service_tag));
         let mut staged_any = false;
@@ -813,6 +837,18 @@ pub fn compose_up(yaml_path: &str, detach: bool) -> Result<(), Box<dyn std::erro
                     eprintln!("[NKR-COMPOSE] Override: {} → guest:{}", host_path, guest_path);
                     staged_any = true;
                     to_remove.push(i);
+                    // Rootfs es VirtIO-FS RO; bind-mount sobre él es poco confiable.
+                    // Exponer path del share como env var para que la app lo use directo.
+                    let share_path = format!("/tmp/nkr-overrides/{}", rel);
+                    match guest_path {
+                        "/etc/odoo/odoo.conf" => {
+                            svc.environment.entry("ODOO_RC".to_string()).or_insert(share_path);
+                        }
+                        "/etc/pgbouncer/pgbouncer.ini" => {
+                            svc.environment.entry("PGBOUNCER_INI".to_string()).or_insert(share_path);
+                        }
+                        _ => {}
+                    }
                 }
                 Err(e) => eprintln!("[NKR-COMPOSE] WARN: no se pudo copiar {}: {}", host_path, e),
             }
@@ -826,6 +862,80 @@ pub fn compose_up(yaml_path: &str, detach: bool) -> Result<(), Box<dyn std::erro
         for i in to_remove.into_iter().rev() {
             svc.volumes.remove(i);
         }
+    }
+
+    // Auto-generar pgbouncer.ini cuando el servicio tiene POOL_MODE (indicador pgbouncer)
+    // y el rootfs será compartido RO (el entrypoint de la imagen regenera con defaults incorrectos).
+    for (name, svc) in services.iter_mut() {
+        let will_become_shared_rootfs = svc.rootfs.is_some()
+            || svc.disks.first().map_or(false, |d| d.ends_with(".ext4"));
+        if !will_become_shared_rootfs { continue; }
+        if !svc.environment.contains_key("POOL_MODE") { continue; }
+
+        let db_host = svc.environment.get("DB_HOST").cloned().unwrap_or_else(|| "127.0.0.1".to_string());
+        let db_port = svc.environment.get("DB_PORT").cloned().unwrap_or_else(|| "5432".to_string());
+        let db_user = svc.environment.get("DB_USER").cloned().unwrap_or_else(|| "postgres".to_string());
+        let db_password = svc.environment.get("DB_PASSWORD").cloned().unwrap_or_else(|| "".to_string());
+        let db_name = svc.environment.get("DB_NAME").cloned().unwrap_or_else(|| "*".to_string());
+        let listen_addr = svc.environment.get("LISTEN_ADDR").cloned().unwrap_or_else(|| "0.0.0.0".to_string());
+        let listen_port = svc.environment.get("LISTEN_PORT").cloned().unwrap_or_else(|| "6432".to_string());
+        let pool_mode = svc.environment.get("POOL_MODE").cloned().unwrap_or_else(|| "transaction".to_string());
+        let auth_type = svc.environment.get("AUTH_TYPE").cloned().unwrap_or_else(|| "plain".to_string());
+        let max_client_conn = svc.environment.get("MAX_CLIENT_CONN").cloned().unwrap_or_else(|| "200".to_string());
+        let default_pool_size = svc.environment.get("DEFAULT_POOL_SIZE").cloned().unwrap_or_else(|| "20".to_string());
+
+        let ini_content = format!(
+            "[databases]\n{db_name} = host={db_host} port={db_port} auth_user={db_user}\n\n\
+             [pgbouncer]\n\
+             listen_addr = {listen_addr}\n\
+             listen_port = {listen_port}\n\
+             unix_socket_dir =\n\
+             user = postgres\n\
+             auth_file = /etc/pgbouncer/userlist.txt\n\
+             auth_type = {auth_type}\n\
+             pool_mode = {pool_mode}\n\
+             max_client_conn = {max_client_conn}\n\
+             default_pool_size = {default_pool_size}\n\
+             ignore_startup_parameters = extra_float_digits\n\
+             admin_users = postgres\n\
+             server_reset_query = DISCARD ALL\n"
+        );
+        let userlist = format!("\"{db_user}\" \"{db_password}\"\n");
+
+        let service_tag = sanitize_component(name);
+        let stage_dir = data_dir.join(format!("{}-overrides", service_tag));
+        let pgb_dir = stage_dir.join("etc/pgbouncer");
+        let _ = fs::create_dir_all(&pgb_dir);
+        let _ = fs::write(pgb_dir.join("pgbouncer.ini"), &ini_content);
+        let _ = fs::write(pgb_dir.join("userlist.txt"), &userlist);
+        eprintln!("[NKR-COMPOSE] PgBouncer: auto-generado pgbouncer.ini (listen={}:{})", listen_addr, listen_port);
+
+        let share = format!("{}:/tmp/nkr-overrides:ro", stage_dir.to_string_lossy());
+        if !svc.shares.iter().any(|s| s == &share) {
+            svc.shares.push(share);
+        }
+        svc.environment.entry("PGBOUNCER_INI".to_string())
+            .or_insert("/tmp/nkr-overrides/etc/pgbouncer/pgbouncer.ini".to_string());
+    }
+
+    // Garantizar que todo servicio con rootfs compartido tenga al menos un share dir
+    // escribible para que vmm.rs pueda depositar nkr-env con las env vars del compose.
+    for (name, svc) in services.iter_mut() {
+        let will_become_shared_rootfs = svc.rootfs.is_some()
+            || svc.disks.first().map_or(false, |d| d.ends_with(".ext4"));
+        if !will_become_shared_rootfs { continue; }
+        if svc.environment.is_empty() { continue; }
+        // ¿Ya tiene un share dir escribible?
+        let has_writable_dir = svc.shares.iter().any(|s| {
+            let host = s.splitn(2, ':').next().unwrap_or("");
+            let is_ro = s.ends_with(":ro");
+            !is_ro && std::fs::metadata(host).map(|m| m.is_dir()).unwrap_or(false)
+        });
+        if has_writable_dir { continue; }
+        let service_tag = sanitize_component(name);
+        let env_dir = data_dir.join(format!("{}-env", service_tag));
+        let _ = fs::create_dir_all(&env_dir);
+        svc.shares.push(format!("{}:/tmp/nkr:rw", env_dir.to_string_lossy()));
     }
 
     // Auto-build: si un servicio tiene `build:` y el disco no existe, construirlo
@@ -856,8 +966,8 @@ pub fn compose_up(yaml_path: &str, detach: bool) -> Result<(), Box<dyn std::erro
     // Aislar automáticamente discos ext4 externos al stack con snapshots gestionados por NKR
     // solo cuando el disco base ya está en uso por otra VM.
     for (_idx, (name, svc)) in services.iter_mut().enumerate() {
-        let nvm_name = svc.nvm_name.clone().unwrap_or_else(|| format!("{}-{}", stack_name, name));
-        let vm_id = resolve_service_id_scoped(cell_name.as_deref(), &nvm_name, svc.id)?;
+        let nkr_name = svc.nkr_name.clone().unwrap_or_else(|| format!("{}-{}", stack_name, name));
+        let vm_id = resolve_service_id_scoped(cell_name.as_deref(), &nkr_name, svc.id)?;
         let service_tag = sanitize_component(name);
 
         for (disk_idx, disk) in svc.disks.iter_mut().enumerate() {
@@ -888,7 +998,7 @@ pub fn compose_up(yaml_path: &str, detach: bool) -> Result<(), Box<dyn std::erro
     let mut handles = Vec::new();
 
     for (_idx, (name, svc)) in services.into_iter().enumerate() {
-        let config_name = svc.nvm_name.clone().unwrap_or_else(|| format!("{}-{}", stack_name, name));
+        let config_name = svc.nkr_name.clone().unwrap_or_else(|| format!("{}-{}", stack_name, name));
         let vm_id = resolve_service_id_scoped(cell_name.as_deref(), &config_name, svc.id)?;
         let guest_ip = registry::id_to_ip(cell_id, vm_id);
 
@@ -972,6 +1082,24 @@ pub fn compose_up(yaml_path: &str, detach: bool) -> Result<(), Box<dyn std::erro
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
+        // Pre-escribir nkr-env en share dirs antes de lanzar el proceso hijo.
+        // vmm.rs lo reescribe, pero la escritura temprana garantiza que
+        // virtiofsd arranque con el archivo ya presente en el directorio.
+        if config.rootfs.is_some() && !svc.environment.is_empty() {
+            let mut env_content = String::from("# NKR environment variables (auto-generated)\n");
+            for (key, val) in &svc.environment {
+                let escaped = val.replace('\'', "'\\''");
+                env_content.push_str(&format!("export {}='{}'\n", key, escaped));
+            }
+            for share in &config.shares {
+                let host = share.splitn(2, ':').next().unwrap_or("");
+                if host.is_empty() { continue; }
+                if !std::fs::metadata(host).map(|m| m.is_dir()).unwrap_or(false) { continue; }
+                let env_path = format!("{}/nkr-env", host);
+                let _ = std::fs::write(&env_path, &env_content);
+            }
+        }
+
         let mut child = cmd.spawn().expect("Fallo al ejecutar nkr run");
 
         eprintln!("[NKR-COMPOSE] VM '{}' iniciada (PID {})", name, child.id());
@@ -1017,8 +1145,9 @@ pub fn compose_up(yaml_path: &str, detach: bool) -> Result<(), Box<dyn std::erro
 
         handles.push((name.clone(), vm_id, guest_ip.clone(), svc.healthcheck.clone(), child, config_name.clone()));
 
-        // Pequeña pausa entre launches para evitar conflictos
-        thread::sleep(std::time::Duration::from_millis(500));
+        // Sin sleep entre launches: la serialización real de netlink/iptables se
+        // hace en vmm.rs via netlock::NetLock (flock inter-proceso). Ganancia:
+        // 500ms × (N-1) VMs; con 20 Odoos ~10s menos de boot.
     }
 
     // Guardar PIDs (process IDs como referencia)
@@ -1109,8 +1238,8 @@ pub fn compose_down(yaml_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     services.sort_by(|a, b| a.0.cmp(&b.0));
     let target_ids: Vec<u8> = services.iter()
         .map(|(_name, svc)| {
-            let nvm = svc.nvm_name.clone().unwrap_or_else(|| _name.clone());
-            resolve_service_id_scoped(cell_name.as_deref(), &nvm, svc.id).unwrap_or(0)
+            let nkr = svc.nkr_name.clone().unwrap_or_else(|| _name.clone());
+            resolve_service_id_scoped(cell_name.as_deref(), &nkr, svc.id).unwrap_or(0)
         })
         .filter(|id| *id > 0)
         .collect();
@@ -1173,13 +1302,15 @@ pub fn compose_ps() -> Result<(), Box<dyn std::error::Error>> {
     if !vms.is_empty() {
         state::print_vm_table();
     } else if let Ok(content) = fs::read_to_string(PID_FILE) {
-        // Fallback al PID file legacy
+        // Fallback al PID file legacy — cell_id derivado del cell.yml en CWD si existe
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let cell_id = cell::load_cell_from_dir(&cwd).map(|c| c.cell_id).unwrap_or(0);
         eprintln!("╔══════════════════════════════════════════════════════════════╗");
         eprintln!("║  NKR Compose — Servicios (legacy PID file)                   ║");
         eprintln!("╠══════════════════════════════════════════════════════════════╣");
         for (idx, line) in content.lines().enumerate() {
-            let vm_id = idx + 1;
-            let ip = format!("10.0.0.{}", vm_id + 1);
+            let vm_id = (idx + 1) as u8;
+            let ip = registry::id_to_ip(cell_id, vm_id);
             eprintln!("║  PID {} │ id={} │ IP {} │ running", line, vm_id, ip);
         }
         eprintln!("╚══════════════════════════════════════════════════════════════╝");
@@ -1210,15 +1341,20 @@ fn run_health_check(service_name: &str, guest_ip: &str, check: &HealthCheck, vm_
             Duration::from_secs(2),
         ) {
             Ok(_) => {
-                eprintln!("[NKR-HEALTH] ✅ '{}' — puerto {} accesible (intento {})",
+                eprintln!("[NKR-HEALTH] ✅ '{}' — puerto {} accesible (intento {}) [NKR-TCP-UP]",
                     service_name, check.port, attempt);
 
-                // ── Pre-Vuelo: warmup HTTP para forzar compilación de assets ──
-                run_warmup(service_name, guest_ip, check.port);
+                // ── Pre-Vuelo: warmup HTTP solo para servicios web (Odoo/nginx/etc) ──
+                // Salteamos PG (5432), pgbouncer (6432), redis (6379), etc.
+                if is_http_port(check.port) {
+                    run_warmup(service_name, guest_ip, check.port);
+                }
 
                 // ── Nitro Dinámico: restaurar cgroup al quota original ──
+                // El warmup ya compiló los assets; la primera request real es <500ms.
                 nitro_throttle_cgroup(vm_name);
 
+                eprintln!("[NKR-HEALTH] ✅ '{}' — listo [NKR-READY]", service_name);
                 return true;
             }
             Err(_) => {
@@ -1243,42 +1379,77 @@ fn run_health_check(service_name: &str, guest_ip: &str, check: &HealthCheck, vm_
 
 /// Dispara un GET /web/login al guest para forzar la compilación de assets
 /// antes de marcar el servicio como listo. El cliente nunca ve el cold-start.
+/// Puertos que se warmap-an con assets de Odoo. Para el resto (PG, pgbouncer,
+/// redis, etc.) el healthcheck TCP es suficiente — un GET HTTP no compila nada.
+fn is_http_port(port: u16) -> bool {
+    matches!(port, 80 | 443 | 8069 | 8072 | 8000 | 8080 | 8081 | 8443)
+}
+
 fn run_warmup(service_name: &str, guest_ip: &str, port: u16) {
     let addr = format!("{}:{}", guest_ip, port);
-    eprintln!("[NKR-WARMUP] '{}' — pre-vuelo GET /web/login (compilando assets)...", service_name);
+    eprintln!("[NKR-WARMUP] '{}' — pre-vuelo: compilando assets (paralelo)...", service_name);
 
-    let start = std::time::Instant::now();
+    let total_start = std::time::Instant::now();
 
-    match TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5)) {
-        Ok(mut stream) => {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    // Assets públicos de Odoo — no requieren autenticación.
+    let assets: &[(&str, &str)] = &[
+        ("/web/assets/debug/web.assets_frontend.css", "frontend CSS"),
+        ("/web/assets/debug/web.assets_frontend.js",  "frontend JS"),
+        ("/web/assets/debug/web.assets_backend.js",   "backend JS"),
+        ("/web/login",                                 "QWeb templates"),
+    ];
 
-            let request = format!(
-                "GET /web/login HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                guest_ip
-            );
-            if stream.write_all(request.as_bytes()).is_ok() {
-                // Leer toda la respuesta (fuerza a Odoo a compilar assets)
-                let mut buf = [0u8; 4096];
-                let mut total = 0usize;
-                loop {
-                    match std::io::Read::read(&mut stream, &mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => total += n,
-                        Err(_) => break,
-                    }
+    // Dispara los 4 GETs concurrentemente — el tiempo total es max(asset), no sum.
+    // El cgroup Nitro ya está relajado durante el warmup, absorbe el spike de CPU.
+    let mut handles = Vec::with_capacity(assets.len());
+    for (path, label) in assets {
+        let addr = addr.clone();
+        let guest_ip = guest_ip.to_string();
+        let path = path.to_string();
+        let label = label.to_string();
+        let service_name = service_name.to_string();
+        handles.push(thread::spawn(move || {
+            let start = std::time::Instant::now();
+            match warmup_get(&addr, &guest_ip, &path) {
+                Ok(bytes) => {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    eprintln!("[NKR-WARMUP] '{}' — ✅ {} compilado ({:.1}s, {} bytes)",
+                        service_name, label, elapsed, bytes);
                 }
-                let elapsed = start.elapsed().as_secs_f64();
-                eprintln!("[NKR-WARMUP] ✅ '{}' — assets compilados ({:.1}s, {} bytes)",
-                    service_name, elapsed, total);
+                Err(e) => {
+                    eprintln!("[NKR-WARMUP] '{}' — ⚠ {} falló ({}), continuando",
+                        service_name, label, e);
+                }
             }
-        }
-        Err(e) => {
-            eprintln!("[NKR-WARMUP] '{}' — warmup fallido ({}), continuando sin pre-vuelo",
-                service_name, e);
+        }));
+    }
+    for h in handles { let _ = h.join(); }
+
+    let total = total_start.elapsed().as_secs_f64();
+    eprintln!("[NKR-WARMUP] '{}' — pre-vuelo completado ({:.1}s total)", service_name, total);
+}
+
+/// GET bloqueante a un endpoint — retorna bytes leídos o error.
+fn warmup_get(addr: &str, host: &str, path: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect_timeout(
+        &addr.parse()?, Duration::from_secs(5)
+    )?;
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+    let req = format!("GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host);
+    stream.write_all(req.as_bytes())?;
+
+    let mut buf = [0u8; 16384];
+    let mut total = 0usize;
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(_) => break,
         }
     }
+    Ok(total)
 }
 
 // =============================================================================
@@ -1328,7 +1499,7 @@ fn read_vm_chrs(vm_name: &str) -> Option<u32> {
                 // Parsear chrs del JSON: buscar "chrs":N
                 if let Some(pos) = content.find("\"chrs\":") {
                     let rest = &content[pos + 7..];
-                    let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let num_str: String = rest.chars().skip_while(|c| c.is_whitespace()).take_while(|c| c.is_ascii_digit()).collect();
                     return num_str.parse().ok();
                 }
             }
@@ -1347,14 +1518,14 @@ fn read_vm_chrs(vm_name: &str) -> Option<u32> {
 /// - Si cell_name es Some, la key es "cell/vm"; None = legacy "vm"
 fn resolve_service_id_scoped(
     cell_name: Option<&str>,
-    nvm_name: &str,
+    nkr_name: &str,
     explicit_id: Option<u8>,
 ) -> Result<u8, Box<dyn std::error::Error>> {
     match explicit_id {
         Some(id) => {
-            registry::register_explicit_scoped(cell_name, nvm_name, id)?;
+            registry::register_explicit_scoped(cell_name, nkr_name, id)?;
             Ok(id)
         }
-        None => registry::resolve_id_scoped(cell_name, nvm_name),
+        None => registry::resolve_id_scoped(cell_name, nkr_name),
     }
 }

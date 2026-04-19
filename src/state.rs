@@ -148,8 +148,9 @@ pub fn stop_vm(vm_id: u8) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("No se pudo enviar SIGTERM a PID {}: {}", state.pid, err).into());
     }
 
-    // Esperar hasta 20 s (dar margen al VMM para cleanup antes de SIGKILL)
-    for _ in 0..200 {
+    // Esperar hasta 90 s (vmm.rs tiene timeout interno de 60s para shutdown del
+    // guest + cleanup/extract_volumes ~5-20s). SIGKILL solo si algo se colgó.
+    for _ in 0..900 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if !is_pid_alive(state.pid) {
             unregister_vm(vm_id);
@@ -242,8 +243,16 @@ fn state_path(vm_id: u8) -> PathBuf {
 }
 
 fn is_pid_alive(pid: u32) -> bool {
-    // kill(pid, 0) verifica si el proceso existe sin enviar señal
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    // kill(pid, 0) es insuficiente: devuelve 0 para zombies (el vmm exita pero
+    // si el parent 'nkr compose up' no llama wait(), queda como Z y stop_vm
+    // esperaba 90 s en vano. Leer /proc/<pid>/status y tratar Z como muerto.
+    if unsafe { libc::kill(pid as i32, 0) } != 0 {
+        return false;
+    }
+    match std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+        Ok(s) => !s.lines().any(|l| l.starts_with("State:") && l.contains('Z')),
+        Err(_) => false,
+    }
 }
 
 pub fn current_timestamp() -> u64 {

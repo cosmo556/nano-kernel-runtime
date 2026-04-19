@@ -232,11 +232,13 @@ pub fn ksm_status() -> KsmStatus {
     }
 }
 
-/// Activa KSM con parámetros optimizados para múltiples VMs Odoo
+/// Activa KSM con parámetros optimizados para múltiples VMs Odoo.
+/// Con 20 Odoos idénticos por cell, valores agresivos reducen el tiempo de
+/// convergencia de ~10 min a ~1 min. ksmd consume 5-10% de un core mientras
+/// escanea, aceptable porque es acotado (las páginas ya fusionadas se mantienen).
 pub fn ksm_enable() -> Result<(), Box<dyn std::error::Error>> {
-    // Escanear más páginas por ciclo y con menos pausa → detección más rápida
-    ksm_write("pages_to_scan", "1000")?;
-    ksm_write("sleep_millisecs", "50")?;
+    ksm_write("pages_to_scan", "5000")?;
+    ksm_write("sleep_millisecs", "10")?;
     ksm_write("run", "1")?;
     Ok(())
 }
@@ -417,21 +419,27 @@ fn render_prometheus_metrics() -> String {
     out
 }
 
-/// Inicia un servidor HTTP mínimo que expone /metrics en formato Prometheus.
+/// Inicia un servidor HTTP mínimo que expone:
+///  - GET /metrics            → formato Prometheus (scraping Grafana/Prom)
+///  - GET /api/v1/health      → health check del API
+///  - POST/GET/DELETE /api/v1/cells/{cell}/instances/...  → panel externo
+///
 /// Se lanza en un hilo daemon y nunca bloquea el hilo principal.
+/// Las mutaciones del API (POST/DELETE) requieren `Authorization: Bearer <token>`
+/// si la env var `NKR_API_TOKEN` está seteada.
 pub fn start_prometheus_server(port: u16) {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::Write;
     use std::net::TcpListener;
 
     std::thread::spawn(move || {
         let addr = format!("0.0.0.0:{}", port);
         let listener = match TcpListener::bind(&addr) {
             Ok(l) => {
-                eprintln!("[NKR-PROM] Servidor Prometheus en http://{}/metrics", addr);
+                eprintln!("[NKR-HTTP] Server en http://{}/  (metrics + API panel)", addr);
                 l
             }
             Err(e) => {
-                eprintln!("[NKR-PROM] Error al bindear {}: {}", addr, e);
+                eprintln!("[NKR-HTTP] Error al bindear {}: {}", addr, e);
                 return;
             }
         };
@@ -442,28 +450,40 @@ pub fn start_prometheus_server(port: u16) {
                 Err(_) => continue,
             };
 
-            // Drenar los headers HTTP (leer hasta línea en blanco)
-            if let Ok(mut reader) = stream.try_clone().map(BufReader::new) {
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => break,
-                        _ => {}
+            // Cada request en su propio thread para no bloquear el listener
+            // durante operaciones largas del API (clone, delete con DB drop).
+            std::thread::spawn(move || {
+                let stream_read = match stream.try_clone() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let (headers, body) = match crate::api::read_request(stream_read) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let (method, path, query) = match crate::api::parse_request_line(&headers) {
+                    Some(x) => x,
+                    None => {
+                        let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        return;
                     }
-                    if line == "\r\n" || line == "\n" {
-                        break;
-                    }
-                }
-            }
+                };
+                let parsed_headers = crate::api::parse_headers(&headers);
 
-            let body = render_prometheus_metrics();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes());
+                let resp = if method == "GET" && path == "/metrics" {
+                    let body = render_prometheus_metrics();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    )
+                } else if path.starts_with("/api/") {
+                    crate::api::dispatch(method, path, query, &parsed_headers, &body).to_wire()
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                };
+
+                let _ = stream.write_all(resp.as_bytes());
+            });
         }
     });
 }

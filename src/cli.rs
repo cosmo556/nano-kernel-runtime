@@ -115,6 +115,26 @@ pub enum Command {
         id: String,
     },
 
+    /// Reiniciar una micro-VM preservando sus args originales
+    /// (útil dentro de una cell para reiniciar un solo Odoo sin tocar DB/PgB)
+    Restart {
+        /// ID o nombre de la micro-VM
+        id: String,
+    },
+
+    /// Liberar el cgroup de una VM (CPU sin throttle) por tiempo limitado.
+    /// Útil para instalar módulos pesados en Odoo (-i account, mrp, website)
+    /// sin quedar estrangulado al quota de crucero.
+    /// Ejemplo: nkr nitro nazcatex-odoo-01 --duration 10m
+    Nitro {
+        /// ID o nombre de la micro-VM
+        id: String,
+
+        /// Duración del boost (ej. 30s, 5m, 10m, 1h). Default: 10m.
+        #[arg(long, default_value = "10m")]
+        duration: String,
+    },
+
     /// Orquestar un stack multi-servicio con YAML
     Compose {
         /// Acción: up, down, ps
@@ -255,6 +275,23 @@ pub enum CellAction {
     Destroy {
         /// Nombre de la célula
         name: String,
+    },
+
+    /// Clonar una instancia Odoo dentro de la misma cell.
+    /// Duplica filestore + addons + config + disco ext4, asigna nuevo vm_id,
+    /// clona la DB vía `CREATE DATABASE ... TEMPLATE` y añade bloque al compose.
+    /// Uso típico: crear entorno de test desde prod sin tocar el original.
+    Clone {
+        /// nkr_name de la instancia origen (ej. nazcatex-odoo-01)
+        src: String,
+        /// nkr_name de la instancia destino (ej. nazcatex-odoo-04)
+        dst: String,
+        /// Saltar el clonado de la base de datos (solo filestore/config/addons)
+        #[arg(long, default_value_t = false)]
+        no_db: bool,
+        /// No modificar el nkr-compose.yml (clonado manual del bloque)
+        #[arg(long, default_value_t = false)]
+        no_compose: bool,
     },
 }
 

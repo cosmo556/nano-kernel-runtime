@@ -5,6 +5,22 @@
 
 use std::process;
 
+fn parse_duration(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    let (num, unit): (&str, &str) = match s.chars().last()? {
+        c if c.is_ascii_digit() => (s, "s"),
+        _ => (&s[..s.len()-1], &s[s.len()-1..]),
+    };
+    let n: u64 = num.parse().ok()?;
+    match unit {
+        "s" | "S" => Some(n),
+        "m" | "M" => Some(n * 60),
+        "h" | "H" => Some(n * 3600),
+        _ => None,
+    }
+}
+
 mod cli;
 mod vmm;
 mod block;
@@ -22,6 +38,9 @@ mod balloon;
 mod virtio_fs;
 mod console;
 mod cell;
+mod fsutil;
+mod netlock;
+mod api;
 
 fn main() {
     let args = cli::parse();
@@ -42,18 +61,26 @@ fn main() {
                 name
             };
 
-            // Auto-registrar en registry si se usa nombre
-            let vm_id = if !vm_name.starts_with("nkr-") || vm_name != format!("nkr-{}", id) {
-                // Tiene nombre explícito: registrar en registry
-                match registry::resolve_id(&vm_name) {
+            // Registry scoped por cell: key = "cell_name/vm_name" si cell_id>0.
+            // Si el caller pasó --id explícito (compose lo hace siempre), se respeta
+            // vía register_explicit_scoped; sin --id se auto-resuelve.
+            let has_explicit_name = !vm_name.starts_with("nkr-") || vm_name != format!("nkr-{}", id);
+            let cell_name_opt = cell::lookup_cell_name(cell_id);
+            let vm_id = if has_explicit_name {
+                let result = if id > 0 {
+                    registry::register_explicit_scoped(cell_name_opt.as_deref(), &vm_name, id).map(|_| id)
+                } else {
+                    registry::resolve_id_scoped(cell_name_opt.as_deref(), &vm_name)
+                };
+                match result {
                     Ok(resolved) => resolved,
                     Err(e) => {
                         eprintln!("[NKR] Error registry: {e}");
-                        id // fallback al ID manual
+                        id
                     }
                 }
             } else {
-                id // Sin nombre significativo, usar ID manual
+                id
             };
 
             let config = cli::VmConfig {
@@ -96,6 +123,145 @@ fn main() {
             } else {
                 eprintln!("[NKR] VM '{}' no encontrada. Usa 'nkr ps' para ver VMs activas.", id);
                 process::exit(1);
+            }
+        }
+
+        cli::Command::Restart { id } => {
+            let vm = match state::find_vm_by_id_str(&id) {
+                Some(v) => v,
+                None => {
+                    eprintln!("[NKR] VM '{}' no encontrada. Usa 'nkr ps' para ver VMs activas.", id);
+                    process::exit(1);
+                }
+            };
+
+            // Capturar argv original antes de matar el proceso
+            let cmdline_path = format!("/proc/{}/cmdline", vm.pid);
+            let cmdline = match std::fs::read(&cmdline_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[NKR] No se pudo leer {}: {}", cmdline_path, e);
+                    process::exit(1);
+                }
+            };
+            let argv: Vec<String> = cmdline
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect();
+            if argv.len() < 2 {
+                eprintln!("[NKR] argv inválido en {}: {:?}", cmdline_path, argv);
+                process::exit(1);
+            }
+            // argv[0] = path al binario, argv[1..] = args reales de nkr (run --name ...)
+            let exe = argv[0].clone();
+            let rest: Vec<String> = argv[1..].to_vec();
+
+            eprintln!("[NKR-RESTART] Reiniciando VM {} ({})...", vm.vm_id, vm.name);
+
+            if let Err(e) = state::stop_vm(vm.vm_id) {
+                eprintln!("[NKR-RESTART] Error deteniendo VM: {e}");
+                process::exit(1);
+            }
+
+            // Esperar a que se libere el TAP/bridge antes de relanzar
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            // Relanzar detached con setsid() — sobrevive al cierre del terminal
+            use std::os::unix::process::CommandExt;
+            let log_path = format!("/tmp/nkr-restart-{}.log", vm.vm_id);
+            let log = match std::fs::File::create(&log_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[NKR-RESTART] No se pudo crear log '{}': {}", log_path, e);
+                    process::exit(1);
+                }
+            };
+            let log_err = match log.try_clone() {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[NKR-RESTART] try_clone log: {e}");
+                    process::exit(1);
+                }
+            };
+
+            let child = unsafe {
+                std::process::Command::new(&exe)
+                    .args(&rest)
+                    .stdout(log)
+                    .stderr(log_err)
+                    .stdin(std::process::Stdio::null())
+                    .pre_exec(|| {
+                        if libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    })
+                    .spawn()
+            };
+            match child {
+                Ok(c) => {
+                    eprintln!("[NKR-RESTART] VM {} relanzada (PID {}) — log: {}", vm.vm_id, c.id(), log_path);
+                }
+                Err(e) => {
+                    eprintln!("[NKR-RESTART] Error relanzando: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+
+        cli::Command::Nitro { id, duration } => {
+            let vm = match state::find_vm_by_id_str(&id) {
+                Some(v) => v,
+                None => {
+                    eprintln!("[NKR] VM '{}' no encontrada. Usa 'nkr ps' para ver VMs activas.", id);
+                    process::exit(1);
+                }
+            };
+            let secs = match parse_duration(&duration) {
+                Some(s) => s,
+                None => {
+                    eprintln!("[NKR-NITRO] duración inválida '{}'. Formato: 30s | 5m | 1h", duration);
+                    process::exit(1);
+                }
+            };
+            let cpu_max = format!("/sys/fs/cgroup/nkr/{}/cpu.max", vm.name);
+            if !std::path::Path::new(&cpu_max).exists() {
+                eprintln!("[NKR-NITRO] cgroup no encontrado: {}", cpu_max);
+                process::exit(1);
+            }
+            let restore = format!("{} 100000", vm.chrs * 20_000);
+            if let Err(e) = std::fs::write(&cpu_max, "max 100000") {
+                eprintln!("[NKR-NITRO] no se pudo relajar cgroup: {}", e);
+                process::exit(1);
+            }
+            eprintln!("[NKR-NITRO] '{}' — CPU sin límite por {}s (restore → {} µs/100ms)",
+                vm.name, secs, vm.chrs * 20_000);
+
+            // Fork detached: el comando termina de inmediato, el hijo sleep+restore
+            use std::os::unix::process::CommandExt;
+            let shell_cmd = format!("sleep {}; echo '{}' > {}", secs, restore, cpu_max);
+            let spawn_result = unsafe {
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&shell_cmd)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .pre_exec(|| {
+                        if libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    })
+                    .spawn()
+            };
+            match spawn_result {
+                Ok(_) => eprintln!("[NKR-NITRO] restore programado en background."),
+                Err(e) => {
+                    eprintln!("[NKR-NITRO] WARN: no se pudo programar restore ({}). Restaura manual con:", e);
+                    eprintln!("    echo '{}' | sudo tee {}", restore, cpu_max);
+                }
             }
         }
 
@@ -191,8 +357,7 @@ fn main() {
                 }
             } else {
                 // Modo auto: deposita en /mnt/nkr/ + genera initramfs
-                let nvm_name = if name.is_empty() {
-                    // Derivar nombre del Nkrfile: "Nkrfile.nginx" → "nginx"
+                let nkr_name = if name.is_empty() {
                     let p = std::path::Path::new(&file);
                     let fname = p.file_name().unwrap_or_default().to_string_lossy();
                     if let Some(suffix) = fname.strip_prefix("Nkrfile.") {
@@ -203,7 +368,7 @@ fn main() {
                 } else {
                     name.clone()
                 };
-                if let Err(e) = build::build_and_generate(&file, &nvm_name, size_mb, &context) {
+                if let Err(e) = build::build_and_generate(&file, &nkr_name, size_mb, &context) {
                     eprintln!("[NKR-BUILD] Error: {e}");
                     process::exit(1);
                 }
@@ -305,6 +470,13 @@ fn main() {
                             eprintln!("[NKR-CELL] Error: {e}");
                             process::exit(1);
                         }
+                    }
+                }
+
+                cli::CellAction::Clone { src, dst, no_db, no_compose } => {
+                    if let Err(e) = cell::clone_instance(&src, &dst, no_db, no_compose) {
+                        eprintln!("[NKR-CELL] Error clonando: {e}");
+                        process::exit(1);
                     }
                 }
             }

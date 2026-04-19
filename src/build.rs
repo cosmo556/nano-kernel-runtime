@@ -86,17 +86,9 @@ pub fn build_disk(
         return Err("docker export falló".into());
     }
 
-    // ── 3. Crear disco ext4 ──
+    // ── 3. Crear disco ext4 (+C en btrfs antes de allocate) ──
     eprintln!("[NKR-BUILD] 3/5 Creando disco ext4 ({} MB)...", size_mb);
-
-    if Command::new("truncate")
-        .args(["-s", &format!("{}M", size_mb), output])
-        .status()
-        .is_err()
-    {
-        let file = fs::File::create(output)?;
-        file.set_len((size_mb as u64) * 1024 * 1024)?;
-    }
+    crate::fsutil::create_ext4_disk(output, size_mb)?;
 
     let mkfs_status = Command::new("mkfs.ext4")
         .args(["-q", "-F", output])
@@ -174,7 +166,7 @@ pub fn build_and_generate(
     build_disk(nkrfile, &disk_path, size_mb, context_dir)?;
 
     // 2. Generar initramfs (sin Docker CMD, detecta del disco)
-    let initramfs_path = initramfs::generate_initramfs(name, &disk_path, None)?;
+    let initramfs_path = initramfs::generate_initramfs(name, &disk_path, None, None)?;
 
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
     eprintln!("║ 🚀 NVM listo para usar                                      ║");

@@ -19,6 +19,9 @@ static SHUTDOWN_PHASE: AtomicU8 = AtomicU8::new(0);
 use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 static SHUTDOWN_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+/// Último momento (ms) en que re-inyectamos "SHUTDOWN\n" tras SIGTERM.
+/// Se usa para reintentar cada 2 s si el watcher del guest no respondió.
+static SHUTDOWN_LAST_REINJECT_MS: AtomicU64 = AtomicU64::new(0);
 /// Path del VirtIO-FS rootfs del host — para escribir el sentinel de shutdown
 static SHUTDOWN_ROOTFS_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -62,19 +65,12 @@ const GDT_ADDR: u64 = 0x500;
 fn ensure_bridge(cell_id: u8) -> Result<(), Box<dyn std::error::Error>> {
     crate::cell::ensure_cell_bridge(cell_id)?;
 
-    // Activar KSM si no está corriendo (/sys/kernel/mm/ksm/run = 1)
-    // Sin esto MADV_MERGEABLE se aplica pero el daemon KSM no fusiona nada.
-    // ksm_pages_sharing en /sys/kernel/mm/ksm/ muestra cuántas páginas se fusionaron.
-    let ksm_run = std::fs::read_to_string("/sys/kernel/mm/ksm/run")
-        .unwrap_or_default();
-    if ksm_run.trim() != "1" {
-        if let Err(e) = std::fs::write("/sys/kernel/mm/ksm/run", "1") {
-            eprintln!("[NKR] WARN: no se pudo activar KSM: {e} (continúa sin KSM)");
-        } else {
-            // Escaneo agresivo: útil al arrancar muchas VMs en ráfaga
-            let _ = std::fs::write("/sys/kernel/mm/ksm/pages_to_scan", "1000");
-            eprintln!("[NKR] KSM activado (pages_to_scan=1000)");
-        }
+    // Activar KSM con tuning agresivo (pages_to_scan=5000, sleep_millisecs=10)
+    // Sin esto MADV_MERGEABLE se aplica pero el daemon KSM fusiona muy lento.
+    // Ver src/metrics.rs::ksm_enable para los valores exactos.
+    match crate::metrics::ksm_enable() {
+        Ok(_) => eprintln!("[NKR] KSM activado (pages_to_scan=5000, sleep_millisecs=10)"),
+        Err(e) => eprintln!("[NKR] WARN: no se pudo activar KSM: {e} (continúa sin KSM)"),
     }
 
     Ok(())
@@ -377,10 +373,15 @@ fn setup_port_forwarding(port_specs: &[String], guest_ip: &str) -> Vec<(u16, u16
 
         let dest = format!("{}:{}", guest_ip, guest_port);
 
+        // Serializa el par DNAT + MASQUERADE para evitar que dos procesos
+        // concurrentes con el mismo -C fallido ambos terminen haciendo -A
+        // (reglas duplicadas).
+        let _netlock = crate::netlock::NetLock::acquire("port-fwd-setup");
+
         // DNAT en OUTPUT: procesos locales del host (Nginx, curl) que conectan a
         // 127.0.0.1:host_port son redirigidos al guest. Esto NO afecta la IP pública.
         // Requiere route_localnet=1 (ya configurado en ensure_bridge).
-        let dnat_local = std::process::Command::new("iptables")
+        let dnat_local = crate::netlock::iptables()
             .args(["-t", "nat", "-C", "OUTPUT",
                    "-p", "tcp", "-d", "127.0.0.1",
                    "--dport", &host_port.to_string(),
@@ -388,7 +389,7 @@ fn setup_port_forwarding(port_specs: &[String], guest_ip: &str) -> Vec<(u16, u16
             .status()
             .and_then(|s| {
                 if !s.success() {
-                    std::process::Command::new("iptables")
+                    crate::netlock::iptables()
                         .args(["-t", "nat", "-A", "OUTPUT",
                                "-p", "tcp", "-d", "127.0.0.1",
                                "--dport", &host_port.to_string(),
@@ -400,7 +401,7 @@ fn setup_port_forwarding(port_specs: &[String], guest_ip: &str) -> Vec<(u16, u16
             });
 
         // MASQUERADE para que el guest vea la IP del bridge como origen
-        let masq = std::process::Command::new("iptables")
+        let masq = crate::netlock::iptables()
             .args(["-t", "nat", "-C", "POSTROUTING",
                    "-p", "tcp", "-d", guest_ip,
                    "--dport", &guest_port.to_string(),
@@ -408,7 +409,7 @@ fn setup_port_forwarding(port_specs: &[String], guest_ip: &str) -> Vec<(u16, u16
             .status()
             .and_then(|s| {
                 if !s.success() {
-                    std::process::Command::new("iptables")
+                    crate::netlock::iptables()
                         .args(["-t", "nat", "-A", "POSTROUTING",
                                "-p", "tcp", "-d", guest_ip,
                                "--dport", &guest_port.to_string(),
@@ -440,8 +441,10 @@ fn cleanup_port_forwarding(rules: &[(u16, u16)], guest_ip: &str) {
     for (host_port, guest_port) in rules {
         let dest = format!("{}:{}", guest_ip, guest_port);
 
+        let _netlock = crate::netlock::NetLock::acquire("port-fwd-cleanup");
+
         // Borrar regla OUTPUT (modo actual localhost-only)
-        let _ = std::process::Command::new("iptables")
+        let _ = crate::netlock::iptables()
             .args(["-t", "nat", "-D", "OUTPUT",
                    "-p", "tcp", "-d", "127.0.0.1",
                    "--dport", &host_port.to_string(),
@@ -449,13 +452,13 @@ fn cleanup_port_forwarding(rules: &[(u16, u16)], guest_ip: &str) {
             .status();
 
         // Borrar regla PREROUTING legacy (best-effort: silencioso si no existe)
-        let _ = std::process::Command::new("iptables")
+        let _ = crate::netlock::iptables()
             .args(["-t", "nat", "-D", "PREROUTING",
                    "-p", "tcp", "--dport", &host_port.to_string(),
                    "-j", "DNAT", "--to-destination", &dest])
             .status();
 
-        let _ = std::process::Command::new("iptables")
+        let _ = crate::netlock::iptables()
             .args(["-t", "nat", "-D", "POSTROUTING",
                    "-p", "tcp", "-d", guest_ip,
                    "--dport", &guest_port.to_string(),
@@ -619,8 +622,8 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
     // --- CPU Pinning: Asignar chrs a cores físicos (localidad NUMA) ---
     pin_cpu_chrs(config.chrs)?;
 
-    // --- cgroupv2: CPU bursting + I/O throttling (Features 2 y 4B) ---
-    setup_cgroup(&config.name, config.chrs, std::process::id(), &config.disks, config.burst);
+    // --- cgroupv2: CPU bursting + I/O throttling + memory.max (Features 2 y 4B) ---
+    setup_cgroup(&config.name, config.chrs, config.ram_mb, std::process::id(), &config.disks, config.burst);
 
     // --- Bridge auto-setup (per-cell) ---
     ensure_bridge(config.cell_id)?;
@@ -640,33 +643,46 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
             // Modo disco: inyectar en /etc/nkr-env dentro del ext4
             inject_env_vars(&config.disks[0], &config.env_vars)?;
         } else if config.rootfs.is_some() {
-            // Modo rootfs compartido: escribir nkr-env al primer share dir del host
-            // (el rootfs es RO, usamos un share privado como destino)
-            // Saltar shares que son archivos .ext4 (van por VirtIO-BLK, no son dirs)
-            let dir_share = config.shares.iter().find(|s| {
-                let host = s.splitn(2, ':').next().unwrap_or("");
-                std::fs::metadata(host).map(|m| m.is_dir()).unwrap_or(false)
-            });
-            if let Some(first_share) = dir_share {
-                let parts: Vec<&str> = first_share.splitn(2, ':').collect();
-                if parts.len() >= 1 {
-                    let host_dir = parts[0];
-                    let env_path = format!("{}/nkr-env", host_dir);
-                    let mut content = String::from("# NKR environment variables (auto-generated)\n");
-                    for var in &config.env_vars {
-                        if let Some(eq_pos) = var.find('=') {
-                            let key = &var[..eq_pos];
-                            let val = &var[eq_pos + 1..];
-                            let escaped = val.replace('\'', "'\\''");
-                            content.push_str(&format!("export {}='{}'\n", key, escaped));
+            // Modo rootfs compartido: escribir nkr-env a TODOS los share dirs del host.
+            // El init escanea cada mount buscando nkr-env; escribir en todos asegura que
+            // se encuentre sin depender del orden de slots (FS0, FS1, ...).
+            let mut content = String::from("# NKR environment variables (auto-generated)\n");
+            for var in &config.env_vars {
+                if let Some(eq_pos) = var.find('=') {
+                    let key = &var[..eq_pos];
+                    let val = &var[eq_pos + 1..];
+                    let escaped = val.replace('\'', "'\\''");
+                    content.push_str(&format!("export {}='{}'\n", key, escaped));
+                }
+            }
+            let mut written = 0;
+            for share in &config.shares {
+                let host = share.splitn(2, ':').next().unwrap_or("");
+                if host.is_empty() { continue; }
+                if !std::fs::metadata(host).map(|m| m.is_dir()).unwrap_or(false) { continue; }
+                let env_path = format!("{}/nkr-env", host);
+                match std::fs::write(&env_path, &content) {
+                    Ok(_) => {
+                        written += 1;
+                        eprintln!("[NKR-ENV] Escrito: {} ({} bytes)", env_path, content.len());
+                        // Verificar que el archivo realmente se escribió
+                        match std::fs::read(&env_path) {
+                            Ok(data) => {
+                                if data.len() != content.len() {
+                                    eprintln!("[NKR-ENV] BUG: archivo {} tiene {} bytes, esperaba {}",
+                                        env_path, data.len(), content.len());
+                                }
+                            }
+                            Err(e) => eprintln!("[NKR-ENV] BUG: no se puede releer {}: {}", env_path, e),
                         }
                     }
-                    if let Err(e) = std::fs::write(&env_path, &content) {
-                        eprintln!("[NKR-ENV] WARN: no se pudo escribir {}: {}", env_path, e);
-                    } else {
-                        eprintln!("[NKR-ENV] Env vars escritas en {} ({} bytes)", env_path, content.len());
-                    }
+                    Err(e) => eprintln!("[NKR-ENV] WARN: no se pudo escribir {}: {}", env_path, e),
                 }
+            }
+            if written > 0 {
+                eprintln!("[NKR-ENV] Env vars escritas en {} share(s) ({} bytes)", written, content.len());
+            } else {
+                eprintln!("[NKR-ENV] WARN: no se encontró ningún share dir para escribir nkr-env");
             }
         }
     }
@@ -943,7 +959,9 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             format!("nkr-c{}-tap{}", config.cell_id, config.vm_id)
         };
-        // Crear TAP + conectar a bridge
+        // Serializa netlink/iptables/tc entre procesos nkr run concurrentes.
+        // Cubre: delete→add del tap, unión al bridge, set up, y aislamiento L2.
+        let _netlock = crate::netlock::NetLock::acquire("tap-create");
         let _ = std::process::Command::new("ip")
             .args(["link", "delete", &tap_name]).status();
         let status = std::process::Command::new("ip")
@@ -956,7 +974,7 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
             .args(["link", "set", &tap_name, "master", &bridge_name]).status();
         let _ = std::process::Command::new("ip")
             .args(["link", "set", &tap_name, "up"]).status();
-        // Instalar aislamiento L2 vía ebtables (Feature 3)
+        // Instalar aislamiento L2 vía tc/ebtables (bajo el mismo netlock)
         setup_tap_isolation(&tap_name, &mac, &guest_ip);
         eprintln!("[NKR] Auto-TAP: {} (bridge {})", tap_name, bridge_name);
         Some(tap_name)
@@ -1178,6 +1196,7 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
     SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
     SHUTDOWN_PHASE.store(0, Ordering::SeqCst);
     SHUTDOWN_STARTED_MS.store(0, Ordering::SeqCst);
+    SHUTDOWN_LAST_REINJECT_MS.store(0, Ordering::SeqCst);
 
     // --- VirtIO Console (canal de control host→guest, /dev/hvc0) ---
     let mut console_dev = VirtioConsoleDevice::new(guest_mem.clone());
@@ -1214,7 +1233,8 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[NKR-DBG] cleanup_port_forwarding OK");
 
     // Extraer volúmenes rw (post-shutdown: monta disco, copia guest→host)
-    if !parsed_volumes.is_empty() {
+    // Solo si hay disco — con rootfs compartido (ext4 promovido), config.disks queda vacío.
+    if !parsed_volumes.is_empty() && !config.disks.is_empty() {
         eprintln!("[NKR-DBG] extract_volumes...");
         extract_volumes(&config.disks[0], &parsed_volumes).unwrap_or_else(|e| {
             eprintln!("[NKR-VOL] WARN: Error extrayendo volúmenes: {e}");
@@ -1222,12 +1242,17 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[NKR-DBG] extract_volumes OK");
     }
 
-    // Limpiar TAP auto-creado + reglas ebtables
+    // Limpiar TAP auto-creado + reglas ebtables (bajo netlock)
     if let Some(ref tap_name) = auto_tap_name {
         eprintln!("[NKR-DBG] teardown_tap...");
+        let _netlock = crate::netlock::NetLock::acquire("tap-teardown");
         teardown_tap_isolation(tap_name, &mac, &guest_ip);
-        let _ = std::process::Command::new("ip")
-            .args(["link", "delete", tap_name]).status();
+        let _ = std::process::Command::new("timeout")
+            .args(["5", "ip", "link", "delete", tap_name])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         eprintln!("[NKR] TAP {} eliminado", tap_name);
     }
 
@@ -1410,27 +1435,14 @@ fn setup_tap_isolation(tap_name: &str, mac: &[u8; 6], guest_ip: &str) {
 }
 
 /// Elimina el aislamiento L2 del TAP (tc qdisc + ebtables fallback).
-fn teardown_tap_isolation(tap_name: &str, mac: &[u8; 6], guest_ip: &str) {
-    // Eliminar qdisc clsact (también elimina todos los filtros cBPF)
-    let _ = std::process::Command::new("tc")
-        .args(["qdisc", "del", "dev", tap_name, "clsact"])
-        .output();
-
-    // Limpieza ebtables (por si se usó el fallback)
-    let mac_str = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-    let rules: &[&[&str]] = &[
-        &["ebtables", "-D", "INPUT", "-i", tap_name,
-          "-p", "ARP", "--arp-mac-src", &mac_str, "-j", "ACCEPT"],
-        &["ebtables", "-D", "INPUT", "-i", tap_name,
-          "-p", "IPv4", "--ip-src", guest_ip, "-s", &mac_str, "-j", "ACCEPT"],
-        &["ebtables", "-D", "INPUT", "-i", tap_name, "-j", "DROP"],
-    ];
-
-    for rule in rules {
-        let _ = std::process::Command::new(rule[0]).args(&rule[1..]).status();
-    }
+fn teardown_tap_isolation(tap_name: &str, _mac: &[u8; 6], _guest_ip: &str) {
+    // NOTA: En el flujo actual, el TAP se elimina con `ip link delete` justo
+    // después de este fn. Borrar el link también libera su qdisc clsact y
+    // cualquier filtro ebtables asociado a su ifname. Saltar tc/ebtables evita
+    // que vmm quede pegado 60s+ si rtnetlink/ebtables están ocupados por otro
+    // proceso (observado: `tc qdisc del` cuelga en D-state durante cleanup
+    // con TAP aún referenciada por vhost-net en drop pendiente).
+    eprintln!("[NKR-DBG] teardown_tap: skip (ip link delete limpia qdisc/filters del {})", tap_name);
 }
 
 // =============================================================================
@@ -1453,10 +1465,11 @@ fn get_block_major_minor(path: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-/// Configura cgroupv2 para la VM: cpu.max (garantía + burst) e io.max (throttling).
+/// Configura cgroupv2 para la VM: cpu.max, memory.max e io.max.
 /// Degrada silenciosamente si cgroupv2 no está disponible en el host.
 /// `burst`: si true (Smart Default v1.3), activa cpu.max.burst para ráfagas cortas.
-fn setup_cgroup(vm_name: &str, chrs: u32, pid: u32, disk_paths: &[String], burst: bool) {
+/// `ram_mb`: usado para memory.max con headroom +15% (stack + kernel guest).
+fn setup_cgroup(vm_name: &str, chrs: u32, ram_mb: u32, pid: u32, disk_paths: &[String], burst: bool) {
     // Verificar que cgroupv2 esté montado
     let controllers_path = "/sys/fs/cgroup/cgroup.controllers";
     let controllers = match std::fs::read_to_string(controllers_path) {
@@ -1480,9 +1493,9 @@ fn setup_cgroup(vm_name: &str, chrs: u32, pid: u32, disk_paths: &[String], burst
         return;
     }
 
-    // Habilitar controladores cpu e io en el cgroup padre
+    // Habilitar controladores cpu, memory, io en el cgroup padre
     let subtree_ctl = format!("{}/cgroup.subtree_control", nkr_base);
-    let _ = std::fs::write(&subtree_ctl, "+cpu +io");
+    let _ = std::fs::write(&subtree_ctl, "+cpu +memory +io");
 
     // cpu.max: quota = chrs * 20_000µs por cada 100_000µs (20% por chr)
     let quota = chrs * 20_000;
@@ -1505,6 +1518,20 @@ fn setup_cgroup(vm_name: &str, chrs: u32, pid: u32, disk_paths: &[String], burst
         }
     }
 
+    // memory.max: RAM configurada + headroom (stack kernel guest + overhead KVM
+    // + virtiofsd + page tables). Formula: max(ram*15%, 128 MB). El floor de
+    // 128 MB es crítico para VMs chicas (pgbouncer 64 MB): con headroom lineal
+    // del 15% (9.6 MB), el kernel guest solo ya se queda sin memoria.
+    // Si la VM se pasa, OOM killer LOCAL del cgroup — no arrastra al host.
+    let headroom_bytes: u64 = std::cmp::max((ram_mb as u64) * 1024 * 1024 * 15 / 100, 128 * 1024 * 1024);
+    let memory_max_bytes: u64 = (ram_mb as u64) * 1024 * 1024 + headroom_bytes;
+    let memory_controller_ok = controllers.contains("memory");
+    if memory_controller_ok {
+        if let Err(e) = std::fs::write(format!("{}/memory.max", base), memory_max_bytes.to_string()) {
+            eprintln!("[NKR] WARN: No se pudo escribir memory.max: {}", e);
+        }
+    }
+
     // io.max: 200 MB/s lectura, 100 MB/s escritura por disco
     if controllers.contains("io") {
         for disk in disk_paths {
@@ -1519,7 +1546,9 @@ fn setup_cgroup(vm_name: &str, chrs: u32, pid: u32, disk_paths: &[String], burst
     if let Err(e) = std::fs::write(format!("{}/cgroup.procs", base), format!("{}", pid)) {
         eprintln!("[NKR] WARN: No se pudo mover PID al cgroup: {}", e);
     } else {
-        eprintln!("[NKR] cgroup: {} | cpu.max={} 100000 | io.max=200/100 MB/s", vm_name, quota);
+        let mem_mb = memory_max_bytes / (1024 * 1024);
+        eprintln!("[NKR] cgroup: {} | cpu.max={} 100000 | memory.max={} MB | io.max=200/100 MB/s",
+            vm_name, quota, mem_mb);
     }
 }
 
@@ -1562,10 +1591,11 @@ fn smart_resolve_kernel(path: &str) -> String {
         || path.ends_with("/kernel/nanolinux") || path.ends_with("/kernel/vmlinux") || path.ends_with("/kernel/bzImage");
 
     if is_default {
-        let central_nanolinux = "/mnt/nkr/kernel/nanolinux";
-        if std::path::Path::new(central_nanolinux).exists() {
+        let nkr_data = std::env::var("NKR_DATA_DIR").unwrap_or_else(|_| "/mnt/nkr".to_string());
+        let central_nanolinux = format!("{}/kernel/nanolinux", nkr_data);
+        if std::path::Path::new(&central_nanolinux).exists() {
             eprintln!("[NKR] Smart default: usando nanolinux en almacén central");
-            return central_nanolinux.to_string();
+            return central_nanolinux;
         }
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
@@ -1704,8 +1734,6 @@ fn configure_linux_boot(
     }
     // Canal de control VirtIO-Console (siempre activo)
     cmdline_str.push_str(&format!(" virtio_mmio.device=4K@{:#010x}:{}", CONSOLE_MMIO_ADDR, CONSOLE_IRQ));
-
-    let host_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         
     if let Some(_) = pmem_dev {
         // 1. Declarar el dispositivo de hardware en el bus MMIO
@@ -1721,7 +1749,7 @@ fn configure_linux_boot(
         cmdline_str.push_str(" root=/dev/vda rw");
     }
     
-    cmdline_str.push_str(&format!(" init=/sbin/init nkr.ip={} nkr.time={} \0", guest_ip, host_time));
+    cmdline_str.push_str(&format!(" init=/sbin/init nkr.ip={} \0", guest_ip));
     
     guest_mem.write_slice(cmdline_str.as_bytes(), GuestAddress(CMDLINE_ADDR))?;
 
@@ -1872,6 +1900,24 @@ extern "C" fn sigterm_handler(_sig: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
+// SIGALRM handler: sin acción propia. Sirve solo para EINTR el KVM_RUN y
+// permitir que el loop top revise SHUTDOWN_REQUESTED / el timeout de 60s.
+extern "C" fn sigalrm_handler(_sig: libc::c_int) {}
+
+/// Arma un itimer repetitivo (SIGALRM cada 1s). Llamar una vez tras inyectar
+/// SHUTDOWN para que vcpu.run() no quede bloqueado en HLT indefinidamente si el
+/// guest no responde (no hay tráfico, no entran más señales del host).
+fn arm_shutdown_itimer() {
+    unsafe {
+        libc::signal(libc::SIGALRM, sigalrm_handler as *const () as libc::sighandler_t);
+        let it = libc::itimerval {
+            it_interval: libc::timeval { tv_sec: 1, tv_usec: 0 },
+            it_value:    libc::timeval { tv_sec: 1, tv_usec: 0 },
+        };
+        libc::setitimer(libc::ITIMER_REAL, &it, std::ptr::null_mut());
+    }
+}
+
 fn run_vcpu_loop(
     vcpu: &mut VcpuFd,
     block_devs: &mut Vec<VirtioBlockDevice>,
@@ -1889,21 +1935,31 @@ fn run_vcpu_loop(
     loop {
         if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
             let phase = SHUTDOWN_PHASE.load(Ordering::SeqCst);
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
             if phase == 0 {
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
                 SHUTDOWN_STARTED_MS.store(now_ms, Ordering::SeqCst);
+                SHUTDOWN_LAST_REINJECT_MS.store(now_ms, Ordering::SeqCst);
                 SHUTDOWN_PHASE.store(1, Ordering::SeqCst);
                 eprintln!("\n[NKR] SIGTERM recibido — enviando SHUTDOWN por hvc0...");
                 console_dev.try_inject(b"SHUTDOWN\n");
+                // Arma SIGALRM cada 1s para romper vcpu.run() si el guest
+                // está en HLT — sin esto, el loop no revisa el timeout de 60s.
+                arm_shutdown_itimer();
             } else {
-                // Timeout de 120 s (fallback)
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
                 let elapsed_secs = now_ms.saturating_sub(SHUTDOWN_STARTED_MS.load(Ordering::SeqCst)) / 1000;
-                if elapsed_secs >= 30 {
-                    eprintln!("[NKR] Timeout 30s esperando shutdown del huésped — forzando salida");
+                if elapsed_secs >= 60 {
+                    eprintln!("[NKR] Timeout 60s esperando shutdown del huésped — forzando salida");
                     break;
+                }
+                // Re-inyectar SHUTDOWN cada 2 s mientras el guest no responda.
+                // Mitiga carreras con la inicialización del driver virtio-console:
+                // si la primera inyección se perdió (IRQ no enganchado, buffers no
+                // listos), los reintentos llegan una vez que hvc0 está operativo.
+                let last_inj = SHUTDOWN_LAST_REINJECT_MS.load(Ordering::SeqCst);
+                if now_ms.saturating_sub(last_inj) >= 2000 {
+                    SHUTDOWN_LAST_REINJECT_MS.store(now_ms, Ordering::SeqCst);
+                    console_dev.try_inject(b"SHUTDOWN\n");
                 }
             }
             // Reintentar inyección si la cola aún no estaba lista

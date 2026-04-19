@@ -98,9 +98,10 @@ CELL_ID="$(grep -E '^cell_id:' "$CELL_DIR/cell.yml" | awk '{print $2}' | tr -d '
 info "cell_id asignado: $CELL_ID (subnet 10.0.${CELL_ID}.0/24, bridge nkr-br${CELL_ID})"
 
 # IPs derivadas del cell_id + vm_id (fórmula: 10.0.{cell_id}.{vm_id+1})
+# IDs fijos: pg=1, pgbouncer=2, odoo-NN=3..N
 PG_IP="10.0.${CELL_ID}.2"        # vm_id=1
-PGB_IP="10.0.${CELL_ID}.4"       # vm_id=3
-ODOO_IP="10.0.${CELL_ID}.5"      # vm_id=4
+PGB_IP="10.0.${CELL_ID}.3"       # vm_id=2
+ODOO_IP="10.0.${CELL_ID}.4"      # vm_id=3 (odoo-01)
 
 # Estructura de la Célula (nkr cell create ya creó estos directorios)
 mkdir -p "$CELL_DIR/addons"    # Slot 1: Extra-addons (ReadOnly via VirtIO-FS)
@@ -218,7 +219,7 @@ services:
       - /mnt/nkr/images/postgres.ext4
     ram: 512
     chrs: 1
-    nvm_name: "${CELL_NAME}-db"
+    nkr_name: "${CELL_NAME}-db"
     shares:
       - "${CELL_DIR}/pg:/var/lib/postgresql/data"
     environment:
@@ -235,13 +236,13 @@ services:
   # PgBouncer — Connection pooler (transaction mode)
   # ---------------------------------------------------------------------------
   pgbouncer:
-    id: 3
+    id: 2
     disks:
       - /mnt/nkr/images/pgbouncer.ext4
     ram: 128
     chrs: 1
     burst: false
-    nvm_name: "${CELL_NAME}-pgb"
+    nkr_name: "${CELL_NAME}-pgb"
     environment:
       PG_HOST: "${PG_IP}"
       PG_PORT: "5432"
@@ -260,11 +261,11 @@ services:
   # Odoo — Worker Stateless
   # ---------------------------------------------------------------------------
   odoo:
-    id: 4
+    id: 3
     rootfs: "${MASTER_ROOTFS}"
     ram: 512
     chrs: 1
-    nvm_name: "${CELL_NAME}-odoo"
+    nkr_name: "${CELL_NAME}-odoo-01"
     shares:
       - "${CELL_DIR}/addons:/mnt/extra-addons:ro"
       - "${CELL_DIR}/files:/var/lib/odoo:rw"

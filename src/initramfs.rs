@@ -84,6 +84,7 @@ done
 [ -z "$GUEST_IP" ] && GUEST_IP="10.0.0.2"
 
 if [ -d /sys/class/net/eth0 ]; then
+    ip link set lo up
     ip link set eth0 up
     ip addr add ${GUEST_IP}/24 dev eth0
     ip route add default via 10.0.0.1
@@ -128,7 +129,11 @@ echo "[NKR] rootfs mounted"
 
 mount -o bind /proc /newroot/proc
 mount -o bind /sys /newroot/sys
-mount -o bind /dev /newroot/dev
+mount -t devtmpfs devtmpfs /newroot/dev 2>/dev/null \
+    || mount -o bind /dev /newroot/dev
+mkdir -p /newroot/dev/pts /newroot/dev/shm 2>/dev/null
+mount -t devpts devpts /newroot/dev/pts 2>/dev/null || true
+mount -t tmpfs tmpfs /newroot/dev/shm 2>/dev/null || true
 chmod 666 /newroot/dev/null /newroot/dev/random /newroot/dev/urandom /newroot/dev/zero /newroot/dev/tty 2>/dev/null
 ln -sf /proc/self/fd /newroot/dev/fd
 ln -sf fd/0 /newroot/dev/stdin
@@ -200,7 +205,9 @@ done
 for MNT in "$NKR_FS0_MNT" "$NKR_FS1_MNT" "$NKR_FS2_MNT" "$NKR_FS3_MNT" "$NKR_FS4_MNT" "$NKR_FS5_MNT" "$NKR_FS6_MNT" "$NKR_FS7_MNT"; do
     if [ -n "$MNT" ] && [ -f "/newroot${MNT}/nkr-env" ]; then
         mkdir -p /newroot/tmp/nkr
-        cp "/newroot${MNT}/nkr-env" /newroot/tmp/nkr/nkr-env
+        if [ "${MNT}/nkr-env" != "/tmp/nkr/nkr-env" ]; then
+            cp "/newroot${MNT}/nkr-env" /newroot/tmp/nkr/nkr-env
+        fi
         break
     fi
 done
@@ -288,7 +295,7 @@ fn ensure_base_initramfs() -> Result<std::path::PathBuf, Box<dyn Error>> {
     Ok(base)
 }
 
-pub fn generate_initramfs(name: &str, disk_path: &str, docker_cmd: Option<&[String]>) -> Result<String, Box<dyn Error>> {
+pub fn generate_initramfs(name: &str, disk_path: &str, docker_cmd: Option<&[String]>, env_vars: Option<&std::collections::HashMap<String, String>>) -> Result<String, Box<dyn Error>> {
     let data_dir = nkr_data_dir();
     let initramfs_dir = data_dir.join("initramfs");
     fs::create_dir_all(&initramfs_dir)?;
@@ -382,6 +389,21 @@ pub fn generate_initramfs(name: &str, disk_path: &str, docker_cmd: Option<&[Stri
         fs::create_dir_all(work.join(dir))?;
     }
 
+    // Embeber env vars en /etc/nkr-env dentro del initramfs (si se proporcionan).
+    // Esto garantiza disponibilidad inmediata sin depender de file delivery vía shares.
+    if let Some(env_map) = env_vars {
+        if !env_map.is_empty() {
+            let mut content = String::from("# NKR environment variables (embedded in initramfs)\n");
+            for (key, val) in env_map {
+                let escaped = val.replace('\'', "'\\''");
+                content.push_str(&format!("export {}='{}'\n", key, escaped));
+            }
+            let env_path = work.join("etc/nkr-env");
+            fs::write(&env_path, &content)?;
+            eprintln!("[NKR-INITRAMFS] Env vars embebidas en /etc/nkr-env ({} bytes)", content.len());
+        }
+    }
+
     eprintln!("[NKR-INITRAMFS] Empaquetando {}...", output_path.display());
     let pack_status = Command::new("sh")
         .args([
@@ -442,6 +464,7 @@ done
 [ -z "$GUEST_IP" ] && GUEST_IP="10.0.0.2"
 
 if [ -d /sys/class/net/eth0 ]; then
+    ip link set lo up
     ip link set eth0 up
     ip addr add ${{GUEST_IP}}/24 dev eth0
     ip route add default via 10.0.0.1
@@ -487,7 +510,11 @@ fi
 echo "[NKR-{label}] [DBG] bind proc/sys/dev..."
 mount -o bind /proc /newroot/proc
 mount -o bind /sys /newroot/sys
-mount -o bind /dev /newroot/dev
+mount -t devtmpfs devtmpfs /newroot/dev 2>/dev/null \
+    || mount -o bind /dev /newroot/dev
+mkdir -p /newroot/dev/pts /newroot/dev/shm 2>/dev/null
+mount -t devpts devpts /newroot/dev/pts 2>/dev/null || true
+mount -t tmpfs tmpfs /newroot/dev/shm 2>/dev/null || true
 echo "[NKR-{label}] [DBG] bind OK"
 
 # Dar permisos universales a dispositivos clave (Postgres hace 'su postgres')
@@ -545,6 +572,19 @@ for idx in 0 1 2; do
         mount -t ext4 -o rw,noatime,nodiratime "$DEV" "/newroot${{MNT}}" \
             && echo "[NKR-{label}] BLK: ${{DEV}} → ${{MNT}}" \
             || echo "[NKR-{label}] WARN: BLK mount falló ${{DEV}}"
+        # Ajustar owner a usuario de servicio si el mount coincide
+        case "$MNT" in
+            /var/lib/odoo)
+                _OUID=$(awk -F: '/^odoo:/{{print $3":"$4; exit}}' /newroot/etc/passwd 2>/dev/null)
+                [ -n "$_OUID" ] && chown -R "$_OUID" "/newroot${{MNT}}" 2>/dev/null
+                mkdir -p "/newroot${{MNT}}/sessions" "/newroot${{MNT}}/filestore" "/newroot${{MNT}}/addons"
+                [ -n "$_OUID" ] && chown -R "$_OUID" "/newroot${{MNT}}" 2>/dev/null
+                echo "[NKR-{label}] BLK: chown $_OUID /var/lib/odoo"
+                ;;
+            /var/lib/postgresql/data)
+                chown -R 999:999 "/newroot${{MNT}}" 2>/dev/null
+                ;;
+        esac
     else
         echo "[NKR-{label}] WARN: ${{DEV}} no apareció tras 5s"
     fi
@@ -557,7 +597,9 @@ echo "[NKR-{label}] Starting {name}..."
 for MNT in "$NKR_FS0_MNT" "$NKR_FS1_MNT" "$NKR_FS2_MNT" "$NKR_FS3_MNT" "$NKR_FS4_MNT" "$NKR_FS5_MNT" "$NKR_FS6_MNT" "$NKR_FS7_MNT"; do
     if [ -n "$MNT" ] && [ -f "/newroot${{MNT}}/nkr-env" ]; then
         mkdir -p /newroot/tmp/nkr
-        cat "/newroot${{MNT}}/nkr-env" > /newroot/tmp/nkr/nkr-env
+        if [ "${{MNT}}/nkr-env" != "/tmp/nkr/nkr-env" ]; then
+            cat "/newroot${{MNT}}/nkr-env" > /newroot/tmp/nkr/nkr-env
+        fi
         break
     fi
 done
@@ -567,29 +609,56 @@ cat /newroot/etc/hosts > /newroot/tmp/hosts 2>/dev/null || echo "127.0.0.1 local
 mount -o bind /newroot/tmp/hosts /newroot/etc/hosts
 
 # Watcher de apagado limpio — corre en el contexto del init (tiene /bin/busybox)
-( while [ ! -e /dev/hvc0 ]; do sleep 0.1; done
+( echo "[NKR-{label}-WATCHER] esperando /dev/hvc0..."
+  _wct=0
+  while [ ! -e /dev/hvc0 ] && [ $_wct -lt 600 ]; do sleep 0.1; _wct=$((_wct+1)); done
+  if [ ! -e /dev/hvc0 ]; then
+    echo "[NKR-{label}-WATCHER] ERROR: /dev/hvc0 no apareció tras 60s — watcher abortado"
+    exit 1
+  fi
+  echo "[NKR-{label}-WATCHER] /dev/hvc0 listo (tras ${{_wct}}*100ms) — bloqueado leyendo..."
+  _nkr_cmd=""
   read -r _nkr_cmd < /dev/hvc0 || true
   echo "[NKR-{label}] Comando '$_nkr_cmd' en hvc0 — apagado limpio..."
-  # Leer PID desde postmaster.pid (buscar en rutas típicas de datos)
-  _PG_PID=""
+  _HANDLED=0
+  # PostgreSQL: preferir shutdown coordinado via postmaster.pid
   for _pgdata in /newroot/var/lib/postgresql/data /newroot/var/lib/postgresql/16/data /newroot/var/lib/postgresql/15/data; do
     if [ -f "$_pgdata/postmaster.pid" ]; then
       _PG_PID=$(/bin/busybox head -n1 "$_pgdata/postmaster.pid" 2>/dev/null)
-      echo "[NKR-{label}] postmaster.pid encontrado: PID=$_PG_PID en $_pgdata"
+      if [ -n "$_PG_PID" ] && /bin/busybox kill -0 "$_PG_PID" 2>/dev/null; then
+        echo "[NKR-{label}] postgres PID=$_PG_PID → SIGTERM"
+        /bin/busybox kill -SIGTERM "$_PG_PID" 2>/dev/null || true
+        _w=0
+        while /bin/busybox kill -0 "$_PG_PID" 2>/dev/null && [ $_w -lt 15 ]; do
+          sleep 1; _w=$((_w+1))
+        done
+        _HANDLED=1
+      fi
       break
     fi
   done
-  if [ -n "$_PG_PID" ] && /bin/busybox kill -0 "$_PG_PID" 2>/dev/null; then
-    echo "[NKR-{label}] Enviando SIGTERM a postgres PID=$_PG_PID"
-    /bin/busybox kill -SIGTERM "$_PG_PID" 2>/dev/null || true
+  # Genérico (Odoo, pgbouncer, cualquier otro): broadcast SIGTERM a todo lo que
+  # no sea PID 1 ni kernel threads. killall5 respeta init y la propia sesión.
+  if [ "$_HANDLED" = "0" ]; then
+    echo "[NKR-{label}] Broadcast SIGTERM (killall5) — app sin handler específico"
+    /bin/busybox killall5 -15 2>/dev/null || true
     _w=0
-    while /bin/busybox kill -0 "$_PG_PID" 2>/dev/null && [ $_w -lt 15 ]; do
+    # Esperar hasta 25s a que salgan los procesos de userspace.
+    # Heurística: procesos de userspace tienen /proc/N/cmdline NO vacío.
+    # Kernel threads (kthreadd, ksoftirqd, etc.) tienen cmdline vacío.
+    while [ $_w -lt 25 ]; do
+      _USER=0
+      for _p in /proc/[0-9]*; do
+        _pidn=${{_p#/proc/}}
+        [ "$_pidn" = "1" ] && continue
+        [ -s "$_p/cmdline" ] && {{ _USER=1; break; }}
+      done
+      [ "$_USER" = "0" ] && break
       sleep 1; _w=$((_w+1))
     done
-    /bin/busybox kill -0 "$_PG_PID" 2>/dev/null && /bin/busybox kill -SIGKILL "$_PG_PID" 2>/dev/null || true
+    echo "[NKR-{label}] userspace drenado en ${{_w}}s — SIGKILL rezagados"
+    /bin/busybox killall5 -9 2>/dev/null || true
     sleep 1
-  else
-    echo "[NKR-{label}] WARN: postgres PID no encontrado o ya terminado"
   fi
   /bin/busybox sync
   for _blk_mnt in $NKR_BLK0_MNT $NKR_BLK1_MNT $NKR_BLK2_MNT; do
@@ -619,7 +688,7 @@ for pg_bin in /usr/lib/postgresql/*/bin; do
     fi
 done
 
-for env_file in /etc/nkr-env /etc/odoo/nkr-env /tmp/nkr/nkr-env; do
+for env_file in /etc/nkr-env /etc/odoo/nkr-env /tmp/nkr/nkr-env /tmp/nkr-overrides/nkr-env; do
     [ -f "$env_file" ] && . "$env_file" && echo "[NKR-{label}] Cargado nkr-env desde $env_file"
 done
 
@@ -678,20 +747,38 @@ if [ "$COMMAND" = "/entrypoint.sh" ] || [ "$COMMAND" = "/docker-entrypoint.sh" ]
     elif [ -d "/var/lib/postgresql" ] || [ -x "/usr/local/bin/postgres" ]; then
         # Inicializar PGDATA si está vacío (primer arranque)
         _PGDATA="${{PGDATA:-/var/lib/postgresql/data}}"
+        echo "[NKR-{label}] DBG PGDATA=$PGDATA _PGDATA=$_PGDATA nkr-env-content=$(cat /tmp/nkr/nkr-env 2>&1 | head -3)"
         if [ ! -f "$_PGDATA/postgresql.conf" ]; then
             echo "[NKR-{label}] PGDATA vacío — ejecutando initdb..."
             mkdir -p "$_PGDATA"
-            chown -R 999:999 "$_PGDATA" 2>/dev/null || true
+            chmod 700 "$_PGDATA" 2>&1 || echo "[NKR-{label}] WARN: chmod 700 $_PGDATA falló"
+            chown -R 999:999 "$_PGDATA" 2>&1 || echo "[NKR-{label}] WARN: chown 999:999 $_PGDATA falló"
+            echo "[NKR-{label}] DBG perms: $(stat -c '%U:%G %a' "$_PGDATA" 2>/dev/null || ls -ld "$_PGDATA")"
+            _INITDB_ARGS="-U ${{POSTGRES_USER:-postgres}} --pgdata=$_PGDATA --encoding=UTF8 --locale=C.UTF-8"
             if [ -x "/usr/local/bin/gosu" ] || [ -x "/usr/bin/gosu" ] || [ -x "/usr/sbin/gosu" ]; then
                 _GOSU_BIN=$(command -v gosu)
-                $_GOSU_BIN postgres initdb -U "${{POSTGRES_USER:-postgres}}" --pgdata="$_PGDATA" \
+                $_GOSU_BIN postgres initdb $_INITDB_ARGS \
                     && echo "[NKR-{label}] initdb completado" \
                     || echo "[NKR-{label}] WARN: initdb falló"
             elif [ -x "/usr/local/sbin/su-exec" ] || [ -x "/sbin/su-exec" ]; then
                 _SUEXEC_BIN=$(command -v su-exec)
-                $_SUEXEC_BIN postgres initdb -U "${{POSTGRES_USER:-postgres}}" --pgdata="$_PGDATA" \
+                $_SUEXEC_BIN postgres initdb $_INITDB_ARGS \
                     && echo "[NKR-{label}] initdb completado" \
                     || echo "[NKR-{label}] WARN: initdb falló"
+            fi
+        fi
+        # Permitir conexiones desde la subred de la cell (pgbouncer + odoos)
+        if [ -f "$_PGDATA/postgresql.conf" ]; then
+            if ! grep -q "^listen_addresses" "$_PGDATA/postgresql.conf"; then
+                echo "listen_addresses = '*'" >> "$_PGDATA/postgresql.conf"
+                echo "[NKR-{label}] postgresql.conf: listen_addresses='*'"
+            fi
+            if [ -f "$_PGDATA/pg_hba.conf" ] && ! grep -q "nkr-cell-net" "$_PGDATA/pg_hba.conf"; then
+                cat >> "$_PGDATA/pg_hba.conf" << 'PGHBAEOF'
+# nkr-cell-net: acceso desde subred de la cell (pgbouncer + odoos)
+host all all 10.0.0.0/8 trust
+PGHBAEOF
+                echo "[NKR-{label}] pg_hba.conf: host all all 10.0.0.0/8 trust"
             fi
         fi
         _PGCMD="postgres -D $_PGDATA -k /var/run/postgresql"
@@ -705,7 +792,19 @@ if [ "$COMMAND" = "/entrypoint.sh" ] || [ "$COMMAND" = "/docker-entrypoint.sh" ]
             COMMAND="$_PGCMD"
         fi
     elif [ -x "/usr/bin/pgbouncer" ]; then
-        COMMAND="$COMMAND pgbouncer /etc/pgbouncer/pgbouncer.ini"
+        _PGB_INI="${{PGBOUNCER_INI:-/etc/pgbouncer/pgbouncer.ini}}"
+        echo "[NKR-{label}] PGB_INI=$PGBOUNCER_INI exists=$([ -f \"$PGBOUNCER_INI\" ] && echo Y || echo N) dir=$(ls -la /etc/pgbouncer/ 2>&1 | head -3)"
+        if [ -n "$PGBOUNCER_INI" ] && [ -f "$PGBOUNCER_INI" ]; then
+            # Override externo: copiar ini+userlist a /etc/pgbouncer (tmpfs) y lanzar directo
+            mkdir -p /etc/pgbouncer
+            cp "$PGBOUNCER_INI" /etc/pgbouncer/pgbouncer.ini || echo "[NKR-{label}] WARN: cp pgbouncer.ini falló: $?"
+            _PGB_DIR=$(dirname "$PGBOUNCER_INI")
+            [ -f "$_PGB_DIR/userlist.txt" ] && cp "$_PGB_DIR/userlist.txt" /etc/pgbouncer/userlist.txt
+            echo "[NKR-{label}] pgbouncer.ini copiado: $(ls -la /etc/pgbouncer/pgbouncer.ini 2>&1)"
+            COMMAND="pgbouncer /etc/pgbouncer/pgbouncer.ini"
+        else
+            COMMAND="$COMMAND pgbouncer $_PGB_INI"
+        fi
     fi
 fi
 
