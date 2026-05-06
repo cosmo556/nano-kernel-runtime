@@ -63,7 +63,13 @@ pub fn run() -> std::io::Result<()> {
     }
 
     let listener = UnixListener::bind(&path)?;
-    set_socket_perms(&path);
+    // Apply 0660 BEFORE accepting any connection. If chmod fails (RO fs,
+    // missing perms on parent dir, etc.) abort the daemon — refusing to run
+    // is the correct behavior here, because the alternative is leaving the
+    // socket world-accessible (default mode is umask-derived, often 0755 or
+    // 0777). The bound socket is unlinked on Drop / next start, so this is
+    // safe to bail out of.
+    set_socket_perms(&path)?;
     eprintln!(
         "[NKR-IPC] UDS server escuchando en {} (mode=0660 root:nkr-api)",
         path.display()
@@ -109,25 +115,27 @@ pub fn run() -> std::io::Result<()> {
     Ok(())
 }
 
-fn set_socket_perms(path: &Path) {
+fn set_socket_perms(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    // 0660 first — even if chown fails the socket stays tight.
-    if let Ok(meta) = fs::metadata(path) {
-        let mut perm = meta.permissions();
-        perm.set_mode(0o660);
-        if let Err(e) = fs::set_permissions(path, perm) {
-            eprintln!("[NKR-IPC] WARN: no pude chmod 0660 {}: {}", path.display(), e);
-        }
-    }
+    // 0660 FIRST — this is non-negotiable. Even if the chown step below
+    // fails (no nkr-api group), the socket stays restricted to root and the
+    // group owner only. Returning Err here aborts the caller so the daemon
+    // does not run with an open socket.
+    let meta = fs::metadata(path)?;
+    let mut perm = meta.permissions();
+    perm.set_mode(0o660);
+    fs::set_permissions(path, perm)?;
 
-    // Try to chown root:nkr-api. If nkr-api group does not exist, leave as root:root.
+    // Try to chown root:nkr-api. If nkr-api group does not exist, leave as
+    // root:root — operators running the proxy as root still get a working
+    // setup, only with a less granular ACL.
     let gid = lookup_group_gid("nkr-api");
     match gid {
         Some(g) => {
             let cpath = match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
                 Ok(c) => c,
-                Err(_) => return,
+                Err(_) => return Ok(()),
             };
             let current_uid = match fs::metadata(path) {
                 Ok(m) => m.uid(),
@@ -152,6 +160,7 @@ fn set_socket_perms(path: &Path) {
             );
         }
     }
+    Ok(())
 }
 
 fn lookup_group_gid(name: &str) -> Option<u32> {

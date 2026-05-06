@@ -183,8 +183,17 @@ pub fn query_get(query: &str, key: &str) -> Option<String> {
 /// characters: alphanum + '-' + '_' + '.'. Rejects spaces, newlines, quotes,
 /// backticks, $, parens → blocks YAML, shell, SQL, log injection at the root.
 /// Max 64 chars. Empty = invalid.
+///
+/// Also rejects standalone `.` and `..` and any value that begins with `.`
+/// — those pass the charset filter but resolve to the current/parent dir
+/// or hidden files, which would surprise downstream `PathBuf::join` calls.
+/// Defense-in-depth: NKR also uses Path::join (which is safe per-component)
+/// and validates against existing dirs, but we close this at the boundary.
 pub fn is_safe_identifier(s: &str) -> bool {
     if s.is_empty() || s.len() > 64 {
+        return false;
+    }
+    if s == "." || s == ".." || s.starts_with('.') {
         return false;
     }
     s.bytes()
@@ -322,7 +331,14 @@ mod tests {
         assert!(!is_safe_identifier("a b"));
         assert!(!is_safe_identifier("a;b"));
         assert!(!is_safe_identifier(&"x".repeat(65)));
+        // Path-traversal / dotfile defense.
+        assert!(!is_safe_identifier("."));
+        assert!(!is_safe_identifier(".."));
+        assert!(!is_safe_identifier(".hidden"));
+        assert!(!is_safe_identifier(".env"));
         assert!(is_safe_identifier("company_client-tst-1"));
+        // Internal dots are still legitimate (e.g. version-suffixed names).
+        assert!(is_safe_identifier("v17.0-tenant"));
     }
 
     #[test]

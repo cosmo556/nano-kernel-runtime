@@ -830,13 +830,8 @@ fn append_compose_block(
     out.push_str(&new_block.join("\n"));
     out.push('\n');
 
-    // Backup before writing
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let bak = compose_path.with_extension(format!("yml.bak.{}", ts));
-    let _ = fs::copy(&compose_path, &bak);
+    // Backup before writing (rotated: keeps only the last N backups).
+    let bak = backup_compose_with_rotation(&compose_path);
 
     fs::write(&compose_path, out)?;
     eprintln!("[NKR-CLONE] Compose actualizado: bloque '{}' añadido ({}). Backup: {}",
@@ -1582,24 +1577,115 @@ fn rewrite_odoo_conf_full(
     Ok(())
 }
 
-/// Inserts or replaces `key = value` in the lines array (INI-style).
-/// Searches under the `[options]` header. If the key already exists under any section, replaces it.
+/// Maximum number of `nkr-compose.yml.bak.<ts>` backups kept per cell. Older
+/// ones are deleted on every new mutation. The default of 20 covers ~weeks
+/// of churn in normal panel usage; raise it via env if the operator wants
+/// deeper history.
+const COMPOSE_BACKUPS_TO_KEEP: usize = 20;
+
+/// Copies `compose_path` to `<compose_path>.bak.<unix_ts>` and then prunes
+/// older backups in the same directory, keeping at most COMPOSE_BACKUPS_TO_KEEP.
+/// Returns the path of the new backup. Best-effort: if the copy fails, returns
+/// the path it WOULD have used so callers can still reference it in logs.
+/// The pruning step is independent of the copy and never propagates errors.
+fn backup_compose_with_rotation(compose_path: &Path) -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let bak = compose_path.with_extension(format!("yml.bak.{}", ts));
+    if let Err(e) = fs::copy(compose_path, &bak) {
+        eprintln!("[NKR-COMPOSE] WARN: backup copy {} failed: {}",
+            bak.display(), e);
+    }
+    rotate_compose_backups(compose_path, COMPOSE_BACKUPS_TO_KEEP);
+    bak
+}
+
+/// Deletes the oldest `<compose_path>.bak.<ts>` files in the same directory
+/// until at most `keep` remain. The timestamp encoded in the filename is
+/// authoritative (mtime can be wrong if files were rsync'd from elsewhere).
+fn rotate_compose_backups(compose_path: &Path, keep: usize) {
+    let parent = match compose_path.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    let stem = match compose_path.file_name().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return,
+    };
+    let prefix = format!("{}.bak.", stem);
+
+    let mut backups: Vec<(PathBuf, u64)> = match fs::read_dir(parent) {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let suffix = name.strip_prefix(&prefix)?;
+                let ts: u64 = suffix.parse().ok()?;
+                Some((e.path(), ts))
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    if backups.len() <= keep {
+        return;
+    }
+    backups.sort_by_key(|(_, ts)| *ts); // ascending: oldest first
+    let drop_n = backups.len() - keep;
+    for (path, _) in backups.iter().take(drop_n) {
+        if let Err(e) = fs::remove_file(path) {
+            eprintln!("[NKR-COMPOSE] WARN: prune {} failed: {}",
+                path.display(), e);
+        }
+    }
+}
+
+/// Inserts or replaces `key = value` under the `[options]` section of an
+/// INI-style file. Section-aware: replacement only happens within the
+/// `[options]` range, so a `[some-other-section]` containing the same key
+/// is never overwritten. Standard Odoo conf files use only `[options]`, so
+/// the behavior matches the previous implementation in the common case;
+/// the change only matters when an operator has added extra sections.
 fn upsert_key(lines: &mut Vec<String>, key: &str, value: &str) {
     let target = format!("{} = {}", key, value);
-    // Attempt 1: in-place replacement if the key exists.
-    for line in lines.iter_mut() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with(&format!("{} =", key))
-            || trimmed.starts_with(&format!("{}=", key))
-            || trimmed.starts_with(&format!("{} =", key))
-        {
-            *line = target.clone();
+
+    // Locate `[options]` boundaries. start_idx is the line AFTER the header
+    // (first line of the section body). end_idx is the line of the next
+    // `[...]` header or `lines.len()` if [options] runs to EOF.
+    let opts_header = lines.iter().position(|l| l.trim() == "[options]");
+    let (start_idx, end_idx) = match opts_header {
+        Some(h) => {
+            let next = lines[h + 1..]
+                .iter()
+                .position(|l| {
+                    let t = l.trim();
+                    t.starts_with('[') && t.ends_with(']')
+                })
+                .map(|rel| h + 1 + rel)
+                .unwrap_or(lines.len());
+            (h + 1, next)
+        }
+        None => (lines.len(), lines.len()),
+    };
+
+    // Attempt 1: in-place replacement WITHIN the [options] range.
+    let key_eq = format!("{} =", key);
+    let key_eq_tight = format!("{}=", key);
+    for i in start_idx..end_idx {
+        let trimmed = lines[i].trim_start();
+        if trimmed.starts_with(&key_eq) || trimmed.starts_with(&key_eq_tight) {
+            lines[i] = target;
             return;
         }
     }
-    // Attempt 2: append under [options]. If the header doesn't exist, we add it at the end.
-    if let Some(pos) = lines.iter().position(|l| l.trim() == "[options]") {
-        lines.insert(pos + 1, target);
+
+    // Attempt 2: append under [options] (creating the section if missing).
+    if let Some(h) = opts_header {
+        // Insert right after the header so new keys cluster at the top of the
+        // section. Operators reading the conf scan top-down and expect new
+        // additions to be visible without scrolling.
+        lines.insert(h + 1, target);
     } else {
         if !lines.is_empty() && !lines.last().unwrap().is_empty() {
             lines.push(String::new());
@@ -1738,11 +1824,7 @@ pub fn patch_compose_block_resources(
         out.insert(insert_at, format!("    balloon_mb: {}", balloon_mb.unwrap()));
     }
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs()).unwrap_or(0);
-    let bak = compose_path.with_extension(format!("yml.bak.{}", ts));
-    let _ = fs::copy(&compose_path, &bak);
+    let bak = backup_compose_with_rotation(&compose_path);
     fs::write(&compose_path, out.join("\n") + "\n")?;
     eprintln!("[NKR-PATCH] compose '{}' updated: ram={:?} chrs={:?} balloon_mb={:?} (backup {})",
         nkr_name, ram_mb, chrs, balloon_mb, bak.display());
@@ -1904,10 +1986,8 @@ fn remove_compose_block(cell: &CellConfig, nkr_name: &str) -> Result<(), Box<dyn
     }
     let end = blk_end.unwrap_or(lines.len());
 
-    // Backup
-    let ts = now_unix_secs();
-    let bak = compose_path.with_extension(format!("yml.bak.{}", ts));
-    let _ = fs::copy(&compose_path, &bak);
+    // Backup (rotated: keeps only the last N backups).
+    let bak = backup_compose_with_rotation(&compose_path);
 
     let kept: Vec<String> = lines.iter().enumerate()
         .filter(|(i, _)| *i < start || *i >= end)
@@ -2167,6 +2247,81 @@ mod tests {
 
         assert!(dst.exists(), "commit() should have preserved the dir");
         assert!(dst.join("marker").exists(), "commit() should have preserved the file");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn upsert_key_replaces_within_options_only() {
+        // [admin] has the same key — must NOT be touched.
+        let mut lines: Vec<String> = vec![
+            String::from("[admin]"),
+            String::from("workers = 99"),
+            String::new(),
+            String::from("[options]"),
+            String::from("workers = 2"),
+            String::from("list_db = True"),
+        ];
+
+        upsert_key(&mut lines, "workers", "8");
+
+        assert_eq!(lines[1], "workers = 99", "[admin] section must be untouched");
+        assert!(lines.iter().any(|l| l == "workers = 8"), "[options] workers must be replaced");
+        // The [options] block still contains list_db.
+        assert!(lines.iter().any(|l| l == "list_db = True"));
+    }
+
+    #[test]
+    fn upsert_key_inserts_at_top_of_options_when_missing() {
+        let mut lines: Vec<String> = vec![
+            String::from("[options]"),
+            String::from("workers = 2"),
+        ];
+
+        upsert_key(&mut lines, "logfile", "/var/log/odoo/odoo.log");
+
+        // logfile must be the first line under [options], not appended elsewhere.
+        assert_eq!(lines[0], "[options]");
+        assert_eq!(lines[1], "logfile = /var/log/odoo/odoo.log");
+        assert_eq!(lines[2], "workers = 2");
+    }
+
+    #[test]
+    fn upsert_key_creates_options_section_when_absent() {
+        let mut lines: Vec<String> = vec![String::from("; bare comment")];
+        upsert_key(&mut lines, "workers", "4");
+        // Must have created [options] and added the key under it.
+        assert!(lines.iter().any(|l| l == "[options]"));
+        assert!(lines.iter().any(|l| l == "workers = 4"));
+    }
+
+    #[test]
+    fn rotate_compose_backups_keeps_last_n() {
+        let tmp = env::temp_dir().join(format!("nkr-rotate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let compose = tmp.join("nkr-compose.yml");
+        fs::write(&compose, b"x").unwrap();
+
+        // Create 25 fake backups with increasing timestamps.
+        for ts in 1000u64..1025 {
+            fs::write(tmp.join(format!("nkr-compose.yml.bak.{}", ts)), b"y").unwrap();
+        }
+
+        rotate_compose_backups(&compose, 10);
+
+        // Should keep only the 10 newest (ts >= 1015).
+        let kept: Vec<u64> = fs::read_dir(&tmp)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                let s = n.strip_prefix("nkr-compose.yml.bak.")?;
+                s.parse::<u64>().ok()
+            })
+            .collect();
+        assert_eq!(kept.len(), 10);
+        assert!(kept.iter().all(|ts| *ts >= 1015), "kept old backup: {:?}", kept);
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }

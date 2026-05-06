@@ -193,6 +193,18 @@ fn stop_vm_by_state(state: VmState) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[NKR] Deteniendo VM {} (PID {})...", vm_id, state.pid);
 
+    // Defense against PID reuse: if the PID we recorded was reaped while we
+    // weren't watching, the kernel may have handed it to a completely
+    // unrelated process. Sending SIGTERM/SIGKILL there would kill a random
+    // host process. Confirm /proc/<pid>/cmdline still matches an `nkr run`
+    // for THIS vm name before signalling.
+    if !pid_matches_vm(state.pid, &state.name) {
+        eprintln!("[NKR] VM {} (PID {}): cmdline no matchea, asumiendo ya muerto",
+            vm_id, state.pid);
+        unregister_vm(vm_id);
+        return Ok(());
+    }
+
     // Send SIGTERM
     let ret = unsafe { libc::kill(state.pid as i32, libc::SIGTERM) };
     if ret != 0 {
@@ -216,6 +228,16 @@ fn stop_vm_by_state(state: VmState) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Re-verify the PID still belongs to us before SIGKILL — between the
+    // SIGTERM 90s ago and now, the kernel could have reaped + recycled it
+    // (rare but observed under high process churn).
+    if !pid_matches_vm(state.pid, &state.name) {
+        eprintln!("[NKR] VM {} (PID {}): cmdline cambió antes de SIGKILL — \
+                   PID fue reciclado, omitiendo kill", vm_id, state.pid);
+        unregister_vm(vm_id);
+        return Ok(());
+    }
+
     // If it didn't exit with SIGTERM, send SIGKILL
     eprintln!("[NKR] VM {} no respondió a SIGTERM, enviando SIGKILL...", vm_id);
     unsafe { libc::kill(state.pid as i32, libc::SIGKILL); }
@@ -223,6 +245,36 @@ fn stop_vm_by_state(state: VmState) -> Result<(), Box<dyn std::error::Error>> {
     unregister_vm(vm_id);
     eprintln!("[NKR] VM {} forzada a detenerse", vm_id);
     Ok(())
+}
+
+/// Checks whether `/proc/<pid>/cmdline` looks like an `nkr run --name <name>`
+/// invocation. Used to detect PID reuse before killing a recorded PID — if
+/// the cmdline no longer matches, the PID belongs to some unrelated host
+/// process and must NOT be signalled.
+fn pid_matches_vm(pid: u32, name: &str) -> bool {
+    let cmdline = match std::fs::read(format!("/proc/{}/cmdline", pid)) {
+        Ok(b) => b,
+        Err(_) => return false, // /proc entry gone → PID is dead, not ours
+    };
+    if cmdline.is_empty() {
+        return false;
+    }
+    // /proc/<pid>/cmdline is NUL-separated argv. We look for two markers:
+    //   1. an arg containing "nkr" (binary name or path ending in /nkr)
+    //   2. an arg "run"
+    //   3. a "--name" followed by exactly our `name`
+    let s = String::from_utf8_lossy(&cmdline);
+    let args: Vec<&str> = s.split('\0').filter(|a| !a.is_empty()).collect();
+    if args.is_empty() {
+        return false;
+    }
+    let bin_ok = args[0].rsplit('/').next().map(|n| n == "nkr").unwrap_or(false)
+        || args.iter().any(|a| *a == "nkr");
+    let run_ok = args.iter().any(|a| *a == "run");
+    let name_ok = args
+        .windows(2)
+        .any(|w| w[0] == "--name" && w[1] == name);
+    bin_ok && run_ok && name_ok
 }
 
 /// Prints a table of active VMs
