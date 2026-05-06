@@ -1,0 +1,2795 @@
+// =============================================================================
+// NKR API — Daemon-side request handlers (invoked over IPC from nkr-api-server)
+// =============================================================================
+//
+// Every `handle_*` function takes already-validated inputs (strings or parsed
+// bodies), performs the actual work against cell/state/metrics modules, and
+// returns an `IpcResponse`. The unprivileged proxy marshals HTTP ↔ IPC; all
+// the privileged work (file I/O, cgroup writes, process spawns) happens here.
+//
+// Validation is repeated here on the daemon side (defense in depth): even
+// though the proxy checks identifiers before sending, a rogue process with
+// access to the UDS could skip the proxy. Every handler re-validates.
+// =============================================================================
+//
+// Routes exposed by the proxy (resolved to IpcRequest variants):
+//   POST   /api/v1/instances                                     → CreateInstance { cell_hint: None }
+//   POST   /api/v1/cells/{cell}/instances                        → CreateInstance { cell_hint: Some(cell) }
+//   GET    /api/v1/cells/{cell}/instances/{nkr_name}             → GetInfo
+//   DELETE /api/v1/cells/{cell}/instances/{nkr_name}?drop_db=1   → DeleteInstance
+//   POST   /api/v1/cells/{cell}/instances/{nkr_name}/actions     → Action
+//   GET    /api/v1/cells/{cell}/instances/{nkr_name}/logs?tail=N → GetLogs
+//   GET    /api/v1/health                                        → Health
+//   GET    /api/v1/cells                                         → ListCells
+//   GET    /metrics                                              → RenderMetrics
+// =============================================================================
+
+use serde::{Deserialize, Serialize};
+use std::process::Command;
+
+use crate::api_http::{is_safe_addons_path, is_safe_dns, is_safe_identifier};
+use crate::cell::{
+    clone_instance_with_opts, count_odoo_instances, delete_instance,
+    ensure_cell_prefix, get_instance_info, load_cell, lookup_cell_id,
+    patch_odoo_conf, select_cell_for_version, CloneOptions, Edition, InstanceMode,
+    MAX_ODOOS_PER_CELL,
+};
+use crate::ipc::IpcResponse;
+
+// =============================================================================
+// Request body types (panel → proxy → daemon over IPC body_json)
+// =============================================================================
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CreateInstanceReq {
+    /// Instance name. Can be short ("tst-1") or full ("company_client-tst-1");
+    /// it auto-prefixes with the cell name if missing.
+    pub nkr_name: String,
+    /// `dev` (clone with DB) or `production` (clone without DB).
+    pub mode: InstanceMode,
+    /// Required: each cell supports a single Odoo version; the panel
+    /// sends it and the backend validates the cell matches.
+    pub odoo_version: String,
+    /// Optional: if specified, version and capacity are validated. If omitted,
+    /// the backend picks the least-full cell with the matching version.
+    #[serde(default)]
+    pub cell: Option<String>,
+    /// Optional: template nkr_name. If omitted, the first alphabetical
+    /// instance of the selected cell is used.
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub dns: Option<String>,
+    #[serde(default)]
+    pub edition: Option<Edition>,
+    #[serde(default)]
+    pub pg_version: Option<String>,
+    /// Sole resource input: NKR deriva chrs, ram_mb (compose) y limit_memory_soft/hard
+    /// (odoo.conf) a partir de este número. Default = 2. Rango válido 1..=16.
+    /// Ver `derive_resources()`.
+    #[serde(default)]
+    pub workers: Option<u32>,
+    #[serde(default)]
+    pub list_db: Option<bool>,
+    #[serde(default)]
+    pub addons_path: Option<String>,
+    #[serde(default)]
+    pub python_libs: Vec<String>,
+    /// Master admin password of the tenant's Odoo instance. Used by /web/database/*
+    /// endpoints and stored encrypted on the panel side. MANDATORY — NKR nunca
+    /// lo genera; el panel es single source of truth. Charset `[A-Za-z0-9._-]{16,128}`.
+    pub admin_passwd: String,
+    /// Password de login del user "admin" del tenant (login web). Si se manda,
+    /// NKR la setea via JSON-RPC tras boot del tenant — antes del 201 al panel.
+    /// Esto cierra la ventana donde admin/admin (heredada del template) seguía
+    /// funcionando. Si se omite, queda admin/admin (backward compat). Charset
+    /// `[A-Za-z0-9._-]{8,128}`.
+    #[serde(default)]
+    pub admin_user_password: Option<String>,
+    /// True por default (las cells NKR siempre están detrás de nginx/Cloudflare).
+    /// Opt-out pasando false para tests locales.
+    #[serde(default)]
+    pub proxy_mode: Option<bool>,
+    /// MB to inflate in the VirtIO-Balloon at boot. If omitted (normal case),
+    /// the clone inherits `balloon_mb` from the template (default 128 MB for
+    /// Odoo). Passing 0 explicitly disables the balloon (not recommended for
+    /// Odoo). The per-descriptor cap + dedup make high values safe, but
+    /// inflating beyond half the guest RAM can stall the guest.
+    #[serde(default)]
+    pub balloon_mb: Option<u32>,
+}
+
+/// Recursos derivados a partir del workers count. Single source of truth para
+/// el sizing del tenant — el panel sólo pasa workers, NKR computa el resto.
+///
+/// Fórmulas (workers=N):
+///   compose:    chrs = 2N + 1            ram_mb     = 1024·N         MB
+///   odoo.conf:  workers = N              soft_bytes = 400·N · 1MiB
+///                                        hard_bytes = 750·N · 1MiB
+///   balloon:    balloon_mb = ram_mb - limit_memory_hard_mb - 256
+///                            (floor 0 si < 64 MB; mejor desactivar que
+///                            arrancar un device para devolver migajas)
+///
+/// Tabla de referencia:
+///   N=1 → chrs=3,  ram=1024MB, soft=400MB,  hard=750MB,  balloon=0
+///   N=2 → chrs=5,  ram=2048MB, soft=800MB,  hard=1500MB, balloon=292
+///   N=4 → chrs=9,  ram=4096MB, soft=1600MB, hard=3000MB, balloon=840
+///   N=8 → chrs=17, ram=8192MB, soft=3200MB, hard=6000MB, balloon=1936
+pub struct DerivedResources {
+    pub workers: u32,
+    pub chrs: u32,
+    pub ram_mb: u32,
+    pub limit_memory_soft: u64, // bytes
+    pub limit_memory_hard: u64, // bytes
+    pub balloon_mb: u32,
+}
+
+pub fn derive_resources(workers: u32) -> DerivedResources {
+    let w = workers as u64;
+    let ram_mb: u32 = 1024 * workers;
+    let limit_memory_soft: u64 = 400 * w * 1024 * 1024;
+    let limit_memory_hard: u64 = 750 * w * 1024 * 1024;
+
+    // Balloon = ram_mb - limit_memory_hard_mb - 256 MB headroom.
+    // Floor: if the formula yields less than 64 MB the device's overhead
+    // (host bookkeeping, guest driver jitter) outweighs the savings — better
+    // to disable the balloon entirely (0).
+    let limit_hard_mb = (limit_memory_hard / (1024 * 1024)) as u32;
+    let raw = ram_mb
+        .saturating_sub(limit_hard_mb)
+        .saturating_sub(256);
+    let balloon_mb = if raw < 64 { 0 } else { raw };
+
+    DerivedResources {
+        workers,
+        chrs: (2 * workers) + 1,
+        ram_mb,
+        limit_memory_soft,
+        limit_memory_hard,
+        balloon_mb,
+    }
+}
+
+
+#[derive(Deserialize, Serialize, Clone, Copy, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum ActionKind {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl ActionKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "start" => Some(ActionKind::Start),
+            "stop" => Some(ActionKind::Stop),
+            "restart" => Some(ActionKind::Restart),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+pub struct ActionReq {
+    pub action: ActionKind,
+}
+
+// =============================================================================
+// Handlers — each returns IpcResponse
+// =============================================================================
+
+pub fn handle_health() -> IpcResponse {
+    IpcResponse::json(
+        200,
+        serde_json::json!({
+            "ok": true,
+            "version": env!("CARGO_PKG_VERSION"),
+        }),
+    )
+}
+
+pub fn handle_list_cells() -> IpcResponse {
+    let cells: Vec<serde_json::Value> = crate::cell::list_cells()
+        .into_iter()
+        .map(|c| {
+            let used = crate::cell::count_odoo_instances(&c.name);
+            let free = MAX_ODOOS_PER_CELL.saturating_sub(used);
+            serde_json::json!({
+                "name": c.name,
+                "cell_id": c.cell_id,
+                "odoo_version": c.odoo_version,
+                "used_odoos": used,
+                "max_odoos": MAX_ODOOS_PER_CELL,
+                "free_slots": free,
+            })
+        })
+        .collect();
+    IpcResponse::json(
+        200,
+        serde_json::json!({
+            "cells": cells,
+            "max_odoos_per_cell": MAX_ODOOS_PER_CELL,
+        }),
+    )
+}
+
+/// `cell_hint`: None for POST /instances (auto-select). Some(cell) for POST /cells/{cell}/instances.
+pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
+    if body_json.len() > 64 * 1024 {
+        return IpcResponse::error(413, "body_too_large", None);
+    }
+    let req: CreateInstanceReq = match serde_json::from_str(body_json) {
+        Ok(r) => r,
+        Err(_) => {
+            return IpcResponse::error(
+                400,
+                "invalid_json",
+                Some("request body is not valid JSON or missing required fields"),
+            )
+        }
+    };
+
+    if !is_safe_identifier(&req.nkr_name) {
+        return IpcResponse::error(
+            400,
+            "invalid_nkr_name",
+            Some("nkr_name must match [A-Za-z0-9._-]{1,64}"),
+        );
+    }
+    if !is_safe_identifier(&req.odoo_version) {
+        return IpcResponse::error(400, "invalid_odoo_version", None);
+    }
+    if let Some(ref c) = req.cell {
+        if !is_safe_identifier(c) {
+            return IpcResponse::error(400, "invalid_cell", None);
+        }
+    }
+    if let Some(h) = cell_hint {
+        if !is_safe_identifier(h) {
+            return IpcResponse::error(400, "invalid_cell_in_url", None);
+        }
+    }
+    if let Some(ref s) = req.source {
+        if !is_safe_identifier(s) {
+            return IpcResponse::error(400, "invalid_source", None);
+        }
+    }
+    if let Some(ref d) = req.dns {
+        if !is_safe_dns(d) {
+            return IpcResponse::error(400, "invalid_dns", None);
+        }
+    }
+    if let Some(ref pg) = req.pg_version {
+        if !is_safe_identifier(pg) {
+            return IpcResponse::error(400, "invalid_pg_version", None);
+        }
+    }
+    if let Some(ref ap) = req.addons_path {
+        if !is_safe_addons_path(ap) {
+            return IpcResponse::error(400, "invalid_addons_path", None);
+        }
+    }
+    // admin_passwd: OBLIGATORIO. El panel es única fuente. Charset [A-Za-z0-9._-]{16,128}
+    // para evitar inyección en odoo.conf y forzar entropía mínima razonable.
+    {
+        let p = req.admin_passwd.as_str();
+        if p.is_empty() {
+            return IpcResponse::error(400, "admin_passwd_required",
+                Some("admin_passwd is mandatory (panel must generate and persist it)"));
+        }
+        let bytes = p.as_bytes();
+        let ok = bytes.len() >= 16 && bytes.len() <= 128
+            && bytes.iter().all(|b| b.is_ascii_alphanumeric()
+                || matches!(b, b'.' | b'_' | b'-'));
+        if !ok {
+            return IpcResponse::error(400, "invalid_admin_passwd",
+                Some("must be [A-Za-z0-9._-]{16,128}"));
+        }
+    }
+    // admin_user_password: OPCIONAL. Si presente, NKR la setea en res_users.password
+    // del user 'admin' tras boot. Mínimo 8 chars (Odoo no fuerza más, no queremos
+    // bloquear casos legítimos). No log, no echo en respuesta.
+    if let Some(ref p) = req.admin_user_password {
+        let bytes = p.as_bytes();
+        let ok = bytes.len() >= 8 && bytes.len() <= 128
+            && bytes.iter().all(|b| b.is_ascii_alphanumeric()
+                || matches!(b, b'.' | b'_' | b'-'));
+        if !ok {
+            return IpcResponse::error(400, "invalid_admin_user_password",
+                Some("must be [A-Za-z0-9._-]{8,128}"));
+        }
+    }
+    // workers: rango 1..=16 (la única input de sizing que acepta el API).
+    if let Some(w) = req.workers {
+        if !(1..=16).contains(&w) {
+            return IpcResponse::error(400, "invalid_workers",
+                Some("workers must be 1..=16"));
+        }
+    }
+
+    // Reconcile cell: body.cell > URL cell > auto by version.
+    let cell_name_req: Option<String> = req.cell.clone().or_else(|| cell_hint.map(|s| s.to_string()));
+
+    let resolved_cell = match cell_name_req {
+        Some(name) => {
+            if lookup_cell_id(&name).is_none() {
+                return IpcResponse::json(
+                    404,
+                    serde_json::json!({"error":"cell_not_found","cell":name}),
+                );
+            }
+            let cell = match load_cell(&name) {
+                Ok(c) => c,
+                Err(e) => {
+                    return IpcResponse::json(
+                        404,
+                        serde_json::json!({
+                            "error":"cell_load_failed","message":e.to_string()
+                        }),
+                    )
+                }
+            };
+            match cell.odoo_version.as_deref() {
+                Some(v) if v == req.odoo_version => {}
+                Some(v) => {
+                    return IpcResponse::json(
+                        409,
+                        serde_json::json!({
+                            "error": "version_mismatch",
+                            "message": format!("Cell '{}' está en odoo_version={}, panel pidió {}",
+                                cell.name, v, req.odoo_version),
+                            "cell": cell.name,
+                            "cell_version": v,
+                            "requested_version": req.odoo_version,
+                        }),
+                    )
+                }
+                None => {
+                    return IpcResponse::json(
+                        409,
+                        serde_json::json!({
+                            "error": "cell_version_unset",
+                            "message": format!("Cell '{}' sin odoo_version en cell.yml", cell.name),
+                            "cell": cell.name,
+                        }),
+                    )
+                }
+            }
+            cell
+        }
+        None => match select_cell_for_version(&req.odoo_version) {
+            Ok(c) => c,
+            Err(e) => {
+                return IpcResponse::json(
+                    409,
+                    serde_json::json!({
+                        "error": "no_cell_available",
+                        "message": e.to_string(),
+                        "requested_version": req.odoo_version,
+                    }),
+                )
+            }
+        },
+    };
+
+    let used = count_odoo_instances(&resolved_cell.name);
+    if used >= MAX_ODOOS_PER_CELL {
+        return IpcResponse::json(
+            409,
+            serde_json::json!({
+                "error": "cell_full",
+                "cell": resolved_cell.name,
+                "used": used,
+                "max": MAX_ODOOS_PER_CELL,
+            }),
+        );
+    }
+
+    // Source resolution (regla nueva, v1.6+):
+    //   - mode=production: NKR fuerza source = "<cell>-odoo-template" (DB del
+    //     template vacío, base+web preinstalados). Panel NO debe mandar
+    //     `source` (si lo manda → 409).
+    //   - mode=dev: panel DEBE mandar `source` apuntando al tenant a clonar
+    //     (ej. clonar producción para staging). Si falta → 400.
+    let source = match req.mode {
+        InstanceMode::Production => {
+            if req.source.is_some() {
+                return IpcResponse::json(409, serde_json::json!({
+                    "error": "source_not_allowed_in_production",
+                    "message": "mode=production siempre clona del template de la cell. Para clonar de otro tenant usá mode=dev con 'source' explícito.",
+                    "cell": resolved_cell.name,
+                }));
+            }
+            let tpl = format!("{}-odoo-template", resolved_cell.name);
+            // Sanity: existe el template en disco?
+            let tpl_dir = crate::cell::cells_dir()
+                .join(&resolved_cell.name)
+                .join("instances")
+                .join(&tpl);
+            if !tpl_dir.exists() {
+                return IpcResponse::json(409, serde_json::json!({
+                    "error": "cell_template_missing",
+                    "message": format!("La cell '{}' no tiene template '{}'. Crearlo o reseed la cell.", resolved_cell.name, tpl),
+                    "cell": resolved_cell.name,
+                    "expected_template": tpl,
+                }));
+            }
+            tpl
+        }
+        InstanceMode::Dev => match req.source.clone() {
+            Some(s) => s,
+            None => {
+                return IpcResponse::error(400, "source_required",
+                    Some("mode=dev requiere 'source' explícito (nkr_name del tenant fuente). Para crear un tenant fresh usá mode=production."));
+            }
+        },
+    };
+
+    let dst_name = ensure_cell_prefix(&resolved_cell.name, &req.nkr_name);
+
+    // Derivar TODOS los recursos a partir de workers (single source of truth).
+    // Si el panel omitió workers → default 2.
+    let r = derive_resources(req.workers.unwrap_or(2));
+
+    // Si el panel pide edition=enterprise, validar que la cell tenga el repo
+    // enterprise descargado. Sin esto el tenant arrancaría con manifests
+    // faltantes y warnings de addons_path inválido — peor: el usuario cree
+    // que tiene enterprise cuando funcionalmente es community.
+    if matches!(req.edition, Some(crate::cell::Edition::Enterprise)) {
+        let ent_dir = format!("/mnt/nkr/enterprise/{}", resolved_cell.odoo_version
+            .clone().unwrap_or_else(|| req.odoo_version.clone()));
+        let mut has_modules = false;
+        if let Ok(entries) = std::fs::read_dir(&ent_dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with('.') || name == "nkr-env" { continue; }
+                if p.is_dir() && p.join("__manifest__.py").exists() {
+                    has_modules = true;
+                    break;
+                }
+            }
+        }
+        if !has_modules {
+            return IpcResponse::json(409, serde_json::json!({
+                "error": "enterprise_not_provisioned",
+                "message": format!(
+                    "edition=enterprise solicitada pero la cell '{}' no tiene el repo Odoo Enterprise descargado en {}. \
+                     El panel debe llamar primero `POST /api/v1/cells/{}/enterprise/git` con el deploy_key_b64 (o github_token) del cliente.",
+                    resolved_cell.name, ent_dir, resolved_cell.name
+                ),
+                "cell": resolved_cell.name,
+                "odoo_version": resolved_cell.odoo_version.clone().unwrap_or_default(),
+                "enterprise_path": ent_dir,
+            }));
+        }
+    }
+
+    let admin_passwd_to_persist = req.admin_passwd.clone();
+
+    let opts = CloneOptions {
+        mode: req.mode,
+        no_compose: false,
+        dns: req.dns,
+        edition: req.edition,
+        odoo_version: Some(req.odoo_version.clone()),
+        pg_version: req.pg_version,
+        workers: Some(r.workers),
+        list_db: req.list_db,
+        limit_memory_soft: Some(r.limit_memory_soft),
+        limit_memory_hard: Some(r.limit_memory_hard),
+        addons_path: req.addons_path,
+        python_libs: req.python_libs,
+        admin_passwd: Some(admin_passwd_to_persist),
+        proxy_mode: req.proxy_mode,
+        ram_mb: Some(r.ram_mb),
+        chrs: Some(r.chrs),
+        // Balloon: if the panel passed an explicit `balloon_mb`, it wins.
+        // Otherwise we apply the derived default (`r.balloon_mb`), which is
+        // computed from `workers` to leave Odoo enough working set under
+        // peak load (see `derive_resources` for the formula).
+        balloon_mb: Some(req.balloon_mb.unwrap_or(r.balloon_mb)),
+        skip_db_clone: false, // HTTP API always clones the DB.
+    };
+
+    let admin_user_pwd = req.admin_user_password.clone();
+    match clone_instance_with_opts(&source, &dst_name, &opts) {
+        Ok(info) => {
+            // Si el panel envió admin_user_password: NKR garantiza tenant
+            // arrancado + password de login del user admin seteada antes del
+            // 201. Cierra la ventana donde admin/admin (heredada del template)
+            // funciona. Si fail acá, 503 con detalle — el clone ya está hecho
+            // pero no listo para producción.
+            if let Some(new_pwd) = admin_user_pwd {
+                let is_enterprise = matches!(req.edition, Some(crate::cell::Edition::Enterprise));
+                if let Err(e) = boot_and_set_admin_password(&info, &new_pwd, is_enterprise) {
+                    eprintln!("[API] admin_password_setup_failed: {}", e);
+                    return IpcResponse::json(503, serde_json::json!({
+                        "error": "admin_password_setup_failed",
+                        "message": e,
+                        "cell": resolved_cell.name,
+                        "nkr_name": dst_name,
+                        "hint": "Tenant arrancado pero password del user 'admin' sigue siendo 'admin' (default del template). Reintentar via JSON-RPC manual o re-llamar create.",
+                    }));
+                }
+            }
+            let payload = serde_json::to_value(&info).unwrap_or(serde_json::json!({}));
+            IpcResponse::json(201, payload)
+        }
+        Err(e) => {
+            eprintln!("[API] clone_failed: {}", e);
+            IpcResponse::json(
+                500,
+                serde_json::json!({
+                    "error": "clone_failed",
+                    "message": e.to_string(),
+                    "cell": resolved_cell.name,
+                    "source": source,
+                    "nkr_name": dst_name,
+                }),
+            )
+        }
+    }
+}
+
+/// Para usuarios que pidieron `admin_user_password` en POST /instances:
+/// (1) `nkr compose up -d` para arrancar el tenant, (2) polling TCP :8069 hasta
+/// que responda, (3) JSON-RPC login admin/admin → res.users.change_password.
+/// Si `is_enterprise=true`, además: (4) `ir.module.module.update_list()` para
+/// registrar manifests de /mnt/extra-enterprise/, y (5) install web_enterprise
+/// para activar el theme enterprise.
+/// Bloquea hasta ~120s + ~3-5min si is_enterprise. Errores propagan al caller.
+fn boot_and_set_admin_password(
+    info: &crate::cell::InstanceInfo,
+    new_pwd: &str,
+    is_enterprise: bool,
+) -> Result<(), String> {
+    use std::time::{Duration, Instant};
+
+    // 1. Compose up — disparar el tenant. Idempotente: si ya estaba arriba,
+    //    el daemon de compose detecta y sigue.
+    let cell_dir = std::path::PathBuf::from(&info.instance_dir)
+        .parent().and_then(|p| p.parent())
+        .ok_or_else(|| "no se pudo resolver cell dir".to_string())?
+        .to_path_buf();
+    let _ = Command::new("nkr")
+        .current_dir(&cell_dir)
+        .args(["compose", "up", "-d"])
+        .status()
+        .map_err(|e| format!("compose up spawn: {}", e))?;
+
+    // 2. Wait HTTP :8069 — polling cada 2s, max 120s.
+    let host = &info.guest_ip;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut http_up = false;
+    while Instant::now() < deadline {
+        let r = http_post_json(host, 8069, "/web/database/list",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"call\",\"params\":{}}",
+            None, 3);
+        if let Ok((code, _, _)) = r {
+            if (200..400).contains(&code) {
+                http_up = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    if !http_up {
+        return Err(format!("tenant {} no respondió :8069 en 120s", host));
+    }
+
+    // 3. JSON-RPC login con admin/admin (default heredada del template).
+    let auth_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "db": info.db_name,
+            "login": "admin",
+            "password": "admin",
+        }
+    }).to_string();
+    let (auth_code, set_cookie, auth_resp) = http_post_json(
+        host, 8069, "/web/session/authenticate",
+        &auth_body, None, 30,
+    ).map_err(|e| format!("auth http: {}", e))?;
+    if auth_code != 200 {
+        return Err(format!("auth status={}", auth_code));
+    }
+    // Validar que la respuesta tenga uid (login exitoso) — Odoo devuelve 200
+    // incluso cuando creds son incorrectas, con result:null.
+    let auth_json: serde_json::Value = serde_json::from_str(&auth_resp)
+        .map_err(|e| format!("auth json: {}", e))?;
+    let uid = auth_json.pointer("/result/uid").and_then(|v| v.as_i64());
+    if uid.is_none() {
+        return Err("login admin/admin falló (¿template ya tiene otra pwd?)".to_string());
+    }
+    let cookie = set_cookie
+        .ok_or_else(|| "auth no devolvió Set-Cookie".to_string())?;
+
+    // 4. JSON-RPC change_password. res.users.change_password(old, new) sólo
+    //    funciona sobre el user autenticado (no admin sobre cualquiera).
+    let chg_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "model": "res.users",
+            "method": "change_password",
+            "args": ["admin", new_pwd],
+            "kwargs": {},
+        }
+    }).to_string();
+    let (chg_code, _, chg_resp) = http_post_json(
+        host, 8069, "/web/dataset/call_kw",
+        &chg_body, Some(&cookie), 30,
+    ).map_err(|e| format!("change_password http: {}", e))?;
+    if chg_code != 200 {
+        return Err(format!("change_password status={}", chg_code));
+    }
+    let chg_json: serde_json::Value = serde_json::from_str(&chg_resp)
+        .map_err(|e| format!("change_password json: {}", e))?;
+    if chg_json.get("error").is_some() {
+        return Err(format!("change_password error: {}",
+            chg_json.get("error").unwrap()));
+    }
+    eprintln!("[API] admin user password set para tenant '{}' (uid={:?})",
+        info.nkr_name, uid);
+
+    // 5. Si edition=enterprise: registrar manifests del repo enterprise +
+    //    instalar web_enterprise para activar el theme. Sin esto el tenant
+    //    montó la share /mnt/extra-enterprise pero ir_module_module sólo tiene
+    //    los 14 modulos del template + algunos enterprise descubiertos al
+    //    azar. update_list() escanea addons_path y registra TODOS los
+    //    manifests faltantes (~750 entries en v19). Después instalar
+    //    web_enterprise dispara reinstalación de modulos base con el
+    //    overlay enterprise — la UI cambia al theme enterprise.
+    if is_enterprise {
+        if let Err(e) = enable_enterprise_runtime(host, &cookie, &info.nkr_name) {
+            // No es fatal — el tenant queda funcional como community. Loggeamos.
+            // El operador puede ejecutar manualmente "Update Apps List" + Install
+            // Web Enterprise desde la UI.
+            eprintln!("[API] enterprise activation falló para '{}': {} \
+                (tenant funcional como community; activar manual desde UI)",
+                info.nkr_name, e);
+        }
+    }
+    Ok(())
+}
+
+/// Ejecuta el flujo de activación de Odoo Enterprise sobre un tenant ya
+/// arrancado y autenticado: update_list (escanea manifests) + install
+/// web_enterprise (cambia theme + dependencias). Tarda 2-5 min.
+fn enable_enterprise_runtime(
+    host: &str,
+    cookie: &str,
+    nkr_name: &str,
+) -> Result<(), String> {
+    // 1. update_list — registra manifests nuevos en ir_module_module.
+    let upd = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "model": "ir.module.module",
+            "method": "update_list",
+            "args": [],
+            "kwargs": {},
+        }
+    }).to_string();
+    let (code, _, _) = http_post_json(
+        host, 8069, "/web/dataset/call_kw",
+        &upd, Some(cookie), 120,
+    ).map_err(|e| format!("update_list http: {}", e))?;
+    if code != 200 {
+        return Err(format!("update_list status={}", code));
+    }
+    eprintln!("[API] enterprise: update_list OK en '{}'", nkr_name);
+
+    // 2. find web_enterprise id.
+    let find = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "model": "ir.module.module",
+            "method": "search_read",
+            "args": [
+                [["name", "=", "web_enterprise"]],
+                ["id", "state"],
+            ],
+            "kwargs": {"limit": 1},
+        }
+    }).to_string();
+    let (find_code, _, find_resp) = http_post_json(
+        host, 8069, "/web/dataset/call_kw",
+        &find, Some(cookie), 30,
+    ).map_err(|e| format!("search web_enterprise: {}", e))?;
+    if find_code != 200 {
+        return Err(format!("search status={}", find_code));
+    }
+    let find_json: serde_json::Value = serde_json::from_str(&find_resp)
+        .map_err(|e| format!("search json: {}", e))?;
+    let id = find_json.pointer("/result/0/id").and_then(|v| v.as_i64());
+    let state = find_json.pointer("/result/0/state").and_then(|v| v.as_str())
+        .unwrap_or("").to_string();
+    let id = match id {
+        Some(i) => i,
+        None => return Err("web_enterprise no aparece tras update_list — \
+            ¿el repo enterprise no está descargado en /mnt/nkr/enterprise/<v>?".to_string()),
+    };
+    if state == "installed" {
+        eprintln!("[API] enterprise: web_enterprise ya installed en '{}', skip", nkr_name);
+        return Ok(());
+    }
+
+    // 3. install web_enterprise. Esto bloquea hasta que termine la
+    //    instalación (puede tardar 2-5 min porque arrastra deps).
+    let install = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "model": "ir.module.module",
+            "method": "button_immediate_install",
+            "args": [[id]],
+            "kwargs": {},
+        }
+    }).to_string();
+    let (inst_code, _, inst_resp) = http_post_json(
+        host, 8069, "/web/dataset/call_kw",
+        &install, Some(cookie), 480,
+    ).map_err(|e| format!("install web_enterprise: {}", e))?;
+    if inst_code != 200 {
+        return Err(format!("install status={}", inst_code));
+    }
+    let inst_json: serde_json::Value = serde_json::from_str(&inst_resp)
+        .map_err(|e| format!("install json: {}", e))?;
+    if inst_json.get("error").is_some() {
+        return Err(format!("install error: {}", inst_json.get("error").unwrap()));
+    }
+    eprintln!("[API] enterprise: web_enterprise installed en '{}' (id={})", nkr_name, id);
+    Ok(())
+}
+
+pub fn handle_get_info(nkr_name: &str) -> IpcResponse {
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    match get_instance_info(nkr_name) {
+        Ok(info) => IpcResponse::json(200, info),
+        Err(e) => {
+            eprintln!("[API] get_info({}) error: {}", nkr_name, e);
+            IpcResponse::json(
+                404,
+                serde_json::json!({"error":"not_found","nkr_name":nkr_name}),
+            )
+        }
+    }
+}
+
+pub fn handle_delete(nkr_name: &str, drop_db: bool) -> IpcResponse {
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    match delete_instance(nkr_name, drop_db) {
+        Ok(cell) => IpcResponse::json(
+            200,
+            serde_json::json!({
+                "deleted": true,
+                "nkr_name": nkr_name,
+                "cell": cell,
+                "drop_db": drop_db,
+            }),
+        ),
+        Err(e) => {
+            // Idempotencia: si la instance ya no existe, devolver 200 con
+            // `already_deleted: true` en vez de 500. Esto evita que el panel
+            // entre en estado de error cuando hace polling y la instance
+            // desapareció en una ronda anterior, o cuando un DELETE se reintenta.
+            let msg = e.to_string();
+            if msg.contains("no encontrada") || msg.contains("not found") {
+                eprintln!("[API] delete({}) idempotente: ya no existía", nkr_name);
+                return IpcResponse::json(
+                    200,
+                    serde_json::json!({
+                        "deleted": true,
+                        "already_deleted": true,
+                        "nkr_name": nkr_name,
+                        "drop_db": drop_db,
+                    }),
+                );
+            }
+            eprintln!("[API] delete({}) error: {}", nkr_name, e);
+            IpcResponse::json(
+                500,
+                serde_json::json!({"error":"delete_failed","nkr_name":nkr_name,"message":msg}),
+            )
+        }
+    }
+}
+
+// In-flight set: una start/stop/restart en curso por nkr_name.
+// Evita races en TAP/iptables/state cuando el panel dispara dos acciones
+// seguidas (ej. webhook que pide restart 2× por reintento).
+fn inflight_actions() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static INFLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    INFLIGHT.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+struct InflightActionGuard(String);
+impl Drop for InflightActionGuard {
+    fn drop(&mut self) {
+        let mut set = match inflight_actions().lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        set.remove(&self.0);
+    }
+}
+
+pub fn handle_action(nkr_name: &str, action_str: &str) -> IpcResponse {
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    let action = match ActionKind::parse(action_str) {
+        Some(a) => a,
+        None => {
+            return IpcResponse::error(
+                400,
+                "invalid_action",
+                Some("expected start|stop|restart"),
+            )
+        }
+    };
+
+    // Resolve cell dir for `nkr compose up` during start/restart.
+    let info = get_instance_info(nkr_name);
+    let cell_dir = info
+        .as_ref()
+        .ok()
+        .and_then(|i| {
+            std::path::PathBuf::from(&i.instance_dir)
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+        });
+
+    // Reserve the in-flight slot BEFORE spawning. Si ya hay una acción para
+    // esta instancia → 409 (el panel debería polear nkr_status en lugar de
+    // re-disparar).
+    {
+        let mut set = match inflight_actions().lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        if set.contains(nkr_name) {
+            return IpcResponse::json(
+                409,
+                serde_json::json!({
+                    "error": "action_in_progress",
+                    "nkr_name": nkr_name,
+                    "message": "ya hay un start/stop/restart en curso para esta instancia",
+                }),
+            );
+        }
+        set.insert(nkr_name.to_string());
+    }
+
+    // Snapshot del info ANTES (el panel ya lo necesita para addons_path/dns
+    // del response inmediato; nkr_status se rescata después con GET).
+    let info_snapshot = info.ok();
+
+    // Detach: stop+start puede tardar 60–130s y la API HTTP es síncrona —
+    // sin esto el panel cortaba por timeout y el restart quedaba colgado en
+    // el medio. El proxy tiene MAX_INFLIGHT=64; bloquear un slot por minuto
+    // y medio por VM era inviable. El panel debe polear
+    // GET /api/v1/cells/{cell}/instances/{name} → nkr_status.port_8069_up
+    // para detectar readiness.
+    let nkr_name_owned = nkr_name.to_string();
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("nkr-action-{}", nkr_name))
+        .spawn(move || {
+            let _guard = InflightActionGuard(nkr_name_owned.clone());
+            let started = std::time::Instant::now();
+            let result = match action {
+                ActionKind::Start => start_instance(&nkr_name_owned, cell_dir.as_deref()),
+                ActionKind::Stop => stop_instance(&nkr_name_owned),
+                ActionKind::Restart => restart_instance(&nkr_name_owned, cell_dir.as_deref()),
+            };
+            let dur = started.elapsed();
+            match result {
+                Ok(()) => eprintln!(
+                    "[API] action({},{:?}) async ok ({}ms)",
+                    nkr_name_owned, action, dur.as_millis()
+                ),
+                Err(e) => eprintln!(
+                    "[API] action({},{:?}) async error ({}ms): {}",
+                    nkr_name_owned, action, dur.as_millis(), e
+                ),
+            }
+        });
+
+    if let Err(e) = spawn_result {
+        // Spawn falló — liberar slot manualmente (el guard nunca corrió).
+        if let Ok(mut set) = inflight_actions().lock() {
+            set.remove(nkr_name);
+        }
+        eprintln!("[API] action({},{:?}) thread spawn fail: {}", nkr_name, action, e);
+        return IpcResponse::json(
+            503,
+            serde_json::json!({"error":"spawn_failed","nkr_name":nkr_name}),
+        );
+    }
+
+    IpcResponse::json(
+        202,
+        serde_json::json!({
+            "action": action,
+            "nkr_name": nkr_name,
+            "status": "accepted",
+            "async": true,
+            "info": info_snapshot,
+        }),
+    )
+}
+
+fn start_instance(
+    nkr_name: &str,
+    cell_dir: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if crate::state::list_vms().iter().any(|v| v.name == nkr_name) {
+        return Ok(());
+    }
+    let dir = cell_dir.ok_or("no se pudo resolver cell dir para start")?;
+    let status = Command::new("nkr")
+        .current_dir(dir)
+        .args(["compose", "up", "-d"])
+        .status()?;
+    if !status.success() {
+        return Err("nkr compose up falló".into());
+    }
+    Ok(())
+}
+
+fn stop_instance(nkr_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let vm = crate::state::list_vms().into_iter().find(|v| v.name == nkr_name);
+    match vm {
+        Some(v) => crate::state::stop_vm(v.vm_id),
+        None => Ok(()),
+    }
+}
+
+fn restart_instance(
+    nkr_name: &str,
+    cell_dir: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    stop_instance(nkr_name)?;
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    start_instance(nkr_name, cell_dir)
+}
+
+pub fn handle_logs(
+    nkr_name: &str,
+    tail: Option<usize>,
+    from_offset: Option<u64>,
+    max_lines: Option<usize>,
+    wait_ms: Option<u64>,
+) -> IpcResponse {
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    let info = match get_instance_info(nkr_name) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("[API] logs({}) error: {}", nkr_name, e);
+            return IpcResponse::error(404, "not_found", None);
+        }
+    };
+
+    // Modo cursor: from_offset presente → read from offset, long-poll opcional.
+    // Modo tail: sin from_offset → últimas N líneas desde el final del archivo.
+    if let Some(mut start) = from_offset {
+        let max_lines = max_lines.unwrap_or(500).clamp(1, 10_000);
+        let wait_ms = wait_ms.unwrap_or(0).min(25_000);
+
+        let file_size = match std::fs::metadata(&info.logs_path) {
+            Ok(m) => m.len(),
+            Err(_) => return IpcResponse::error(404, "log_file_missing", None),
+        };
+
+        // Rotation detection: si el archivo es MÁS PEQUEÑO que from_offset
+        // → fue truncado/rotado. El panel debe reiniciar desde 0.
+        let rotated = start > file_size;
+        if rotated {
+            start = 0;
+        }
+
+        // Long-poll: si nada nuevo, esperar hasta wait_ms.
+        let file_size = if !rotated && start == file_size && wait_ms > 0 {
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(wait_ms);
+            let mut cur = file_size;
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                match std::fs::metadata(&info.logs_path) {
+                    Ok(m) if m.len() > cur => { cur = m.len(); break; }
+                    Ok(m) if m.len() < cur => { cur = m.len(); break; } // rotate mid-wait
+                    _ => {}
+                }
+            }
+            cur
+        } else {
+            file_size
+        };
+
+        // Rotation mid-wait: si el file_size es menor que start ahora, rotó.
+        let (start, rotated) = if file_size < start { (0u64, true) } else { (start, rotated) };
+
+        let (lines, next_offset) = read_forward_lines(
+            &info.logs_path, start, max_lines, 4 * 1024 * 1024,
+        );
+
+        return IpcResponse::json(200, serde_json::json!({
+            "nkr_name": nkr_name,
+            "logs_path": info.logs_path,
+            "mode": "cursor",
+            "lines": lines,
+            "from_offset": start,
+            "next_offset": next_offset,
+            "file_size": file_size,
+            "rotated": rotated,
+            "eof": next_offset >= file_size,
+        }));
+    }
+
+    // Modo tail clásico (retrocompatible).
+    let tail = tail.unwrap_or(200).min(10_000);
+    let tail_lines = read_tail_lines(&info.logs_path, tail, 4 * 1024 * 1024);
+    let file_size = std::fs::metadata(&info.logs_path).map(|m| m.len()).unwrap_or(0);
+    IpcResponse::json(
+        200,
+        serde_json::json!({
+            "nkr_name": nkr_name,
+            "logs_path": info.logs_path,
+            "mode": "tail",
+            "tail": tail,
+            "lines": tail_lines,
+            "next_offset": file_size,
+            "file_size": file_size,
+        }),
+    )
+}
+
+/// Forward read desde `start`. Devuelve (líneas, next_offset byte-accurate).
+/// Cap: `max_bytes` en RAM y `max_lines` líneas.
+fn read_forward_lines(path: &str, start: u64, max_lines: usize, max_bytes: usize)
+    -> (Vec<String>, u64)
+{
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (Vec::new(), start),
+    };
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return (Vec::new(), start);
+    }
+    // Leer como máximo max_bytes; cortar en el último \n que entra.
+    let mut buf = vec![0u8; max_bytes];
+    let n = match f.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return (Vec::new(), start),
+    };
+    buf.truncate(n);
+
+    // Buscar el último \n para no devolver una línea parcial.
+    let last_nl = buf.iter().rposition(|&b| b == b'\n');
+    let (consumed_bytes, slice): (usize, &[u8]) = match last_nl {
+        Some(p) => (p + 1, &buf[..=p]),
+        None if n == 0 => (0, &[][..]),
+        None => {
+            // Archivo sin '\n' hasta ahora — devolver partial-less y no avanzar.
+            return (Vec::new(), start);
+        }
+    };
+
+    let text = String::from_utf8_lossy(slice);
+    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+
+    // Si exceden max_lines, truncar Y calcular el offset real hasta esa línea
+    // para que el panel pueda seguir desde ahí sin saltarse nada.
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        // Re-encontrar el offset byte-accurate de la line max_lines-ésima.
+        let mut consumed = 0usize;
+        let mut count = 0usize;
+        for (i, &b) in slice.iter().enumerate() {
+            if b == b'\n' {
+                count += 1;
+                if count == max_lines {
+                    consumed = i + 1;
+                    break;
+                }
+            }
+        }
+        return (lines, start + consumed as u64);
+    }
+
+    (lines, start + consumed_bytes as u64)
+}
+
+// =============================================================================
+// Module install / upgrade / uninstall — vía Odoo JSON-RPC
+// =============================================================================
+
+pub fn handle_modules_action(
+    nkr_name: &str,
+    op: &str,
+    modules: &[String],
+    admin_login: &str,
+    admin_password: &str,
+) -> IpcResponse {
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    let odoo_method = match op {
+        "install" => "button_immediate_install",
+        "upgrade" => "button_immediate_upgrade",
+        "uninstall" => "button_immediate_uninstall",
+        _ => return IpcResponse::error(400, "invalid_op",
+            Some("expected install|upgrade|uninstall")),
+    };
+    if modules.is_empty() {
+        return IpcResponse::error(400, "missing_modules",
+            Some("provide at least one module name"));
+    }
+    if modules.len() > 64 {
+        return IpcResponse::error(400, "too_many_modules",
+            Some("max 64 per call"));
+    }
+    for m in modules {
+        // Odoo module names: ASCII alphanum + underscore, 1..64.
+        let ok = !m.is_empty() && m.len() <= 64
+            && m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if !ok {
+            return IpcResponse::error(400, "invalid_module_name",
+                Some(&format!("'{}': expected [A-Za-z0-9_]{{1,64}}", m)));
+        }
+    }
+    if admin_login.is_empty() || admin_login.len() > 128
+        || admin_login.bytes().any(|b| matches!(b, b'\n' | b'\r' | 0)) {
+        return IpcResponse::error(400, "invalid_admin_login", None);
+    }
+    if admin_password.len() < 4 || admin_password.len() > 512
+        || admin_password.bytes().any(|b| matches!(b, b'\n' | b'\r' | 0)) {
+        return IpcResponse::error(400, "invalid_admin_password", None);
+    }
+
+    let info = match get_instance_info(nkr_name) {
+        Ok(i) => i,
+        Err(_) => return IpcResponse::error(404, "instance_not_found", None),
+    };
+    if !info.nkr_status.running || !info.nkr_status.port_8069_up {
+        return IpcResponse::error(502, "odoo_not_ready",
+            Some("VM must be running and :8069 up"));
+    }
+
+    // 1) Autenticar — /web/session/authenticate devuelve uid + session cookie.
+    let auth_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "params": {
+            "db": info.db_name,
+            "login": admin_login,
+            "password": admin_password,
+        }
+    }).to_string();
+    let (auth_code, auth_cookie, auth_resp) = match http_post_json(
+        &info.guest_ip, 8069, "/web/session/authenticate",
+        &auth_body, None, 30,
+    ) {
+        Ok(t) => t,
+        Err(e) => return IpcResponse::error(502, "odoo_auth_failed",
+            Some(&e)),
+    };
+    if auth_code != 200 {
+        return IpcResponse::error(502, "odoo_auth_http_error",
+            Some(&format!("code={}", auth_code)));
+    }
+    let uid = match serde_json::from_str::<serde_json::Value>(&auth_resp)
+        .ok()
+        .and_then(|v| v.get("result").and_then(|r| r.get("uid").cloned()))
+        .and_then(|u| u.as_i64())
+    {
+        Some(u) if u > 0 => u,
+        _ => return IpcResponse::error(401, "odoo_auth_rejected",
+            Some("wrong admin_login/admin_password, or no DB")),
+    };
+    let cookie = match auth_cookie {
+        Some(c) => c,
+        None => return IpcResponse::error(502, "odoo_no_session_cookie", None),
+    };
+
+    // 2) Buscar los ir.module.module por nombre. execute_kw via /jsonrpc.
+    let search_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "service": "object",
+            "method": "execute_kw",
+            "args": [
+                info.db_name, uid, admin_password,
+                "ir.module.module", "search_read",
+                [[["name", "in", modules]]],
+                {"fields": ["id", "name", "state"]}
+            ]
+        }
+    }).to_string();
+    let (search_code, _, search_resp) = match http_post_json(
+        &info.guest_ip, 8069, "/jsonrpc", &search_body, Some(&cookie), 30,
+    ) {
+        Ok(t) => t,
+        Err(e) => return IpcResponse::error(502, "odoo_search_failed", Some(&e)),
+    };
+    if search_code != 200 {
+        return IpcResponse::error(502, "odoo_search_http_error",
+            Some(&format!("code={}", search_code)));
+    }
+    let search_val: serde_json::Value = match serde_json::from_str(&search_resp) {
+        Ok(v) => v,
+        Err(_) => return IpcResponse::error(502, "odoo_search_parse_error", None),
+    };
+    if let Some(err) = search_val.get("error") {
+        return IpcResponse::json(502, serde_json::json!({
+            "error": "odoo_search_rpc_error",
+            "detail": err,
+        }));
+    }
+    let found = search_val.get("result").and_then(|r| r.as_array())
+        .cloned().unwrap_or_default();
+
+    // Armar { name → (id, state) } y detectar módulos faltantes.
+    let mut module_map: std::collections::HashMap<String, (i64, String)> =
+        std::collections::HashMap::new();
+    for m in &found {
+        let id = m.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let state = m.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if id > 0 && !name.is_empty() {
+            module_map.insert(name, (id, state));
+        }
+    }
+    let missing: Vec<String> = modules.iter()
+        .filter(|m| !module_map.contains_key(*m))
+        .cloned().collect();
+    if !missing.is_empty() {
+        return IpcResponse::json(404, serde_json::json!({
+            "error": "modules_not_found",
+            "missing": missing,
+            "hint": "module must exist in the database (addons_path + update apps list)",
+        }));
+    }
+
+    // 3) Ejecutar la acción sobre los IDs. button_immediate_* takes `[ids]` y
+    // bloquea hasta completar (instala deps, carga XML, recomputa views).
+    let ids: Vec<i64> = modules.iter()
+        .filter_map(|m| module_map.get(m).map(|(id, _)| *id))
+        .collect();
+    let action_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "service": "object",
+            "method": "execute_kw",
+            "args": [
+                info.db_name, uid, admin_password,
+                "ir.module.module", odoo_method,
+                [ids],
+                {}
+            ]
+        }
+    }).to_string();
+    let start = std::time::Instant::now();
+    // Timeout generoso: instalación con many2many tables puede tomar 2-5 min.
+    let (action_code, _, action_resp) = match http_post_json(
+        &info.guest_ip, 8069, "/jsonrpc", &action_body, Some(&cookie), 600,
+    ) {
+        Ok(t) => t,
+        Err(e) => return IpcResponse::error(502, "odoo_action_failed", Some(&e)),
+    };
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    if action_code != 200 {
+        return IpcResponse::error(502, "odoo_action_http_error",
+            Some(&format!("code={}", action_code)));
+    }
+    let action_val: serde_json::Value = match serde_json::from_str(&action_resp) {
+        Ok(v) => v,
+        Err(_) => return IpcResponse::error(502, "odoo_action_parse_error", None),
+    };
+    if let Some(err) = action_val.get("error") {
+        return IpcResponse::json(500, serde_json::json!({
+            "error": format!("odoo_{}_failed", op),
+            "elapsed_ms": elapsed_ms,
+            "detail": err,
+            "modules": modules,
+        }));
+    }
+
+    IpcResponse::json(200, serde_json::json!({
+        "nkr_name": nkr_name,
+        "op": op,
+        "modules": modules,
+        "elapsed_ms": elapsed_ms,
+        "status": "ok",
+    }))
+}
+
+/// HTTP POST con JSON body y manejo mínimo de cookies. Retorna
+/// (status_code, primera Set-Cookie, body). `cookie_in` se envía como Cookie: header.
+fn http_post_json(
+    host: &str, port: u16, path: &str,
+    body: &str, cookie_in: Option<&str>, timeout_secs: u64,
+) -> Result<(u16, Option<String>, String), String> {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let addr: SocketAddr = format!("{}:{}", host, port).to_socket_addrs()
+        .map_err(|e| e.to_string())?
+        .next().ok_or_else(|| "no address resolved".to_string())?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| format!("connect: {}", e))?;
+    stream.set_read_timeout(Some(Duration::from_secs(timeout_secs))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(timeout_secs))).ok();
+
+    let cookie_hdr = match cookie_in {
+        Some(c) => format!("Cookie: {}\r\n", c),
+        None => String::new(),
+    };
+    let req = format!(
+        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: nkr-daemon/1.5\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n{}Connection: close\r\n\r\n{}",
+        path, host, port, body.len(), cookie_hdr, body
+    );
+    stream.write_all(req.as_bytes()).map_err(|e| format!("write: {}", e))?;
+
+    let mut resp = Vec::with_capacity(4096);
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                resp.extend_from_slice(&buf[..n]);
+                if resp.len() > 4 * 1024 * 1024 { break; } // cap 4 MiB
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&resp).to_string();
+    let code: u16 = text.split_whitespace().nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let header_end = text.find("\r\n\r\n").unwrap_or(text.len());
+    let headers_s = &text[..header_end];
+    // Primera Set-Cookie (Odoo sólo manda session_id — basta con eso).
+    let mut cookie_out: Option<String> = None;
+    for line in headers_s.lines() {
+        if let Some(rest) = line.strip_prefix("Set-Cookie: ")
+            .or_else(|| line.strip_prefix("set-cookie: "))
+        {
+            // Tomar la parte NAME=VALUE antes del primer ';'.
+            let pair = rest.split(';').next().unwrap_or("").trim().to_string();
+            if !pair.is_empty() {
+                cookie_out = Some(pair);
+                break;
+            }
+        }
+    }
+    let body_part = if header_end + 4 <= text.len() {
+        text[header_end + 4..].to_string()
+    } else {
+        String::new()
+    };
+    Ok((code, cookie_out, body_part))
+}
+
+/// Reads the last `max_lines` lines of the file without loading > `max_bytes` in RAM.
+/// Strategy: seek to end, read 64 KiB chunks backwards, count '\n' until we
+/// have max_lines+1 or reach max_bytes.
+fn read_tail_lines(path: &str, max_lines: usize, max_bytes: usize) -> Vec<String> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+    const CHUNK: usize = 64 * 1024;
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let file_size = match f.seek(SeekFrom::End(0)) {
+        Ok(n) => n as usize,
+        Err(_) => return Vec::new(),
+    };
+    let read_cap = file_size.min(max_bytes);
+    let start_off = file_size.saturating_sub(read_cap);
+    let mut buf = Vec::with_capacity(read_cap);
+    let mut pos = file_size;
+    while pos > start_off {
+        let chunk_start = pos.saturating_sub(CHUNK).max(start_off);
+        let chunk_size = pos - chunk_start;
+        if f.seek(SeekFrom::Start(chunk_start as u64)).is_err() {
+            break;
+        }
+        let mut tmp = vec![0u8; chunk_size];
+        if f.read_exact(&mut tmp).is_err() {
+            break;
+        }
+        tmp.extend_from_slice(&buf);
+        buf = tmp;
+        pos = chunk_start;
+        let newlines = buf.iter().filter(|&&b| b == b'\n').count();
+        if newlines > max_lines {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].iter().map(|s| s.to_string()).collect()
+}
+
+// =============================================================================
+// DNS provisioning — nginx vhost + Let's Encrypt cert por tenant
+// =============================================================================
+//
+// El panel remoto manda `POST /cells/<cell>/instances/<nkr_name>/dns { dns }` y
+// el daemon:
+//   1. Encuentra la IP del tenant (guest_ip) desde meta.json.
+//   2. Emite (o renueva) cert Let's Encrypt para el dns vía `certbot --webroot`.
+//   3. Escribe /etc/nginx/sites-available/<nkr_name> con el vhost generado.
+//   4. Symlink en sites-enabled/.
+//   5. `nginx -t` → `systemctl reload nginx`.
+//
+// Idempotente: volver a llamar con el mismo dns es un no-op efectivo.
+// Cambiar el dns (llamar con uno distinto) reemplaza el vhost y emite cert nuevo.
+
+const NGINX_SITES_AVAILABLE: &str = "/etc/nginx/sites-available";
+const NGINX_SITES_ENABLED: &str = "/etc/nginx/sites-enabled";
+const LETSENCRYPT_LIVE: &str = "/etc/letsencrypt/live";
+const ACME_WEBROOT: &str = "/var/www/html";
+const CERTBOT_EMAIL: &str = "antovargas556@gmail.com";
+
+pub fn handle_create_dns(nkr_name: &str, dns: &str, enable_ws: bool) -> IpcResponse {
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    if !is_safe_dns(dns) {
+        return IpcResponse::error(400, "invalid_dns", None);
+    }
+
+    let info = match get_instance_info(nkr_name) {
+        Ok(i) => i,
+        Err(_) => return IpcResponse::error(404, "instance_not_found", None),
+    };
+    let guest_ip = info.guest_ip.clone();
+
+    // 1. Emit cert. Usa webroot (no modifica nginx), sirve ACME por el vhost
+    //    default en :80 con `location /.well-known/acme-challenge/ { root ... }`.
+    //    --expand=false significa que cert por dns aparte; si ya existe, certbot
+    //    es idempotente.
+    let _ = std::fs::create_dir_all(ACME_WEBROOT);
+    let cert_out = Command::new("certbot")
+        .args([
+            "certonly", "--non-interactive", "--agree-tos",
+            "--email", CERTBOT_EMAIL,
+            "--no-eff-email",
+            "--webroot", "--webroot-path", ACME_WEBROOT,
+            "-d", dns,
+        ])
+        .output();
+    match cert_out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).to_string();
+            let out = String::from_utf8_lossy(&o.stdout).to_string();
+            eprintln!("[API-DNS] certbot falló para {}: {}\n{}", dns, err, out);
+            // Fallback: si el cert ya existe con otra firma, no bloqueemos;
+            // sólo fallar si el dir no está.
+            let cert_dir = format!("{}/{}", LETSENCRYPT_LIVE, dns);
+            if !std::path::Path::new(&cert_dir).exists() {
+                return IpcResponse::json(422, serde_json::json!({
+                    "error": "cert_issue_failed",
+                    "dns": dns,
+                    "log_tail": tail_str(&format!("{}{}", out, err), 40),
+                }));
+            }
+        }
+        Err(e) => {
+            return IpcResponse::error(500, "certbot_spawn_failed", Some(&e.to_string()));
+        }
+    }
+
+    // 2. Generar vhost.
+    let vhost_body = render_tenant_vhost(nkr_name, dns, &guest_ip, enable_ws);
+    let vhost_path = format!("{}/{}", NGINX_SITES_AVAILABLE, nkr_name);
+    if let Err(e) = std::fs::write(&vhost_path, &vhost_body) {
+        return IpcResponse::error(500, "vhost_write_failed", Some(&e.to_string()));
+    }
+
+    // 3. Symlink en sites-enabled (idempotente — si existe y apunta bien, skip).
+    let link_path = format!("{}/{}", NGINX_SITES_ENABLED, nkr_name);
+    if !std::path::Path::new(&link_path).exists() {
+        use std::os::unix::fs::symlink;
+        let _ = std::fs::remove_file(&link_path);
+        if let Err(e) = symlink(&vhost_path, &link_path) {
+            return IpcResponse::error(500, "vhost_enable_failed", Some(&e.to_string()));
+        }
+    }
+
+    // 4. nginx -t + reload. Si -t falla, rollback del symlink para no romper nginx.
+    let test = Command::new("nginx").arg("-t").output();
+    let test_ok = matches!(&test, Ok(o) if o.status.success());
+    if !test_ok {
+        let log = test.as_ref().map(|o| {
+            format!("{}\n{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr))
+        }).unwrap_or_else(|_| "nginx -t spawn failed".to_string());
+        let _ = std::fs::remove_file(&link_path);
+        return IpcResponse::json(422, serde_json::json!({
+            "error": "nginx_config_invalid",
+            "log_tail": tail_str(&log, 30),
+        }));
+    }
+    let reload = Command::new("systemctl").args(["reload", "nginx"]).status();
+    if !reload.map(|s| s.success()).unwrap_or(false) {
+        return IpcResponse::error(500, "nginx_reload_failed", None);
+    }
+
+    // 5. Best-effort: setear web.base.url=https://<dns> + freeze en la DB del
+    //    tenant. Si la DB no existe todavía (panel llamó /dns antes de /init-db),
+    //    no es error — el tenant arrancará con el placeholder `http://...`
+    //    y el panel debería re-llamar /dns post init-db.
+    //
+    //    SIN este step: Odoo carga /web/login con URLs http:// internas, el
+    //    browser bloquea por mixed-content cuando la página se sirve por HTTPS,
+    //    el JS de OWL no hidrata el form (queda con clase `d-none` heredada del
+    //    template), y el cliente ve un login en blanco.
+    let https_url = format!("https://{}", dns);
+    let base_url_status = match update_tenant_base_url(&info.cell, &info.db_name, &https_url) {
+        Ok(()) => {
+            eprintln!("[API-DNS] web.base.url={} sealed para tenant {}", https_url, nkr_name);
+            "updated"
+        }
+        Err(e) if e == "db_not_present" => {
+            eprintln!("[API-DNS] DB '{}' aún no existe; web.base.url se aplicará al re-llamar /dns tras init-db", info.db_name);
+            "skipped_db_missing"
+        }
+        Err(e) => {
+            eprintln!("[API-DNS] WARN: update_tenant_base_url falló: {}", e);
+            "failed_nonblocking"
+        }
+    };
+
+    IpcResponse::json(200, serde_json::json!({
+        "nkr_name": nkr_name,
+        "dns": dns,
+        "guest_ip": guest_ip,
+        "https_url": https_url,
+        "vhost_path": vhost_path,
+        "cert_path": format!("{}/{}/fullchain.pem", LETSENCRYPT_LIVE, dns),
+        "websocket_enabled": enable_ws,
+        "base_url_update": base_url_status,
+    }))
+}
+
+/// Setea `web.base.url=<https_url>` y `web.base.url.freeze=True` en la DB del
+/// tenant. Si la DB no existe, retorna Err("db_not_present") (caller decide).
+///
+/// El freeze evita que Odoo auto-overwrite el valor con el host del primer
+/// request HTTP entrante (ese es el comportamiento default de Odoo y la causa
+/// de que la URL quede `http://...` después de init-db inicial).
+fn update_tenant_base_url(cell_name: &str, db_name: &str, https_url: &str)
+    -> Result<(), String>
+{
+    use crate::cell::lookup_cell_id;
+    let cell_id = lookup_cell_id(cell_name)
+        .ok_or_else(|| "cell_not_found".to_string())?;
+    let pg_ip = format!("10.0.{}.2", cell_id);
+
+    // Sanity: db existe?
+    let chk = Command::new("psql")
+        .args(["-h", &pg_ip, "-U", "odoo", "-d", "postgres", "-tAc",
+               &format!("SELECT 1 FROM pg_database WHERE datname='{}';", db_name)])
+        .env("PGPASSWORD", "odoo")
+        .env("PGCONNECT_TIMEOUT", "5")
+        .output()
+        .map_err(|e| format!("psql spawn (probe): {}", e))?;
+    if !chk.status.success() {
+        return Err(format!("psql probe failed: {}",
+            String::from_utf8_lossy(&chk.stderr)));
+    }
+    let present = String::from_utf8_lossy(&chk.stdout).trim() == "1";
+    if !present {
+        return Err("db_not_present".into());
+    }
+
+    // UPSERT de las dos keys. https_url ya pasó is_safe_dns + es-construido por
+    // NKR (no input directo), así que no hay riesgo de SQL injection.
+    let sql = format!(
+        "INSERT INTO ir_config_parameter (key, value, create_date, write_date, create_uid, write_uid) \
+         VALUES ('web.base.url','{url}',NOW(),NOW(),1,1) \
+         ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, write_date=NOW(); \
+         INSERT INTO ir_config_parameter (key, value, create_date, write_date, create_uid, write_uid) \
+         VALUES ('web.base.url.freeze','True',NOW(),NOW(),1,1) \
+         ON CONFLICT (key) DO UPDATE SET value='True', write_date=NOW();",
+        url = https_url,
+    );
+
+    let out = Command::new("psql")
+        .args(["-h", &pg_ip, "-U", "odoo", "-d", db_name, "-v", "ON_ERROR_STOP=1", "-c", &sql])
+        .env("PGPASSWORD", "odoo")
+        .env("PGCONNECT_TIMEOUT", "5")
+        .output()
+        .map_err(|e| format!("psql spawn (upsert): {}", e))?;
+    if !out.status.success() {
+        return Err(format!("psql upsert: {}",
+            String::from_utf8_lossy(&out.stderr).chars().take(500).collect::<String>()));
+    }
+    Ok(())
+}
+
+pub fn handle_delete_dns(nkr_name: &str, delete_cert: bool) -> IpcResponse {
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+
+    let vhost_path = format!("{}/{}", NGINX_SITES_AVAILABLE, nkr_name);
+    let link_path = format!("{}/{}", NGINX_SITES_ENABLED, nkr_name);
+
+    // Leer el dns del vhost antes de borrarlo (para certbot delete).
+    let dns_maybe = std::fs::read_to_string(&vhost_path)
+        .ok()
+        .and_then(|content| {
+            content.lines()
+                .find(|l| l.trim_start().starts_with("server_name "))
+                .and_then(|l| l.split_whitespace().nth(1).map(|s| s.trim_end_matches(';').to_string()))
+        });
+
+    let _ = std::fs::remove_file(&link_path);
+    let _ = std::fs::remove_file(&vhost_path);
+
+    let _ = Command::new("systemctl").args(["reload", "nginx"]).status();
+
+    if delete_cert {
+        if let Some(dns) = &dns_maybe {
+            // Re-validate the dns read from the vhost before passing it to
+            // certbot. Although the initial validation already blocks malformed
+            // dns inputs, the vhost file lives on disk and could be modified
+            // outside this path; treat it as untrusted input.
+            if is_safe_dns(dns) {
+                let _ = Command::new("certbot")
+                    .args(["delete", "--non-interactive", "--cert-name", dns])
+                    .output();
+            } else {
+                eprintln!("[API-DNS] skipping certbot delete: invalid dns '{}'", dns);
+            }
+        }
+    }
+
+    IpcResponse::json(200, serde_json::json!({
+        "deleted": true,
+        "nkr_name": nkr_name,
+        "dns": dns_maybe,
+        "cert_deleted": delete_cert,
+    }))
+}
+
+fn tail_str(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+// =============================================================================
+// InitDb — llama a Odoo /web/database/create en el guest
+// =============================================================================
+
+pub fn handle_init_db(
+    nkr_name: &str,
+    db_name_override: Option<&str>,
+    admin_login: &str,
+    admin_password: &str,
+    demo: bool,
+    lang: Option<&str>,
+    country_code: Option<&str>,
+    phone: Option<&str>,
+) -> IpcResponse {
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    if admin_login.is_empty() || admin_login.len() > 128
+        || admin_login.bytes().any(|b| matches!(b, b'\n' | b'\r' | 0)) {
+        return IpcResponse::error(400, "invalid_admin_login", None);
+    }
+    if admin_password.len() < 4 || admin_password.len() > 512
+        || admin_password.bytes().any(|b| matches!(b, b'\n' | b'\r' | 0)) {
+        return IpcResponse::error(400, "invalid_admin_password", None);
+    }
+
+    let info = match get_instance_info(nkr_name) {
+        Ok(i) => i,
+        Err(_) => return IpcResponse::error(404, "instance_not_found", None),
+    };
+    if !info.nkr_status.running {
+        return IpcResponse::error(409, "instance_not_running",
+            Some("call POST /actions {\"action\":\"start\"} first"));
+    }
+    if !info.nkr_status.port_8069_up {
+        // 503 + Retry-After semántico: el panel sabe que es transitorio y
+        // puede reintentar sin marcar la creación como failed.
+        return IpcResponse::json(503, serde_json::json!({
+            "error": "odoo_not_ready_yet",
+            "message": "VM running pero Odoo :8069 aún no responde. Reintentá en 5s.",
+            "retry_after_s": 5,
+        }));
+    }
+
+    let db_name = db_name_override.map(|s| s.to_string())
+        .unwrap_or_else(|| info.db_name.clone());
+    if !is_safe_identifier(&db_name) {
+        return IpcResponse::error(400, "invalid_db_name", None);
+    }
+
+    // Idempotencia 1: DB ya existe → 200.
+    if info.nkr_status.db_present {
+        return IpcResponse::json(200, serde_json::json!({
+            "nkr_name": nkr_name,
+            "db_name": db_name,
+            "status": "already_present",
+            "message": "DB ya existe — no-op idempotente",
+        }));
+    }
+
+    // Idempotencia 2: hay un job en curso → 202 con el estado actual.
+    let status_path = format!("{}/.nkr-init-db.json", info.instance_dir);
+    if let Ok(existing) = std::fs::read_to_string(&status_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&existing) {
+            if v.get("status").and_then(|s| s.as_str()) == Some("running") {
+                return IpcResponse::json(202, serde_json::json!({
+                    "nkr_name": nkr_name,
+                    "db_name": db_name,
+                    "status": "running",
+                    "message": "init-db ya en curso; poll GET /instances/{name} → nkr_status.init_db",
+                    "job": v,
+                }));
+            }
+        }
+    }
+
+    let master_pwd = read_admin_passwd_from_conf(&info.config_path)
+        .unwrap_or_else(|| "admin".to_string());
+
+    let form = build_form(&[
+        ("master_pwd", &master_pwd),
+        ("name", &db_name),
+        ("login", admin_login),
+        ("password", admin_password),
+        ("phone", phone.unwrap_or("")),
+        ("lang", lang.unwrap_or("en_US")),
+        ("country_code", country_code.unwrap_or("")),
+        ("demo", if demo { "true" } else { "false" }),
+    ]);
+
+    // Persist status "running" ANTES de spawn para que un poll inmediato del
+    // panel vea el job en curso (evita race "202 recibido pero init_db=null").
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let _ = std::fs::write(&status_path, serde_json::json!({
+        "status": "running",
+        "db_name": db_name,
+        "admin_login": admin_login,
+        "started_at": started_at,
+    }).to_string());
+
+    // Spawn background worker. El daemon retorna 202 al toque, el panel hace
+    // poll de GET /instances/{name} y espera a db_present=true o init_db.status=failed.
+    let nkr_name_owned = nkr_name.to_string();
+    let db_name_owned = db_name.clone();
+    let admin_login_owned = admin_login.to_string();
+    let guest_ip = info.guest_ip.clone();
+    let status_path_owned = status_path.clone();
+    eprintln!("[API] init-db({}) arrancando job background (db={})",
+        nkr_name_owned, db_name_owned);
+
+    std::thread::spawn(move || {
+        let call_start = std::time::Instant::now();
+        let result = http_post_form(
+            &guest_ip, 8069, "/web/database/create", &form, 600,
+        );
+        let elapsed_ms = call_start.elapsed().as_millis() as u64;
+        let finished_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+
+        let status_val = match result {
+            Ok((code, _body_snippet)) if (200..400).contains(&code) => {
+                eprintln!("[API] init-db({}) OK en {}ms (code={})",
+                    nkr_name_owned, elapsed_ms, code);
+                serde_json::json!({
+                    "status": "success",
+                    "db_name": db_name_owned,
+                    "admin_login": admin_login_owned,
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "elapsed_ms": elapsed_ms,
+                    "odoo_response_code": code,
+                })
+            }
+            Ok((code, body_snippet)) => {
+                let lowered = body_snippet.to_lowercase();
+                if lowered.contains("already exists") || lowered.contains("database already") {
+                    eprintln!("[API] init-db({}) ya existía (idempotente)", nkr_name_owned);
+                    serde_json::json!({
+                        "status": "success",
+                        "db_name": db_name_owned,
+                        "note": "db_already_exists",
+                        "started_at": started_at,
+                        "finished_at": finished_at,
+                        "elapsed_ms": elapsed_ms,
+                    })
+                } else {
+                    eprintln!("[API] init-db({}) FAIL odoo_rejected code={} ({}ms)",
+                        nkr_name_owned, code, elapsed_ms);
+                    serde_json::json!({
+                        "status": "failed",
+                        "error": "odoo_rejected",
+                        "odoo_response_code": code,
+                        "body_snippet": body_snippet.chars().take(500).collect::<String>(),
+                        "started_at": started_at,
+                        "finished_at": finished_at,
+                        "elapsed_ms": elapsed_ms,
+                    })
+                }
+            }
+            Err(e) => {
+                eprintln!("[API] init-db({}) FAIL odoo_unreachable: {} ({}ms)",
+                    nkr_name_owned, e, elapsed_ms);
+                serde_json::json!({
+                    "status": "failed",
+                    "error": "odoo_unreachable",
+                    "message": e,
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "elapsed_ms": elapsed_ms,
+                })
+            }
+        };
+        let _ = std::fs::write(&status_path_owned, status_val.to_string());
+    });
+
+    // 202 inmediato. El panel espera db_present=true via GET /instances/{name}.
+    IpcResponse::json(202, serde_json::json!({
+        "nkr_name": nkr_name,
+        "db_name": db_name,
+        "admin_login": admin_login,
+        "status": "accepted",
+        "message": "init-db corriendo en background (30-90s típico). Poll GET /instances/{name} y espera nkr_status.db_present=true. Errores aparecen en nkr_status.init_db.",
+    }))
+}
+
+fn read_admin_passwd_from_conf(conf_path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(conf_path).ok()?;
+    for line in content.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("admin_passwd") {
+            let rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '=').trim();
+            if !rest.is_empty() && rest != "admin" {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// URL-encode form body.
+fn build_form(pairs: &[(&str, &str)]) -> String {
+    fn pct(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(b as char);
+                }
+                _ => out.push_str(&format!("%{:02X}", b)),
+            }
+        }
+        out
+    }
+    let mut s = String::new();
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        if i > 0 { s.push('&'); }
+        s.push_str(&pct(k));
+        s.push('=');
+        s.push_str(&pct(v));
+    }
+    s
+}
+
+/// Mini-HTTP-client bloqueante. Usa TcpStream plano (guest es HTTP, no HTTPS).
+/// Sigue redirects 303 (típica respuesta de Odoo tras create OK).
+/// Retorna (status_code, primera parte del body como String).
+fn http_post_form(host: &str, port: u16, path: &str, body: &str, timeout_secs: u64)
+    -> Result<(u16, String), String>
+{
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let addr: SocketAddr = format!("{}:{}", host, port).to_socket_addrs()
+        .map_err(|e| e.to_string())?
+        .next().ok_or_else(|| "no address resolved".to_string())?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| format!("connect: {}", e))?;
+    stream.set_read_timeout(Some(Duration::from_secs(timeout_secs))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(timeout_secs))).ok();
+
+    let req = format!(
+        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: nkr-daemon/1.5\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path, host, port, body.len(), body
+    );
+    stream.write_all(req.as_bytes()).map_err(|e| format!("write: {}", e))?;
+
+    let mut resp = Vec::with_capacity(4096);
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                resp.extend_from_slice(&buf[..n]);
+                if resp.len() > 256 * 1024 { break; } // cap a 256 KiB
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&resp).to_string();
+    // Parse status line: "HTTP/1.1 303 See Other\r\n..."
+    let code: u16 = text.split_whitespace().nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // Body: everything after \r\n\r\n.
+    let body_part = text.find("\r\n\r\n").map(|p| text[p+4..].to_string())
+        .unwrap_or_default();
+    Ok((code, body_part))
+}
+
+fn render_tenant_vhost(nkr_name: &str, dns: &str, guest_ip: &str, enable_ws: bool) -> String {
+    let http_upstream = format!("up_{}", nkr_name.replace('-', "_"));
+    let ws_upstream = format!("{}_ws", http_upstream);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+"# Auto-generated by NKR for tenant '{nkr_name}'. DO NOT EDIT MANUALLY.
+# Regenerate via POST /api/v1/cells/<cell>/instances/{nkr_name}/dns.
+
+upstream {http_upstream} {{ server {guest_ip}:8069; keepalive 16; }}
+"));
+    if enable_ws {
+        out.push_str(&format!(
+"upstream {ws_upstream} {{ server {guest_ip}:8072; keepalive 16; }}
+"));
+    }
+    out.push_str(&format!(
+"
+server {{
+    listen 80;
+    listen [::]:80;
+    server_name {dns};
+    location /.well-known/acme-challenge/ {{ root /var/www/html; }}
+    location / {{ return 301 https://$host$request_uri; }}
+}}
+
+server {{
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name {dns};
+
+    ssl_certificate     /etc/letsencrypt/live/{dns}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{dns}/privkey.pem;
+    include /etc/nginx/snippets/nkr-ssl.conf;
+    # Hardening universal: bloquea .php/.env/.git/.zip + paths CMS (444 close).
+    include /etc/nginx/snippets/nkr-hardening.conf;
+
+    client_max_body_size 200M;
+    proxy_read_timeout 720s;
+    proxy_send_timeout 720s;
+    proxy_buffering off;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # Rate limit anti brute-force sobre login + database manager.
+    # Burst 5 nodelay: 5 reqs simultáneos pasan; 6to en adelante 429.
+    # Funciona porque CF NO está proxied (DNS-only) y $binary_remote_addr
+    # es la IP real del atacante, no del edge CF.
+    location ~ ^/web/(login|database/selector|database/manager) {{
+        limit_req zone=nkr_login_limit burst=5 nodelay;
+        limit_req_status 429;
+        proxy_pass http://{http_upstream};
+    }}
+
+"));
+    if enable_ws {
+        out.push_str(&format!(
+"    # WebSocket / long-polling → :8072 (gevent worker)
+    location /websocket {{
+        proxy_pass http://{ws_upstream};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+    }}
+    location /longpolling {{
+        proxy_pass http://{ws_upstream};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+    }}
+
+"));
+    }
+    out.push_str(&format!(
+"    # /web/static/* — assets de módulos (img, fonts, css de módulos).
+    # Cache server-side 24h. proxy_buffering on local: el server padre
+    # tiene buffering off (necesario para SSE/long-polling), pero cache
+    # REQUIERE buffering on porque nginx necesita capturar la respuesta
+    # entera antes de escribirla al disco.
+    location /web/static/ {{
+        proxy_pass http://{http_upstream};
+        proxy_buffering on;
+        proxy_cache nkr_static;
+        proxy_cache_key \"$host$request_uri\";
+        proxy_cache_valid 200 24h;
+        proxy_cache_use_stale error timeout updating;
+        proxy_cache_lock on;
+        add_header X-Cache-Status $upstream_cache_status always;
+        expires 24h;
+    }}
+
+    # /web/assets/<hash>/* — bundles compilados (frontend.min.css, web.assets.js).
+    # El <hash> en URL invalida automáticamente cuando el contenido cambia, así
+    # que cache long-term (30 días) es seguro. Cache-Control: immutable evita
+    # que el browser re-valide. Crítico para densidad: el bundle del login pesa
+    # ~850 KB y se sirve en cada cold-load.
+    location ~ ^/web/assets/[a-f0-9]+/ {{
+        proxy_pass http://{http_upstream};
+        proxy_buffering on;
+        proxy_cache nkr_static;
+        proxy_cache_key \"$host$request_uri\";
+        proxy_cache_valid 200 30d;
+        proxy_cache_use_stale error timeout updating;
+        proxy_cache_lock on;
+        add_header X-Cache-Status $upstream_cache_status always;
+        add_header Cache-Control \"public, immutable, max-age=2592000\" always;
+    }}
+
+    location / {{
+        proxy_pass http://{http_upstream};
+    }}
+}}
+"));
+    out
+}
+
+// =============================================================================
+// PATCH /instances/{name}/config — upsert workers/memory/SMTP
+// =============================================================================
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PatchConfigReq {
+    /// Único input de sizing. Si se pasa, NKR re-deriva chrs, ram_mb (compose)
+    /// y limit_memory_soft/hard (odoo.conf) vía `derive_resources()` y los
+    /// reescribe atómicamente. Rango 1..=16.
+    #[serde(default)]
+    pub workers: Option<u32>,
+
+    // ─── SMTP saliente del tenant ───────────────────────────────────────────
+    // El panel manda estos campos cuando quiere configurar el servidor de mail
+    // saliente. NKR upsertea un registro `ir.mail_server` (name='NKR-managed')
+    // en la DB del tenant — esto es lo que Odoo usa en runtime y muestra en
+    // "Settings → Technical → Email → Outgoing Mail Servers". También escribe
+    // los `smtp_*` en odoo.conf como fallback (Odoo cae a ellos si no hay
+    // ningún ir.mail_server activo, raro pero defensivo).
+    #[serde(default)]
+    pub smtp_server: Option<String>,
+    #[serde(default)]
+    pub smtp_port: Option<u16>,
+    #[serde(default)]
+    pub smtp_user: Option<String>,
+    #[serde(default)]
+    pub smtp_password: Option<String>,
+    /// "none" | "ssl" | "starttls". Mapea directo al field `smtp_encryption`
+    /// del modelo Odoo. Si se omite y `smtp_ssl=true` legacy → "ssl";
+    /// si `smtp_ssl=false` y port=587 → "starttls"; otherwise "none".
+    #[serde(default)]
+    pub smtp_encryption: Option<String>,
+    /// Legacy: bool simple. Reemplazado por `smtp_encryption`. Si ambos vienen,
+    /// `smtp_encryption` gana. Mantenido para compat backwards.
+    #[serde(default)]
+    pub smtp_ssl: Option<bool>,
+    /// "From:" header default (cuando un mail no tiene from explícito). Suele
+    /// ser igual a `smtp_user`.
+    #[serde(default)]
+    pub email_from: Option<String>,
+    /// Si true, NKR reinicia la VM tras escribir el conf. Workers lo NECESITA;
+    /// SMTP toma efecto al instante via ir.mail_server, restart innecesario.
+    #[serde(default)]
+    pub restart: Option<bool>,
+}
+
+/// Rechaza cualquier char que rompa el INI parser de Odoo o permita inyección
+/// de líneas (newlines). Permite espacios y casi cualquier ASCII imprimible
+/// pero no CR/LF/NUL.
+fn is_safe_conf_value(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 512
+        && !s.bytes().any(|b| matches!(b, 0 | b'\n' | b'\r'))
+}
+
+/// Host/server: más estricto (solo [A-Za-z0-9._-:]) — evita inyección en el
+/// arranque de Odoo si alguien usa smtp_server en shell concat más adelante.
+fn is_safe_smtp_host(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':'))
+}
+
+pub fn handle_patch_config(nkr_name: &str, body_json: &str) -> IpcResponse {
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    if body_json.len() > 16 * 1024 {
+        return IpcResponse::error(413, "body_too_large", None);
+    }
+    let req: PatchConfigReq = match serde_json::from_str(body_json) {
+        Ok(r) => r,
+        Err(_) => return IpcResponse::error(400, "invalid_json", None),
+    };
+
+    // workers es la única input de sizing; el resto se deriva.
+    if let Some(w) = req.workers {
+        if !(1..=16).contains(&w) {
+            return IpcResponse::error(400, "invalid_workers",
+                Some("workers must be 1..=16"));
+        }
+    }
+    if let Some(ref host) = req.smtp_server {
+        if !is_safe_smtp_host(host) {
+            return IpcResponse::error(400, "invalid_smtp_server", None);
+        }
+    }
+    if let Some(p) = req.smtp_port {
+        if p == 0 {
+            return IpcResponse::error(400, "invalid_smtp_port", None);
+        }
+    }
+    if let Some(ref u) = req.smtp_user {
+        if !is_safe_conf_value(u) || u.len() > 256 {
+            return IpcResponse::error(400, "invalid_smtp_user", None);
+        }
+    }
+    if let Some(ref p) = req.smtp_password {
+        if !is_safe_conf_value(p) {
+            return IpcResponse::error(400, "invalid_smtp_password", None);
+        }
+    }
+    if let Some(ref e) = req.email_from {
+        if !is_safe_conf_value(e) || e.len() > 256 {
+            return IpcResponse::error(400, "invalid_email_from", None);
+        }
+    }
+    if let Some(ref enc) = req.smtp_encryption {
+        if !matches!(enc.as_str(), "none" | "ssl" | "starttls") {
+            return IpcResponse::error(400, "invalid_smtp_encryption",
+                Some("expected: none | ssl | starttls"));
+        }
+    }
+
+    let info = match get_instance_info(nkr_name) {
+        Ok(i) => i,
+        Err(_) => return IpcResponse::error(404, "instance_not_found", None),
+    };
+
+    // Construir set de upserts. Solo entran los campos que el panel mandó.
+    let mut upserts: Vec<(String, String)> = Vec::new();
+    let mut applied: Vec<&str> = Vec::new();
+    let mut restart_required = false;
+
+    // workers → recomputa workers + limit_memory_soft + limit_memory_hard (odoo.conf)
+    //         + ram + chrs (compose). Single input, multi-output coherente.
+    let workers_resources: Option<DerivedResources> = req.workers.map(derive_resources);
+    if let Some(ref r) = workers_resources {
+        upserts.push(("workers".into(), r.workers.to_string()));
+        upserts.push(("limit_memory_soft".into(), r.limit_memory_soft.to_string()));
+        upserts.push(("limit_memory_hard".into(), r.limit_memory_hard.to_string()));
+        applied.push("workers");
+        applied.push("limit_memory_soft");
+        applied.push("limit_memory_hard");
+        applied.push("ram_mb");
+        applied.push("chrs");
+        restart_required = true;
+    }
+
+    // SMTP: detectar si el panel mandó alguno de los campos. Si sí, hacemos
+    // dos cosas:
+    //   (a) Escribir keys en odoo.conf (fallback que Odoo usa SOLO si no hay
+    //       ningún ir.mail_server activo — caso edge en boots fríos).
+    //   (b) UPSERT en ir.mail_server (lo que la UI de Odoo muestra y lo que
+    //       Odoo realmente usa en runtime).
+    let any_smtp = req.smtp_server.is_some() || req.smtp_port.is_some()
+        || req.smtp_user.is_some() || req.smtp_password.is_some()
+        || req.smtp_encryption.is_some() || req.smtp_ssl.is_some()
+        || req.email_from.is_some();
+
+    if let Some(ref s) = req.smtp_server {
+        upserts.push(("smtp_server".into(), s.clone()));
+        applied.push("smtp_server");
+    }
+    if let Some(p) = req.smtp_port {
+        upserts.push(("smtp_port".into(), p.to_string()));
+        applied.push("smtp_port");
+    }
+    if let Some(ref u) = req.smtp_user {
+        upserts.push(("smtp_user".into(), u.clone()));
+        applied.push("smtp_user");
+    }
+    if let Some(ref p) = req.smtp_password {
+        upserts.push(("smtp_password".into(), p.clone()));
+        applied.push("smtp_password");
+    }
+    if let Some(ssl) = req.smtp_ssl {
+        upserts.push(("smtp_ssl".into(), if ssl { "True".into() } else { "False".into() }));
+        applied.push("smtp_ssl");
+    }
+    if let Some(ref e) = req.email_from {
+        upserts.push(("email_from".into(), e.clone()));
+        applied.push("email_from");
+    }
+
+    if upserts.is_empty() && workers_resources.is_none() {
+        return IpcResponse::error(400, "no_fields",
+            Some("at least one field must be provided (workers / smtp_*)"));
+    }
+
+    if !upserts.is_empty() {
+        if let Err(e) = patch_odoo_conf(&info.config_path, &upserts) {
+            eprintln!("[API] patch_config({}) failed: {}", nkr_name, e);
+            return IpcResponse::error(500, "patch_failed", Some(&e.to_string()));
+        }
+    }
+    if let Some(ref r) = workers_resources {
+        // When workers changes we re-derive ALL the compose-level resources
+        // that depend on it: ram, chrs, and balloon_mb. Keeping balloon in
+        // sync with ram is critical — leaving the old balloon when ram grows
+        // wastes density; leaving it when ram shrinks can starve Odoo.
+        if let Err(e) = crate::cell::patch_compose_block_resources(
+            nkr_name, Some(r.ram_mb), Some(r.chrs), Some(r.balloon_mb))
+        {
+            eprintln!("[API] patch_config({}) compose failed: {}", nkr_name, e);
+            return IpcResponse::error(500, "patch_compose_failed", Some(&e.to_string()));
+        }
+        restart_required = true;
+    }
+
+    // SMTP runtime: UPSERT en ir.mail_server. Esto es lo que la UI de Odoo
+    // muestra y lo que el motor de mail.thread realmente usa al hacer SEND.
+    let mut mail_server_status: &'static str = "not_requested";
+    if any_smtp {
+        // Resolver smtp_encryption efectivo:
+        //   - Si vino explícito en req.smtp_encryption → lo usamos.
+        //   - Si no, derivamos de smtp_ssl + smtp_port (heurística).
+        //   - Si nada, "none".
+        let encryption = match req.smtp_encryption.as_deref() {
+            Some(v) => v.to_string(),
+            None => match (req.smtp_ssl, req.smtp_port) {
+                (Some(true), _) => "ssl".to_string(),
+                (Some(false), Some(587)) => "starttls".to_string(),
+                _ => "none".to_string(),
+            },
+        };
+        match upsert_tenant_mail_server(
+            &info.cell, &info.db_name,
+            req.smtp_server.as_deref().unwrap_or(""),
+            req.smtp_port.unwrap_or(0),
+            req.smtp_user.as_deref().unwrap_or(""),
+            req.smtp_password.as_deref().unwrap_or(""),
+            &encryption,
+            req.email_from.as_deref().unwrap_or(""),
+        ) {
+            Ok(()) => {
+                applied.push("ir.mail_server");
+                mail_server_status = "updated";
+                eprintln!("[API] patch_config({}) ir.mail_server upsertado (encryption={})",
+                    nkr_name, encryption);
+            }
+            Err(e) if e == "db_not_present" => {
+                mail_server_status = "skipped_db_missing";
+                eprintln!("[API] patch_config({}) ir.mail_server omitido: DB aún no existe", nkr_name);
+            }
+            Err(e) => {
+                mail_server_status = "failed_nonblocking";
+                eprintln!("[API] patch_config({}) ir.mail_server FAIL: {}", nkr_name, e);
+            }
+        }
+        // SMTP via ir.mail_server NO requiere restart — Odoo lo lee fresh
+        // cada vez que `mail.mail.send()` corre. Sólo si quedó SOLO en
+        // odoo.conf (fallback) habría que restart.
+    }
+
+    // Restart opcional. Si el panel lo pide (default para workers/memory: sí
+    // a menos que explícitamente mande restart=false).
+    let want_restart = req.restart.unwrap_or(restart_required);
+    let mut restarted = false;
+    if want_restart {
+        match handle_action(nkr_name, "restart") {
+            r if r.status == 202 || r.status == 200 => { restarted = true; }
+            r => {
+                eprintln!("[API] patch_config({}): restart falló code={}", nkr_name, r.status);
+            }
+        }
+    }
+
+    IpcResponse::json(200, serde_json::json!({
+        "nkr_name": nkr_name,
+        "applied": applied,
+        "restart_required": restart_required,
+        "restarted": restarted,
+        "mail_server_update": mail_server_status,
+    }))
+}
+
+/// UPSERT del registro `ir.mail_server` con name='NKR-managed' en la DB del
+/// tenant. Es lo que la UI de Odoo ("Settings → Technical → Email → Outgoing
+/// Mail Servers") muestra y lo que el motor de mail usa al enviar.
+///
+/// Si la DB no existe → Err("db_not_present"). Resto de errores propagan stderr
+/// truncado.
+fn upsert_tenant_mail_server(
+    cell_name: &str,
+    db_name: &str,
+    smtp_host: &str,
+    smtp_port: u16,
+    smtp_user: &str,
+    smtp_pass: &str,
+    smtp_encryption: &str, // "none" | "ssl" | "starttls"
+    from_filter: &str,
+) -> Result<(), String> {
+    use crate::cell::lookup_cell_id;
+    let cell_id = lookup_cell_id(cell_name)
+        .ok_or_else(|| "cell_not_found".to_string())?;
+    let pg_ip = format!("10.0.{}.2", cell_id);
+
+    // Probe DB.
+    let chk = Command::new("psql")
+        .args(["-h", &pg_ip, "-U", "odoo", "-d", "postgres", "-tAc",
+               &format!("SELECT 1 FROM pg_database WHERE datname='{}';", db_name)])
+        .env("PGPASSWORD", "odoo").env("PGCONNECT_TIMEOUT", "5")
+        .output().map_err(|e| format!("psql probe spawn: {}", e))?;
+    if !chk.status.success() {
+        return Err(format!("psql probe: {}", String::from_utf8_lossy(&chk.stderr)));
+    }
+    if String::from_utf8_lossy(&chk.stdout).trim() != "1" {
+        return Err("db_not_present".into());
+    }
+
+    // Escape simple: las comillas simples se duplican (ANSI SQL). El charset
+    // ya pasó is_safe_conf_value (no \n / \r / NUL).
+    let esc = |s: &str| s.replace('\'', "''");
+    let host_e = esc(smtp_host);
+    let user_e = esc(smtp_user);
+    let pass_e = esc(smtp_pass);
+    let enc_e = esc(smtp_encryption);
+    let from_e = esc(from_filter);
+
+    // UPSERT por name único 'NKR-managed'. Si Odoo no tiene la columna
+    // smtp_authentication (versión antigua), el INSERT cae con error claro
+    // (la sentencia es atómica via ON_ERROR_STOP=1).
+    //
+    // Uso DELETE+INSERT en lugar de ON CONFLICT porque `name` no tiene unique
+    // index en ir.mail_server. Sí hay potencial race con varios PATCH paralelos
+    // pero el endpoint corre con `restart` que ya serializa naturalmente.
+    let sql = format!(
+        "DELETE FROM ir_mail_server WHERE name='NKR-managed';
+         INSERT INTO ir_mail_server
+            (name, sequence, smtp_host, smtp_port, smtp_authentication,
+             smtp_user, smtp_pass, smtp_encryption, from_filter, active,
+             create_uid, write_uid, create_date, write_date)
+         VALUES
+            ('NKR-managed', 10, '{host}', {port}, 'login',
+             NULLIF('{user}',''), NULLIF('{pass}',''), '{enc}',
+             NULLIF('{from}',''), TRUE,
+             1, 1, NOW(), NOW());",
+        host = host_e, port = smtp_port,
+        user = user_e, pass = pass_e, enc = enc_e, from = from_e,
+    );
+
+    let out = Command::new("psql")
+        .args(["-h", &pg_ip, "-U", "odoo", "-d", db_name, "-v", "ON_ERROR_STOP=1", "-c", &sql])
+        .env("PGPASSWORD", "odoo").env("PGCONNECT_TIMEOUT", "5")
+        .output().map_err(|e| format!("psql upsert spawn: {}", e))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).chars().take(500).collect::<String>());
+    }
+    Ok(())
+}
+
+// =============================================================================
+// POST /instances/{name}/psql — sandboxed psql vs tenant DB
+// =============================================================================
+
+/// Rechaza queries peligrosas para el scope del endpoint. No es un parser SQL;
+/// sólo un filtro grueso para bloquear los casos obvios de escape/cross-tenant.
+fn reject_psql_query(q: &str) -> Option<&'static str> {
+    // Límite duro al body.
+    if q.is_empty() { return Some("empty_query"); }
+    if q.len() > 16 * 1024 { return Some("query_too_large"); }
+    // Nul bytes → shell/exec injection.
+    if q.bytes().any(|b| b == 0) { return Some("null_byte"); }
+    let lower = q.to_ascii_lowercase();
+    // \c / \connect meta-commands de psql → cambian de DB.
+    if lower.contains("\\c ") || lower.contains("\\connect") {
+        return Some("meta_connect_forbidden");
+    }
+    // \! ejecuta shell dentro de psql.
+    if lower.contains("\\!") {
+        return Some("shell_escape_forbidden");
+    }
+    // COPY ... TO/FROM PROGRAM — ejecución arbitraria.
+    if lower.contains("copy") && lower.contains("program") {
+        return Some("copy_program_forbidden");
+    }
+    // DROP/CREATE DATABASE — el panel tiene /init-db para create; nunca
+    // debería crear/borrar DBs via este endpoint.
+    if lower.contains("drop database") || lower.contains("create database") {
+        return Some("database_ddl_forbidden");
+    }
+    None
+}
+
+fn audit_psql(nkr_name: &str, db_name: &str, query: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    let truncated: String = query.chars().take(1024).collect();
+    let line = format!("{t}\t{nkr_name}\t{db_name}\t{}\n",
+        truncated.replace('\n', " ").replace('\t', " "));
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .mode(0o640)
+        .open("/var/log/nkr-psql-audit.log")
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+pub fn handle_psql(nkr_name: &str, query: &str, max_rows: usize) -> IpcResponse {
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    if let Some(reason) = reject_psql_query(query) {
+        return IpcResponse::error(400, reason, None);
+    }
+    // Cap de filas: default 1000, max 10000.
+    let max_rows = max_rows.clamp(1, 10_000);
+
+    let info = match get_instance_info(nkr_name) {
+        Ok(i) => i,
+        Err(_) => return IpcResponse::error(404, "instance_not_found", None),
+    };
+
+    let cell_id = match lookup_cell_id(&info.cell) {
+        Some(c) => c,
+        None => return IpcResponse::error(404, "cell_not_found", None),
+    };
+    let pg_ip = format!("10.0.{}.2", cell_id);
+
+    audit_psql(nkr_name, &info.db_name, query);
+
+    // Ejecutar psql con:
+    //   -h <pg_ip> -U odoo -d db-<tenant>
+    //   --csv   → CSV parseable
+    //   -P pager=off
+    //   ON_ERROR_STOP=1
+    //   statement_timeout=30s vía -v y SET
+    //
+    // La query se pasa por stdin para evitar límites de argv y inyección
+    // en la línea de comandos.
+    let mut cmd = Command::new("psql");
+    cmd.arg("-h").arg(&pg_ip)
+       .arg("-U").arg("odoo")
+       .arg("-d").arg(&info.db_name)
+       .arg("--csv")
+       .arg("-P").arg("pager=off")
+       .arg("-v").arg("ON_ERROR_STOP=1")
+       .arg("-X"); // no leer ~/.psqlrc
+    cmd.env("PGPASSWORD", "odoo"); // credencial interna del cluster
+    cmd.env("PGCONNECT_TIMEOUT", "5");
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return IpcResponse::error(500, "psql_spawn_failed",
+            Some(&e.to_string())),
+    };
+
+    // Prepender timeouts y setear search_path a public para evitar sorpresas.
+    let full_query = format!(
+        "SET statement_timeout = '30s';\nSET idle_in_transaction_session_timeout = '30s';\n{}\n",
+        query
+    );
+    use std::io::Write;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(full_query.as_bytes());
+    }
+
+    // Timeout del proceso total: 35s (5s grace sobre el statement_timeout).
+    let start = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(35);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return IpcResponse::error(504, "psql_timeout", None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return IpcResponse::error(500, "psql_wait_failed",
+                Some(&e.to_string())),
+        }
+    }
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => return IpcResponse::error(500, "psql_output_failed",
+            Some(&e.to_string())),
+    };
+
+    let stdout_s = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr_s = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+
+    // Truncar por filas. La primera línea es header.
+    let mut lines: Vec<&str> = stdout_s.lines().collect();
+    let total_rows = lines.len().saturating_sub(1);
+    let truncated = total_rows > max_rows;
+    if truncated {
+        lines.truncate(max_rows + 1); // +1 header
+    }
+    let body_out = lines.join("\n");
+
+    // Cap absoluto defensivo: 4 MiB.
+    let body_out = if body_out.len() > 4 * 1024 * 1024 {
+        body_out.chars().take(4 * 1024 * 1024).collect()
+    } else {
+        body_out
+    };
+
+    if code == 0 {
+        IpcResponse::json(200, serde_json::json!({
+            "nkr_name": nkr_name,
+            "db_name": info.db_name,
+            "exit_code": 0,
+            "rows_returned": total_rows.min(max_rows),
+            "truncated": truncated,
+            "csv": body_out,
+        }))
+    } else {
+        IpcResponse::json(400, serde_json::json!({
+            "error": "psql_error",
+            "nkr_name": nkr_name,
+            "db_name": info.db_name,
+            "exit_code": code,
+            "stderr": stderr_s.chars().take(4096).collect::<String>(),
+        }))
+    }
+}
+
+// =============================================================================
+// POST /admin/cache/purge — vaciar cache nginx (global, todos los tenants)
+// =============================================================================
+
+const NGINX_CACHE_DIR: &str = "/var/cache/nginx/nkr_static";
+
+/// Borra todas las entries del cache nginx en disco. Reconstrucción orgánica:
+/// la próxima request a un asset cacheado va a Odoo y vuelve a poblar la entry.
+/// Aplicación típica: tras `POST /addons/git` que toca `/web/static/*` (logos,
+/// imgs, fonts) — sin purgar, el cache server-side serviría stale por hasta 24h.
+pub fn handle_purge_cache() -> IpcResponse {
+    let dir = std::path::Path::new(NGINX_CACHE_DIR);
+    if !dir.exists() {
+        return IpcResponse::json(200, serde_json::json!({
+            "purged": 0,
+            "size_bytes_freed": 0,
+            "note": "cache dir no existe — nada para purgar",
+        }));
+    }
+
+    // Walk: cada entry hijo del cache dir es un subdir hash o archivo.
+    // rm -rf todo el contenido (preservar el dir top porque nginx lo necesita).
+    let mut purged = 0u64;
+    let mut bytes_freed = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => return IpcResponse::error(500, "read_cache_dir_failed",
+            Some(&e.to_string())),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let metadata_size = walk_size(&path);
+        match if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        } {
+            Ok(()) => {
+                purged += 1;
+                bytes_freed += metadata_size;
+            }
+            Err(e) => errors.push(format!("{}: {}", path.display(), e)),
+        }
+    }
+
+    eprintln!("[API] cache purge: {} entries, {} bytes liberados", purged, bytes_freed);
+
+    if !errors.is_empty() {
+        return IpcResponse::json(207, serde_json::json!({
+            "purged": purged,
+            "size_bytes_freed": bytes_freed,
+            "errors": errors,
+        }));
+    }
+    IpcResponse::json(200, serde_json::json!({
+        "purged": purged,
+        "size_bytes_freed": bytes_freed,
+    }))
+}
+
+/// Estado del repo Odoo Enterprise descargado en una cell.
+/// Lo usa el panel para chequear si puede aceptar `edition: "enterprise"`
+/// al crear tenants — si no hay repo descargado, mejor rechazar antes de
+/// que el tenant arranque con manifests faltantes.
+pub fn handle_enterprise_status(cell: &str) -> IpcResponse {
+    if !is_safe_identifier(cell) {
+        return IpcResponse::error(400, "invalid_cell", None);
+    }
+    // Leer odoo_version desde cell.yml. Si no existe la cell o no tiene
+    // odoo_version, devolver 404.
+    let cell_yml = format!("/mnt/nkr/cells/{}/cell.yml", cell);
+    let content = match std::fs::read_to_string(&cell_yml) {
+        Ok(c) => c,
+        Err(_) => return IpcResponse::error(404, "cell_not_found", None),
+    };
+    let odoo_version = content.lines()
+        .find_map(|l| l.trim().strip_prefix("odoo_version:"))
+        .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string())
+        .unwrap_or_default();
+    if odoo_version.is_empty() {
+        return IpcResponse::error(404, "cell_has_no_odoo_version", None);
+    }
+
+    let ent_dir = format!("/mnt/nkr/enterprise/{}", odoo_version);
+    let path = std::path::Path::new(&ent_dir);
+    let mut available = false;
+    let mut module_count: u64 = 0;
+    let mut size_bytes: u64 = 0;
+    let mut sha = String::new();
+
+    if path.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = match p.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                // Modules son subdirs con __manifest__.py. Filtrar dotfiles
+                // y el `nkr-env` artifact que generamos en otro flujo.
+                if name.starts_with('.') || name == "nkr-env" { continue; }
+                if !p.is_dir() { continue; }
+                if p.join("__manifest__.py").exists() {
+                    module_count += 1;
+                }
+            }
+        }
+        // El repo está "available" si tiene al menos 1 manifest enterprise.
+        available = module_count > 0;
+        size_bytes = walk_size(path);
+
+        // SHA del HEAD del repo si existe .git
+        // safe.directory=<dir> scoped to this path (NOT `*`) so we don't
+        // disable the CVE-2022-24765 protection globally.
+        if let Ok(out) = std::process::Command::new("git")
+            .args(["-c", &format!("safe.directory={}", ent_dir),
+                   "-c", "core.hooksPath=/dev/null",
+                   "-C", &ent_dir, "rev-parse", "HEAD"])
+            .output()
+        {
+            if out.status.success() {
+                sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            }
+        }
+    }
+
+    IpcResponse::json(200, serde_json::json!({
+        "cell": cell,
+        "odoo_version": odoo_version,
+        "available": available,
+        "module_count": module_count,
+        "path": ent_dir,
+        "size_bytes": size_bytes,
+        "sha": sha,
+    }))
+}
+
+/// Suma recursiva de tamaños de archivos. Tolera errores (skipea archivos no
+/// legibles). Usado solo para reportar bytes liberados — no es crítico.
+fn walk_size(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(md) = std::fs::metadata(path) {
+        if md.is_file() {
+            return md.len();
+        }
+        if md.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for e in entries.flatten() {
+                    total += walk_size(&e.path());
+                }
+            }
+        }
+    }
+    total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_resources_balloon_formula() {
+        // Reference table from the doc comment.
+        // workers=1: 1024 - 750 - 256 = 18 → floor 0 (below 64 MB minimum).
+        let r1 = derive_resources(1);
+        assert_eq!(r1.ram_mb, 1024);
+        assert_eq!(r1.balloon_mb, 0);
+
+        // workers=2: 2048 - 1500 - 256 = 292.
+        let r2 = derive_resources(2);
+        assert_eq!(r2.ram_mb, 2048);
+        assert_eq!(r2.balloon_mb, 292);
+
+        // workers=4: 4096 - 3000 - 256 = 840.
+        let r4 = derive_resources(4);
+        assert_eq!(r4.ram_mb, 4096);
+        assert_eq!(r4.balloon_mb, 840);
+
+        // workers=8: 8192 - 6000 - 256 = 1936.
+        let r8 = derive_resources(8);
+        assert_eq!(r8.ram_mb, 8192);
+        assert_eq!(r8.balloon_mb, 1936);
+    }
+
+    #[test]
+    fn derive_resources_balloon_floor() {
+        // The 64 MB floor must clamp small results to 0.
+        // workers=1 yields 18 → 0.
+        assert_eq!(derive_resources(1).balloon_mb, 0);
+    }
+}

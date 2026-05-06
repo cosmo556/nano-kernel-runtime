@@ -1,0 +1,102 @@
+# =============================================================================
+# NKR Stack Registry — Registro de Stacks Odoo
+# =============================================================================
+#
+# Cada stack = 1 PG + 1 PgBouncer + N instancias Odoo (micro-VMs separadas)
+# que comparten: filestore, extra-addons y logs en disco del host.
+#
+# Flujo de provisión:
+#   1. Editar este archivo
+#   2. sudo ./deploy/mt-provision.sh [nombre-stack]
+#   3. sudo ./deploy/mt-compose-gen.sh
+#   4. sudo nkr compose down && sudo nkr compose up -f nkr-compose.yml -d
+#
+# Asignación de IDs (determinista por posición):
+#   Stack 0: PG=1, PgB=2, Odoo 1..N = 3..(2+N)
+#   Stack 1: PG=base, PgB=base+1, Odoo 1..N = base+2..(base+1+N)
+#   donde base = suma de (2+odoo_count) de stacks anteriores + 1
+#
+# Subnetting: 10.0.0.1 = bridge host, vm_id → 10.0.0.(vm_id+1)
+#   Con odoo_count=20 por stack: máx ~11 stacks en /24.
+# =============================================================================
+
+# ── Configuración global ──
+global:
+  # Imágenes
+  kernel: ./bzImage
+  pg_initramfs:        /opt/nkr/initramfs/pg_initramfs.cpio.gz
+  pgbouncer_initramfs: /opt/nkr/initramfs/pgbouncer_initramfs.cpio.gz
+  odoo_initramfs:      /opt/nkr/initramfs/odoo_initramfs.cpio.gz
+
+  # Discos base (CoW desde estos)
+  pg_base_disk:        /opt/nkr/disks/postgres-base.ext4
+  pgbouncer_base_disk: /opt/nkr/disks/pgbouncer-base.ext4
+  odoo_base_disk:      /opt/nkr/disks/odoo-base.ext4
+
+  # Directorios host
+  disk_dir:    /opt/nkr/disks
+  data_dir:    /opt/nkr/data       # /<stack>/pg/  /<stack>/filestore/
+  log_dir:     /opt/nkr/logs       # /<stack>/odoo-N/  /<stack>/pgbouncer/
+  config_dir:  /opt/nkr/config     # /<stack>/odoo-N.conf  /<stack>/pgbouncer/
+  modules_dir: /opt/nkr/modules    # addons extra compartidos por TODOS los stacks
+
+  # PostgreSQL por stack
+  pg_ram:      2048
+  pg_chrs:     2
+  pg_user:     odoo
+  pg_password: odoo
+  pg_disk_gb:  8
+
+  # PgBouncer por stack
+  pgbouncer_ram:  256
+  pgbouncer_chrs: 1
+  pgbouncer_disk_gb: 1
+  pgbouncer_port: 6432
+  pgbouncer_pool_mode: transaction
+  pgbouncer_pool_size: 20       # conexiones reales al PG por base de datos
+  pgbouncer_max_client: 400     # conexiones Odoo totales aceptadas
+
+  # Odoo por instancia dentro del stack
+  odoo_count:      20           # instancias Odoo por stack (default)
+  odoo_ram:        256
+  odoo_chrs:       1
+  odoo_admin_passwd: admin
+  odoo_disk_gb:    4
+  odoo_port:       8069
+
+  # Nginx (host)
+  nginx_sites_dir:   /etc/nginx/sites-available
+  nginx_enabled_dir: /etc/nginx/sites-enabled
+
+  # Límites multi-tenant PostgreSQL
+  db_statement_timeout: 60000   # ms
+  db_conn_limit:        -1       # sin límite a nivel DB (PgBouncer lo gestiona)
+
+  # Backups
+  backup_remote_user: backup
+  backup_remote_host: backup.example.com
+  backup_remote_path: /backups/nkr
+  backup_retention_days: 30
+  backup_ssh_key: /root/.ssh/nkr_backup_rsa
+
+# ── Stacks ──
+# Campos obligatorios: name, domain, db_name
+# Campos opcionales (override del global): odoo_count, pg_ram, pg_chrs,
+#   odoo_ram, odoo_chrs, odoo_admin_passwd, pgbouncer_pool_size
+#
+stacks:
+  - name: ejemplo
+    domain: erp.ejemplo.com
+    db_name: ejemplo_prod
+    odoo_count: 20
+    pg_ram: 4096
+    pg_chrs: 4
+    odoo_ram: 512
+    odoo_chrs: 1
+
+# ── Plantilla ──
+# - name: cliente2
+#   domain: erp.cliente2.com
+#   db_name: cliente2_prod
+#   odoo_count: 10
+#   odoo_ram: 256

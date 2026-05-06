@@ -1,0 +1,82 @@
+# ==========================================
+# Entorno Rust / Cargo
+# ==========================================
+/target/
+**/*.rs.bk
+# Nota: Cargo.lock NO se ignora porque estamos construyendo un binario final (nkr), 
+# no una librería, garantizando compilaciones deterministas en producción.
+
+# ==========================================
+# Artefactos de Ensamblador y Linker (C/ASM)
+# ==========================================
+*.o
+*.out
+*.elf
+*.bin
+*.lock
+# Cargo.lock SÍ se versiona (binario final, builds reproducibles).
+# Esta línea anula `*.lock` arriba — orden importa en gitignore.
+!Cargo.lock
+
+# Kernel artifacts: el bzImage está en build-kernel/output/, pero un
+# `cp ... ./bzImage` durante dev podría dejarlo en la raíz. Bloquear
+# para que un `git add -A` no lo committee.
+/bzImage
+/vmlinux*
+
+# ==========================================
+# Imágenes del Unikernel y Discos Virtuales
+# ==========================================
+# Evitamos subir el test-kernel.img y futuras imágenes de Odoo/Alpine
+*.img
+*.iso
+*.qcow2
+*.vmdk
+*.cpio.gz
+*.ext4
+*.ext4.new
+*.ext4.old
+*.ext4.bak
+
+# ==========================================
+# Logs, Sockets y Volcados de KVM
+# ==========================================
+*.log
+*.sock
+/vmm.sock
+core
+vgcore.*
+
+# ==========================================
+# Archivos de Sistema e IDEs
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# ==========================================
+# Agent / tooling local state (no debe ir al repo)
+# ==========================================
+.claude/
+.cursor/
+.aider*
+
+# ==========================================
+# Backups de compose / archivos de runtime que no son fuente
+# ==========================================
+*.bak.*
+nkr-compose.yml.bak.*
+
+# ==========================================
+# Build output (regenerable via make / cargo)
+# ==========================================
+build-kernel/output/
+
+# ==========================================
+# Residuos de patch fallidos (limpiar a mano cuando ya no se necesiten)
+# ==========================================
+*.patch
+*.rej
+*.orig

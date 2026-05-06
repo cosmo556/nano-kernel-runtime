@@ -1,0 +1,46 @@
+# =============================================================================
+# Nkrfile — Odoo 17 para NKR
+# =============================================================================
+# Construye: sudo nkr build -f Nkrfile.odoo -o odoo.ext4 --size-gb 4
+#
+# Personaliza: agrega tus dependencias Python, paquetes del sistema,
+# y archivos de configuración aquí.
+# =============================================================================
+
+FROM odoo:17.0
+
+USER root
+
+# ── Dependencias Python adicionales (descomenta las que necesites) ──
+# RUN pip3 install --no-cache-dir \
+#     phonenumbers \
+#     python-barcode \
+#     num2words \
+#     xlsxwriter \
+#     vobject \
+#     qrcode
+
+# ── Paquetes del sistema (descomenta si necesitas) ──
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#     wkhtmltopdf \
+#     && rm -rf /var/lib/apt/lists/*
+
+# ── Configuración Odoo ──
+COPY deploy/config/odoo.conf /etc/odoo/odoo.conf
+RUN chown odoo:odoo /etc/odoo/odoo.conf
+
+# ── Mount points requeridos por NKR (rootfs compartido es RO al runtime).
+#     /mnt/extra-addons es un VOLUME de la imagen base → cambios en RUN
+#     se descartan. Por eso los mount points de panel viven FUERA del VOLUME:
+#       /mnt/extra-addons      — custom addons del cliente (virtiofs del panel)
+#       /mnt/extra-enterprise  — Odoo Enterprise (clonado por cell)
+#       /mnt/extra-pylibs      — libs Python del cliente
+#     El odoo.conf lista los 3 en addons_path + PYTHONPATH. ──
+RUN mkdir -p /mnt/extra-enterprise /mnt/extra-pylibs \
+    && touch /mnt/extra-enterprise/.keep /mnt/extra-pylibs/.keep \
+    && chown -R odoo:odoo /mnt/extra-enterprise /mnt/extra-pylibs
+
+# ── (Opcional) Copiar módulos directamente al disco ──
+# COPY ./modules/ /mnt/extra-addons/
+
+USER odoo

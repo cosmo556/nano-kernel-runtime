@@ -1,0 +1,105 @@
+[Unit]
+Description=NKR unprivileged HTTP proxy (→ UDS to nkr daemon)
+Documentation=https://github.com/anthropics/nano-kernel-runtime
+After=network-online.target nkr.service
+Requires=nkr.service
+
+[Service]
+Type=simple
+
+# Dedicated unprivileged user — created with:
+#   sudo groupadd -r nkr-api
+#   sudo useradd  -r -g nkr-api -s /usr/sbin/nologin -d /nonexistent nkr-api
+#   sudo groupadd -r nkr-addons
+#   sudo usermod -aG nkr-addons nkr-api
+#   sudo setfacl -R -m g:nkr-addons:rwx -m d:g:nkr-addons:rwx /mnt/nkr/cells /mnt/nkr/enterprise
+User=nkr-api
+Group=nkr-api
+# Membership used by the git/pylibs endpoints to write under /mnt/nkr via ACL.
+SupplementaryGroups=nkr-addons
+
+# The daemon chown's /var/run/nkr.sock to root:nkr-api so this service can connect.
+# If you relocate the UDS, keep both services in sync:
+# Environment=NKR_SOCKET_PATH=/run/nkr/nkr.sock
+
+# Bind config:
+#   NKR_BIND_ADDR default 127.0.0.1 — terminate TLS in nginx/caddy in front.
+#   NKR_API_PORT  default 9090.
+#   NKR_API_TOKEN required in production; drop to dev/local if unset.
+Environment=NKR_BIND_ADDR=127.0.0.1
+Environment=NKR_API_PORT=9090
+# Load NKR_API_TOKEN from a root-only readable file:
+#   /etc/nkr/api.env contains: NKR_API_TOKEN=<hex>
+EnvironmentFile=-/etc/nkr/api.env
+
+ExecStart=/usr/local/bin/nkr-api-server
+
+Restart=on-failure
+RestartSec=2s
+StartLimitBurst=5
+StartLimitIntervalSec=60s
+
+StandardOutput=journal
+StandardError=journal
+
+# ────────────────────────────────────────────────────────────────────────────
+# Hardening — everything off unless needed
+# ────────────────────────────────────────────────────────────────────────────
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# git / pip write under /mnt/nkr/cells and /mnt/nkr/enterprise via ACL on
+# the nkr-addons group. ProtectSystem=strict hides /mnt, so whitelist it.
+ReadWritePaths=/mnt/nkr/cells /mnt/nkr/enterprise /var/run/nkr.sock
+ReadOnlyPaths=/mnt/nkr/images /mnt/nkr/kernel /mnt/nkr/initramfs
+# /tmp is already PrivateTmp (per-service scratch); used for ephemeral SSH keys.
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+UMask=0077
+
+# Only IPv4/IPv6 TCP + Unix sockets needed (TCP for HTTP listener, UDS for
+# connecting to nkr daemon).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Network reach: el bind default es 127.0.0.1 (NKR_BIND_ADDR). Nginx/Caddy
+# enfrente termina TLS y reenvía local.
+#
+# NO usamos `IPAddressDeny=any` porque este proceso ejecuta `git clone/pull`
+# contra GitHub/GitLab (endpoints /v1/git/*) — bloquear egress mataría esa
+# funcionalidad. Si el panel deja de necesitar git directo y todo se fetchea
+# por otro proceso, endurecer aquí con:
+#     IPAddressDeny=any
+#     IPAddressAllow=127.0.0.0/8 ::1/128
+# Mientras tanto, enforce de "solo localhost para inbound" se delega a
+# NKR_BIND_ADDR=127.0.0.1 + nginx/iptables del host.
+
+# Syscall filter: allow default @system-service minus suspect groups.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @cpu-emulation @debug @obsolete
+SystemCallArchitectures=native
+
+# Capabilities: none. Listening on >1024 needs no cap.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Resource limits: prevent thread-bomb / fd-leak from taking down the host.
+LimitNPROC=256
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target
