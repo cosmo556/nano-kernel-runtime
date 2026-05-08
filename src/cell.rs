@@ -169,7 +169,109 @@ pub fn create_cell(name: &str, odoo_version: Option<&str>) -> Result<CellConfig,
         name, cell_id, cell_id);
     eprintln!("[NKR-CELL] Directorio: {}", cell_dir.display());
 
+    // Per-cell reflink of shared master images (postgres, pgbouncer). Skipped
+    // silently if any master is missing — the cell can still be created and
+    // the operator can call `provision_cell_root_disks` later (or run
+    // `nkr build -f Nkrfile.pg` first). This preserves the legacy flow where
+    // a cell.yml is created before any master exists in the host.
+    if let Err(e) = provision_cell_root_disks(&key) {
+        eprintln!("[NKR-CELL] WARN: provision_cell_root_disks: {} \
+                   — la cell se creó sin reflinks; correr el helper a mano \
+                   tras `nkr build -f Nkrfile.pg`/`Nkrfile.pgbouncer`.", e);
+    }
+
     Ok(config)
+}
+
+/// Master ext4 images that get a private per-cell reflink copy. Each tuple is
+/// (master file under /mnt/nkr/images/, name of the per-cell copy under the
+/// cell directory). Extend this list when a new shared image becomes part of
+/// a cell's bring-up.
+///
+/// Why per-cell copies: the master files are shared across cells (same path,
+/// `/mnt/nkr/images/postgres.ext4` is referenced by every cell). Mapping the
+/// master directly via virtio-pmem (MAP_SHARED + PROT_WRITE) means two cells
+/// that run simultaneously write to the same backing → eventual ext4
+/// corruption. The reflink copy gives each cell its own physical file with
+/// btrfs CoW: the kernel handles divergent writes per-inode, master is never
+/// touched.
+const CELL_ROOTFS_MASTERS: &[(&str, &str)] = &[
+    ("postgres.ext4",  "postgres-root.ext4"),
+    ("pgbouncer.ext4", "pgbouncer-root.ext4"),
+];
+
+/// Provisions per-cell reflink copies of the well-known master ext4 images
+/// (postgres, pgbouncer). Idempotent: skips masters that have already been
+/// reflinked. On hosts where btrfs reflink is unavailable, `cp --reflink=auto`
+/// transparently falls back to a physical copy — slower but functionally
+/// equivalent.
+///
+/// NOTE: deliberately does NOT apply `chattr +C` to the resulting copies.
+/// Applying NoCoW to a file whose extents are shared via reflink is a no-op
+/// in btrfs (the flag is accepted but does not affect existing extents, and
+/// shared extents must always CoW on write to avoid corrupting the source).
+/// The rootfs is read-mostly in operation, so the residual fragmentation is
+/// operationally negligible. PG checkpoint/WAL traffic goes to
+/// `pg/data.ext4`, which is created fresh with `+C` on an empty file by
+/// `fsutil::create_ext4_disk` — that path keeps NoCoW effective.
+pub fn provision_cell_root_disks(
+    cell_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cell_dir = cells_dir().join(cell_name);
+    let images_dir = nkr_data_dir().join("images");
+    provision_cell_root_disks_with_paths(&cell_dir, &images_dir)
+}
+
+/// Path-injectable variant of `provision_cell_root_disks`, used by tests that
+/// can't touch the real /mnt/nkr layout. Production code should call the
+/// public wrapper above.
+pub(crate) fn provision_cell_root_disks_with_paths(
+    cell_dir: &Path,
+    images_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !cell_dir.exists() {
+        return Err(format!("cell dir missing: {}", cell_dir.display()).into());
+    }
+    if !images_dir.exists() {
+        return Err(format!("images dir missing: {}", images_dir.display()).into());
+    }
+
+    for (src_name, dst_name) in CELL_ROOTFS_MASTERS {
+        let src = images_dir.join(src_name);
+        let dst = cell_dir.join(dst_name);
+        if !src.exists() {
+            return Err(format!(
+                "master ext4 missing: {} (run `nkr build -f Nkrfile.{}` first)",
+                src.display(),
+                src_name.trim_end_matches(".ext4")
+            ).into());
+        }
+        if dst.exists() {
+            // Idempotent: master was already reflinked into this cell.
+            continue;
+        }
+        // cp -a --reflink=auto: O(1) on btrfs (CoW), falls back to a physical
+        // copy on ext4/xfs hosts.
+        let status = std::process::Command::new("cp")
+            .args(["-a", "--reflink=auto",
+                   &src.to_string_lossy(),
+                   &dst.to_string_lossy()])
+            .status()?;
+        if !status.success() {
+            return Err(format!(
+                "cp --reflink failed: {} → {}",
+                src.display(), dst.display()
+            ).into());
+        }
+        // Best-effort consistency check on the new copy. e2fsck -p only fixes
+        // safe issues and exits 0; non-zero is informative, not fatal.
+        let _ = std::process::Command::new("e2fsck")
+            .args(["-p", &dst.to_string_lossy()])
+            .status();
+        eprintln!("[NKR-CELL] reflinked {} → {}",
+            src.display(), dst.display());
+    }
+    Ok(())
 }
 
 /// Loads a cell's configuration from its cell.yml
@@ -2292,6 +2394,86 @@ mod tests {
         // Must have created [options] and added the key under it.
         assert!(lines.iter().any(|l| l == "[options]"));
         assert!(lines.iter().any(|l| l == "workers = 4"));
+    }
+
+    #[test]
+    fn provision_creates_reflink_copies_idempotent() {
+        let tmp = env::temp_dir().join(format!("nkr-prov-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let cell_dir = tmp.join("cells/test-cell");
+        let images_dir = tmp.join("images");
+        fs::create_dir_all(&cell_dir).unwrap();
+        fs::create_dir_all(&images_dir).unwrap();
+        // Stub masters with distinct content so we can verify the copies are
+        // independent inodes (cp does not deduplicate content beyond the
+        // reflink mechanism).
+        fs::write(images_dir.join("postgres.ext4"), b"PG_MASTER_BYTES").unwrap();
+        fs::write(images_dir.join("pgbouncer.ext4"), b"PGB_MASTER_BYTES").unwrap();
+
+        // First call: copies must be created.
+        provision_cell_root_disks_with_paths(&cell_dir, &images_dir).unwrap();
+        assert!(cell_dir.join("postgres-root.ext4").exists());
+        assert!(cell_dir.join("pgbouncer-root.ext4").exists());
+        assert_eq!(
+            fs::read(cell_dir.join("postgres-root.ext4")).unwrap(),
+            b"PG_MASTER_BYTES"
+        );
+
+        // Second call: idempotent, no error and no duplicate work.
+        provision_cell_root_disks_with_paths(&cell_dir, &images_dir).unwrap();
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn provision_fails_if_master_missing() {
+        let tmp = env::temp_dir().join(format!("nkr-prov-miss-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let cell_dir = tmp.join("cells/c");
+        let images_dir = tmp.join("images");
+        fs::create_dir_all(&cell_dir).unwrap();
+        fs::create_dir_all(&images_dir).unwrap();
+        // No master files → the helper must report the missing one.
+
+        let res = provision_cell_root_disks_with_paths(&cell_dir, &images_dir);
+        assert!(res.is_err());
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("master ext4 missing"), "unexpected msg: {}", msg);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn provision_skips_existing_dst() {
+        let tmp = env::temp_dir().join(format!("nkr-prov-skip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let cell_dir = tmp.join("cells/c");
+        let images_dir = tmp.join("images");
+        fs::create_dir_all(&cell_dir).unwrap();
+        fs::create_dir_all(&images_dir).unwrap();
+        fs::write(images_dir.join("postgres.ext4"), b"NEW").unwrap();
+        fs::write(images_dir.join("pgbouncer.ext4"), b"NEW").unwrap();
+
+        // Pre-existing copy with stale content. The helper must NOT overwrite
+        // it — once a cell has been provisioned, the per-cell copy diverges
+        // from the master and must be preserved.
+        fs::write(cell_dir.join("postgres-root.ext4"), b"STALE_BUT_OURS").unwrap();
+
+        provision_cell_root_disks_with_paths(&cell_dir, &images_dir).unwrap();
+
+        assert_eq!(
+            fs::read(cell_dir.join("postgres-root.ext4")).unwrap(),
+            b"STALE_BUT_OURS",
+            "existing copy must not be overwritten"
+        );
+        // The other master (pgbouncer) had no pre-existing copy, so it should
+        // now be reflinked.
+        assert_eq!(
+            fs::read(cell_dir.join("pgbouncer-root.ext4")).unwrap(),
+            b"NEW"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

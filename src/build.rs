@@ -18,6 +18,51 @@ use std::process::Command;
 use std::fs;
 use std::path::Path;
 
+/// Returns true if `output` lives under the central /mnt/nkr/images/ tree —
+/// the convention for "shared master ext4 images" that get reflinked to each
+/// cell via `cell::provision_cell_root_disks`. Outputs to other paths
+/// (developer scratch in /tmp, ad-hoc tests) are not subject to the
+/// chattr +i lifecycle.
+fn is_master_image_path(output: &str) -> bool {
+    let data_dir = std::env::var("NKR_DATA_DIR").unwrap_or_else(|_| "/mnt/nkr".to_string());
+    let images_prefix = format!("{}/images/", data_dir.trim_end_matches('/'));
+    output.starts_with(&images_prefix)
+}
+
+/// Best-effort `chattr -i` on a master image. Silent if the file doesn't
+/// exist yet (first build) or if the flag wasn't set. Returning an error
+/// here would block re-builds on hosts where chattr is unavailable; treat
+/// the lifecycle as best-effort and surface only stderr from the tool.
+fn unlock_master(output: &str) {
+    if !is_master_image_path(output) {
+        return;
+    }
+    if !Path::new(output).exists() {
+        return;
+    }
+    let _ = Command::new("chattr").args(["-i", output]).status();
+}
+
+/// Best-effort `chattr +i` on a master image. Logs a WARN if it fails
+/// because that means the master remains writable — risky if any cell
+/// later maps it directly. Operator can re-apply manually with
+/// `sudo chattr +i <path>`.
+fn lock_master(output: &str) {
+    if !is_master_image_path(output) {
+        return;
+    }
+    match Command::new("chattr").args(["+i", output]).status() {
+        Ok(s) if s.success() => {
+            eprintln!("[NKR-BUILD] chattr +i aplicado al master {}", output);
+        }
+        _ => {
+            eprintln!("[NKR-BUILD] WARN: chattr +i falló sobre {}. \
+                       Master queda escribible. Reaplicar manualmente: \
+                       sudo chattr +i {}", output, output);
+        }
+    }
+}
+
 /// Builds an ext4 disk from an Nkrfile (Dockerfile compatible)
 pub fn build_disk(
     nkrfile: &str,
@@ -34,6 +79,12 @@ pub fn build_disk(
     if !Command::new("docker").arg("--version").output().is_ok() {
         return Err("Docker no está instalado. nkr build usa Docker como motor de build.".into());
     }
+
+    // If the output is a master image under /mnt/nkr/images/, the previous
+    // build may have set `chattr +i` to prevent accidental writes from VMs.
+    // Unlock it here so the build can overwrite the file. Re-locked at the
+    // end of the build on success.
+    unlock_master(output);
 
     let tag = format!("nkr-build-{}", std::process::id());
 
@@ -141,6 +192,11 @@ pub fn build_disk(
     eprintln!("║ Archivo: {:<51} ║", output);
     eprintln!("║ Tamaño:  {} MB{:<49} ║", disk_size, "");
     eprintln!("╚══════════════════════════════════════════════════════════════╝");
+
+    // Re-lock master images so VMs cannot accidentally open them RW.
+    // Per-cell rootfs copies are produced by `cell::provision_cell_root_disks`
+    // via `cp --reflink=auto`, which still works against an immutable source.
+    lock_master(output);
 
     Ok(())
 }
