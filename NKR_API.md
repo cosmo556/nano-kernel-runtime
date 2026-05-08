@@ -593,7 +593,9 @@ curl -sI -H "$TOK" \
 
 Clona un repo Git en `addons/` y **explota los módulos al nivel `addons/<modulo>/`** para que `addons_path` quede en una sola ruta `/mnt/extra-addons` sin importar el layout del repo de origen.
 
-Layout final dentro del tenant (independiente de single-module o repo OCA multi-módulo):
+**Soporta submódulos privados con jerarquía profunda** (padre/hijo/nieto/etc., a profundidad arbitraria). NKR clona recursivo, escanea todo el árbol resultante, y aplana TODOS los módulos Odoo encontrados a `addons/<modulo>/`. Los dirs intermedios (agrupadores sin manifest) se descartan.
+
+Layout final dentro del tenant (independiente del layout del repo):
 ```
 instances/<tenant>/addons/
   ├── modulo_a/__manifest__.py
@@ -606,10 +608,12 @@ instances/<tenant>/addons/
 | layout del repo clonado | acción |
 |---|---|
 | `repo/__manifest__.py` (single-module en raíz) | mueve todo a `addons/<subdir>/` (`subdir` = lo que el panel pidió o el basename del repo) |
-| `repo/<m1>/__manifest__.py`, `repo/<m2>/__manifest__.py`, ... (multi-módulo, OCA-style) | mueve cada `<m>/` con `__manifest__.py` a `addons/<m>/`. Los archivos en raíz del repo (README, LICENSE, .git) se descartan. |
-| sin manifests | 422 `no_modules_found` |
+| `repo/<m1>/__manifest__.py`, `repo/<m2>/__manifest__.py`, ... (multi-módulo en primer nivel) | mueve cada `<m>/` con `__manifest__.py` a `addons/<m>/`. Los archivos en raíz del repo (README, LICENSE, .git) se descartan. |
+| `repo/.gitmodules` con jerarquía padre/hijo/nieto (submódulos a profundidad arbitraria) | clone con `--recurse-submodules`, scan recursivo del árbol completo, mueve cada dir con `__manifest__.py` a `addons/<m>/` **sin importar la profundidad de Git**. Los agrupadores intermedios (submódulos sin manifest) se ignoran. Ejemplo en §4.10.1. |
+| sin manifests en ninguna parte del árbol | `422 no_modules_found` |
+| dos módulos con mismo dirname encontrados en distintas ramas del árbol | `409 module_name_collision` (deploy abortado, NO toca el filesystem destino) |
 
-**Idempotencia:** cualquier `action` (`clone`, `pull`, `sync`) ejecuta un re-clone fresco a un tmp dir efímero (`addons/.nkr-tmp-<subdir>/`) y luego mueve los módulos. El `.git` no se preserva — para "actualizar" el panel vuelve a llamar al endpoint y NKR re-clona. Cada módulo movido lleva un tracker `addons/<m>/.nkr-source` (`repo_url=`, `ref=`, `sha=`) que sirve para distinguir overwrite legítimo (mismo repo) vs conflicto real (otro repo con módulo del mismo nombre → `409 module_conflict`).
+**Idempotencia:** cualquier `action` (`clone`, `pull`, `sync`) ejecuta un re-clone fresco a un tmp dir efímero (`addons/.nkr-tmp-<subdir>/`) y luego mueve los módulos. El `.git` no se preserva — para "actualizar" el panel vuelve a llamar al endpoint y NKR re-clona el árbol completo. Cada módulo movido lleva un tracker `addons/<m>/.nkr-source` (`repo_url=`, `ref=`, `sha=`) que sirve para distinguir overwrite legítimo (mismo repo) vs conflicto real (otro repo con módulo del mismo nombre → `409 module_conflict`).
 
 **Body (SSH deploy key):**
 ```json
@@ -666,8 +670,10 @@ instances/<tenant>/addons/
 - `401 git_ssh_auth_failed` — la deploy key no tiene acceso al repo (o no fue agregada en GitHub → Settings → Deploy keys).
 - `404 instance_not_found` — la instancia no existe en disco.
 - `404 git_repo_not_found` — el repo no existe o el token no tiene permiso de lectura.
-- `409 module_conflict` — uno o más módulos del repo ya existen en `addons/` y vienen de otro `repo_url` (según `.nkr-source`). Body incluye `conflicts: [{module, existing_repo, attempted_repo}, ...]`. Panel debe borrar manualmente los módulos en conflicto antes de reintentar.
-- `422 no_modules_found` — el repo no tiene `__manifest__.py` en raíz ni en subdirs de primer nivel. Probablemente el `ref` apunta a una rama vacía o a un repo de tooling sin módulos Odoo.
+- **`409 module_name_collision`** — dos `__manifest__.py` con el mismo dirname encontrados en distintas ramas del árbol Git (sólo aplica con submódulos). Body incluye `conflicts: [{module_name, found_at: [...]}]` listando los paths exactos donde apareció cada duplicado, más un `remediation`. **NKR aborta el deploy y no toca el filesystem destino** — la VM Odoo del tenant sigue corriendo con el árbol anterior. **El panel debe marcar este deploy como FAILED / DROPPED / ROJO en su UI**: NKR no eligió un ganador automáticamente para evitar pérdida silenciosa de código. El cliente debe renombrar uno de los módulos en conflicto en su repo Git (commit + push) y re-mandar el POST. Ver §4.10.2.
+- `409 module_conflict` — uno o más módulos del repo ya existen en `addons/` y vienen de otro `repo_url` (según `.nkr-source`). Distinto de `module_name_collision`: este es overwrite vs OTRO repo previo, no colisión dentro del mismo deploy. Body incluye `conflicts: [{module, existing_repo, attempted_repo}, ...]`. Panel debe borrar manualmente los módulos en conflicto antes de reintentar.
+- `422 no_modules_found` — el árbol clonado (incluyendo submódulos recursivos) no contiene ningún `__manifest__.py`. Probablemente el `ref` apunta a una rama vacía o a un repo de tooling sin módulos Odoo.
+- **`422 submodule_clone_partial`** — algún submódulo del árbol quedó vacío post-clone (PAT no tiene scope sobre ese repo, SHA inexistente por force-push, owner GitHub distinto, etc.). Body incluye `failed_submodules: ["path/relativo", ...]` y `remediation`. **NKR no aplica nada al filesystem destino** — la VM Odoo sigue con el árbol anterior. El panel debe mostrar el deploy como fallido y solicitar al operador que corrija el scope del PAT y re-mande.
 - `422 git_clone_failed` — git devolvió no-cero sin match a los anteriores. Body incluye `log_tail` (30 líneas).
 - `500 move_failed` — `rename` falló (típicamente filesystem lleno o cross-device move). Body incluye el path origen/destino.
 - `504 git_timeout` — git tardó más de 180 s (red lenta o repo muy grande).
@@ -695,6 +701,107 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 **Para que Odoo vea los módulos nuevos:** después del clone el panel debe (1) `POST /actions {action:"restart"}` para que Odoo recargue manifests y los módulos aparezcan en la tabla `ir_module_module`, o (2) en la UI ir a Apps → Update Apps List. **Sin restart o Update Apps List los módulos siguen invisibles aunque estén físicamente en `addons/`.**
 
 **Timeout:** 180s. Si el repo es muy grande, el panel debería hacer el clone en vertientes (primero `--depth 1`, después fetch de refs adicionales).
+
+### 4.10.1 Submódulos privados con jerarquía profunda
+
+Caso de uso: el cliente quiere mantener cada módulo en un repo privado separado, agruparlos jerárquicamente, y que NKR los publique todos planos en `addons/`.
+
+**Layout en GitHub (jerarquía padre/hijo/nieto, profundidad arbitraria):**
+
+```
+acme-customs/                      ← repo padre (privado)
+├── .gitmodules
+├── module-direct/                 ← submódulo HIJO (1 módulo Odoo, manifest en raíz)
+│   └── __manifest__.py
+├── group-frontend/                ← submódulo HIJO (NO módulo, agrupador)
+│   ├── .gitmodules                ← submódulos anidados (nietos)
+│   ├── module-x/                  ← submódulo NIETO
+│   │   └── __manifest__.py
+│   └── module-y/                  ← submódulo NIETO
+│       └── __manifest__.py
+└── group-backend/                 ← submódulo HIJO agrupador
+    ├── .gitmodules
+    └── module-z/                  ← submódulo NIETO
+        └── __manifest__.py
+```
+
+`group-frontend` y `group-backend` **NO tienen `__manifest__.py` en su raíz** — son agrupadores. NKR los recorre buscando módulos adentro pero NO los publica como módulos.
+
+**Resultado en NKR (aplanado total):**
+
+```
+/mnt/nkr/cells/.../instances/<tenant>/addons/
+├── module-direct/__manifest__.py   ← venía del hijo
+├── module-x/__manifest__.py        ← venía del nieto group-frontend/module-x
+├── module-y/__manifest__.py        ← venía del nieto group-frontend/module-y
+└── module-z/__manifest__.py        ← venía del nieto group-backend/module-z
+```
+
+`addons_path = /mnt/extra-addons`. Odoo enumera los 4 módulos. **Cero subdirs intermedios** en el filesystem del tenant — los agrupadores Git desaparecieron correctamente.
+
+**Convenciones obligatorias del meta-repo:**
+
+1. Cada submódulo que sea un módulo Odoo debe tener `__manifest__.py` en su raíz.
+2. **Los nombres de directorio de los módulos deben ser únicos en todo el árbol.** Si dos repos distintos tienen un módulo llamado `module-x`, NKR aborta con `409 module_name_collision` (ver §4.10.2).
+3. Submódulos sin `__manifest__.py` se tratan como agrupadores: NKR recorre adentro pero no los publica.
+4. Todo el árbol (padre + hijos + nietos + ...) debe estar bajo el **mismo owner GitHub**. Cross-owner privado no se soporta — limitación de auth de GitHub.
+
+**Auth con un solo PAT cubriendo todo el árbol:**
+
+```bash
+# 1. Crear PAT fine-grained en https://github.com/settings/personal-access-tokens
+#    - Repository access: "Only select repositories" → meta-repo + cada repo de submódulo
+#    - Permissions: Contents: Read-only, Metadata: Read-only
+#    - Expiration: 90 días (renovable)
+# 2. Pasarlo en el body:
+
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repo_url": "https://github.com/acme/customs.git",
+    "ref": "main",
+    "github_token": "ghp_..."
+  }' \
+  http://nkr-host:9090/api/v1/cells/odoo-v17/instances/odoo-v17-cliente-42/addons/git
+# → { "module_count": 4, "modules": ["module-direct", "module-x", "module-y", "module-z"] }
+```
+
+NKR usa `url.insteadOf` internamente para que el PAT aplique recursivamente a todos los submódulos del owner, sin necesidad de modificar las URLs en los `.gitmodules` del cliente.
+
+**Cero `git pull` incremental.** Cada `POST /addons/git` es un re-clone completo del árbol — no se mantiene `.git` activo en `addons/`. Tiempo típico: ~15-30 s para árboles de 5-15 módulos. Tráfico contra GitHub: 1 clone por cada repo del árbol (mantenemos `--depth 1` y `--shallow-submodules` para minimizar bytes transferidos).
+
+### 4.10.2 Ejemplo de respuesta `409 module_name_collision`
+
+Caso: el cliente tiene `module-x` declarado en `group-frontend/` Y en `group-backend/` (mismo nombre, distintas ramas del árbol):
+
+```json
+HTTP 409
+{
+  "error": "module_name_collision",
+  "message": "dos o más módulos con el mismo nombre fueron encontrados en distintas ramas del árbol Git. Renombrar uno de ellos en el repo y re-mandar.",
+  "conflicts": [
+    {
+      "module_name": "module-x",
+      "found_at": [
+        "group-frontend/module-x",
+        "group-backend/module-x"
+      ]
+    }
+  ],
+  "remediation": "Renombrar el directorio del módulo en uno de los repos en conflicto y commit + push. NKR no eligió un ganador automáticamente para evitar perder código silenciosamente.",
+  "repo_url": "https://github.com/acme/customs.git",
+  "ref": "main"
+}
+```
+
+**Comportamiento del panel ante este 409:**
+
+1. Marcar el deploy como **failed / dropped / rojo** en la UI del operador.
+2. Listar los módulos en conflicto con sus paths Git completos (de `conflicts[].found_at`).
+3. Mostrar el campo `remediation` para guiar al operador.
+4. **No reintentar automáticamente** — el cliente debe arreglar el árbol Git primero.
+
+NKR **no aplica nada al filesystem destino** cuando hay colisión: la VM Odoo del tenant sigue corriendo con el árbol anterior. Una vez que el cliente renombra el módulo en su repo (commit + push) y el panel re-manda el POST, el deploy procede normalmente.
 
 ### 4.11 `POST /api/v1/cells/{cell}/enterprise/git` — Clone de Odoo Enterprise
 
