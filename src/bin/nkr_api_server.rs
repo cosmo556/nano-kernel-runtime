@@ -651,12 +651,144 @@ fn handle_addons_git(cell: &str, instance: &str, body: &[u8]) -> HttpResponse {
     }
 }
 
-/// Detecta si el repo recién clonado es single-module (manifest en raíz) o
-/// multi-módulo (manifests en subdirs) y mueve los módulos a su posición
-/// final bajo `addons/<module>/`.
+/// Walks `tmp_dir` recursively looking for any directory whose entry list
+/// includes `__manifest__.py`. Skips `.git/` directories and any dotfile
+/// directory. Returns a vector of (absolute-path-of-module-dir, dirname)
+/// pairs. Dirname is the basename of the module dir, which becomes the
+/// publication name in `addons/<dirname>/`.
+///
+/// Stops descending once it finds `__manifest__.py` in a directory: the
+/// subdirs of an Odoo module (data/, models/, wizard/, security/) are not
+/// modules themselves, so descending into them would yield false positives
+/// if any of them happened to contain a stray `__manifest__.py`.
+fn scan_modules_recursive(tmp_dir: &str) -> Result<Vec<(std::path::PathBuf, String)>, String> {
+    let mut found: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let root = std::path::Path::new(tmp_dir);
+    walk_for_modules(root, &mut found)?;
+    Ok(found)
+}
+
+fn walk_for_modules(
+    dir: &std::path::Path,
+    acc: &mut Vec<(std::path::PathBuf, String)>,
+) -> Result<(), String> {
+    // If this dir IS a module, capture and don't descend further.
+    if dir.join("__manifest__.py").is_file() {
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("invalid dir name at {}", dir.display()))?
+            .to_string();
+        acc.push((dir.to_path_buf(), name));
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("read_dir {} failed: {}", dir.display(), e))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        // Skip Git internals and any dotfile dir.
+        if name.starts_with('.') {
+            continue;
+        }
+        walk_for_modules(&path, acc)?;
+    }
+    Ok(())
+}
+
+/// Returns (name, [paths]) for any module name that appears more than once
+/// across the recursive scan results. Empty vec when no collisions.
+fn detect_name_collisions(
+    modules: &[(std::path::PathBuf, String)],
+) -> Vec<(String, Vec<std::path::PathBuf>)> {
+    use std::collections::HashMap;
+    let mut by_name: HashMap<String, Vec<std::path::PathBuf>> = HashMap::new();
+    for (path, name) in modules {
+        by_name.entry(name.clone()).or_default().push(path.clone());
+    }
+    by_name
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .collect()
+}
+
+/// Reads `.gitmodules` files recursively (the parent's plus each
+/// submodule's nested `.gitmodules` if present). For each declared submodule
+/// `path = X`, checks the destination directory has at least one entry.
+/// Returns the list of empty paths (relative to root) so the caller can
+/// build a 422 response listing every submodule that failed to clone.
+fn validate_submodules_populated(tmp_dir: &str) -> Result<(), Vec<String>> {
+    let root = std::path::Path::new(tmp_dir);
+    let mut empty_paths: Vec<String> = Vec::new();
+    walk_gitmodules(root, root, &mut empty_paths);
+    if empty_paths.is_empty() {
+        Ok(())
+    } else {
+        Err(empty_paths)
+    }
+}
+
+fn walk_gitmodules(
+    root: &std::path::Path,
+    current: &std::path::Path,
+    empty: &mut Vec<String>,
+) {
+    let gm = current.join(".gitmodules");
+    if !gm.is_file() {
+        return;
+    }
+    let content = match std::fs::read_to_string(&gm) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    // Minimal INI parser: extract `path = X` lines from any [submodule "..."]
+    // section. We don't need to parse the section header — `path =` lines
+    // only appear under submodule sections in this format.
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("path") {
+            let val = rest
+                .trim_start_matches(|c: char| c == ' ' || c == '\t' || c == '=')
+                .trim();
+            if val.is_empty() {
+                continue;
+            }
+            let sub_path = current.join(val);
+            let count = std::fs::read_dir(&sub_path)
+                .map(|rd| rd.flatten().count())
+                .unwrap_or(0);
+            if count == 0 {
+                let rel = sub_path
+                    .strip_prefix(root)
+                    .unwrap_or(&sub_path)
+                    .to_string_lossy()
+                    .into_owned();
+                empty.push(rel);
+            } else {
+                // Recurse into the submodule's own .gitmodules, if any.
+                walk_gitmodules(root, &sub_path, empty);
+            }
+        }
+    }
+}
+
+/// Detecta si el repo recién clonado es single-module (manifest en raíz),
+/// multi-módulo (manifests en subdirs) o tiene submódulos jerárquicos
+/// (`.gitmodules` presente, profundidad arbitraria), y mueve los módulos a
+/// su posición final bajo `addons/<module>/`.
 ///
 /// Single-module: `tmp/__manifest__.py` → `addons/<subdir>/`.
 /// Multi-módulo:  `tmp/<m>/__manifest__.py` → `addons/<m>/` para cada `m`.
+/// Submódulos:    walk recursivo del árbol entero, todo dir con manifest
+///                a `addons/<m>/`. Falla con 409 si dos módulos colisionan
+///                en nombre, o 422 si algún submódulo declarado en
+///                `.gitmodules` quedó vacío.
 ///
 /// Tracker `.nkr-source` por módulo: archivo INI con `repo_url=`, `ref=`,
 /// `sha=`. Permite re-clone idempotente sobre módulos del mismo repo y
@@ -671,14 +803,104 @@ fn explode_modules(
 ) -> Result<Vec<String>, HttpResponse> {
     let tmp = std::path::Path::new(tmp_dir);
     let manifest_at_root = tmp.join("__manifest__.py").exists();
+    let has_submodules = tmp.join(".gitmodules").is_file();
 
-    // Pre-scan: recolectar nombres de módulos detectados.
-    let mut module_names: Vec<String> = Vec::new();
-    if manifest_at_root {
-        // Single-module: nombre = subdir_hint (panel decidió cómo llamarlo).
-        module_names.push(subdir_hint.to_string());
+    // Pre-scan: recolectar (src_path, name) de cada módulo detectado.
+    // Para single-module y multi-módulo legacy, src_path corresponde a la
+    // posición canónica que se usará al hacer rename. Para submódulos
+    // (jerarquía profunda), los src_paths vienen del walk recursivo.
+    let mut modules: Vec<(std::path::PathBuf, String)> = Vec::new();
+
+    if has_submodules {
+        // Submódulos: validar que ningún submódulo del árbol haya quedado
+        // vacío post-clone (auth recursiva fallida, SHA inexistente, etc.).
+        // Esto se chequea ANTES del scan de manifests para que el panel
+        // reciba un error específico (`submodule_clone_partial`) en vez de
+        // un misleading `no_modules_found` cuando el problema fue de auth.
+        if let Err(empty) = validate_submodules_populated(tmp_dir) {
+            return Err(HttpResponse::json(422, serde_json::json!({
+                "error": "submodule_clone_partial",
+                "message": format!(
+                    "{} submódulo(s) no se clonaron — verificar scope del PAT \
+                     y que cada repo declarado en .gitmodules sea accesible.",
+                    empty.len()
+                ),
+                "failed_submodules": empty,
+                "remediation": "Confirmar que el PAT tiene Contents:Read sobre \
+                                todos los repos del árbol y reintentar el POST.",
+            })));
+        }
+
+        // Recursive scan: encontrar todo dir con __manifest__.py a profundidad
+        // arbitraria. Salta dotfile dirs (.git, .github) y no desciende dentro
+        // de un módulo (data/, models/, etc. no son módulos).
+        match scan_modules_recursive(tmp_dir) {
+            Ok(found) => modules = found,
+            Err(e) => return Err(HttpResponse::error(500, "scan_failed",
+                Some(&e))),
+        }
+
+        if modules.is_empty() {
+            return Err(HttpResponse::error(422, "no_modules_found",
+                Some("el árbol clonado (incluyendo submódulos) no contiene \
+                      ningún __manifest__.py")));
+        }
+
+        // Validar que cada nombre de módulo es seguro (mismo charset que
+        // is_safe_identifier para evitar path-injection vía rename).
+        for (path, name) in &modules {
+            if !is_safe_identifier(name) {
+                return Err(HttpResponse::error(400, "invalid_module_name",
+                    Some(&format!("module dir '{}' (en {}) tiene caracteres inválidos",
+                        name, path.display()))));
+            }
+        }
+
+        // Detectar colisión de nombres dentro del mismo deploy: dos módulos
+        // con el mismo dirname encontrados en distintas ramas del árbol Git.
+        // NKR no elige un ganador — aborta para que el cliente lo resuelva
+        // explícitamente. Ver §4.10.2 de NKR_API.md.
+        let collisions = detect_name_collisions(&modules);
+        if !collisions.is_empty() {
+            let conflicts_json: Vec<serde_json::Value> = collisions
+                .iter()
+                .map(|(name, paths)| {
+                    let rels: Vec<String> = paths
+                        .iter()
+                        .map(|p| {
+                            p.strip_prefix(tmp)
+                                .unwrap_or(p)
+                                .to_string_lossy()
+                                .into_owned()
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "module_name": name,
+                        "found_at": rels,
+                    })
+                })
+                .collect();
+            return Err(HttpResponse::json(409, serde_json::json!({
+                "error": "module_name_collision",
+                "message": "dos o más módulos con el mismo nombre fueron \
+                            encontrados en distintas ramas del árbol Git. \
+                            Renombrar uno de ellos en el repo y re-mandar.",
+                "conflicts": conflicts_json,
+                "remediation": "Renombrar el directorio del módulo en uno \
+                                de los repos en conflicto y commit + push. \
+                                NKR no eligió un ganador automáticamente \
+                                para evitar perder código silenciosamente.",
+                "repo_url": repo_url,
+                "ref": reference,
+            })));
+        }
+    } else if manifest_at_root {
+        // Single-module legacy: nombre = subdir_hint (panel decidió cómo
+        // llamarlo). El src_path es el tmp dir entero, que se renombra
+        // como bloque.
+        modules.push((tmp.to_path_buf(), subdir_hint.to_string()));
     } else {
-        // Multi-módulo: cada subdir directo de tmp con __manifest__.py.
+        // Multi-módulo legacy: cada subdir directo de tmp con __manifest__.py.
         let entries = match std::fs::read_dir(tmp) {
             Ok(e) => e,
             Err(e) => return Err(HttpResponse::error(500, "scan_failed",
@@ -697,19 +919,21 @@ fn explode_modules(
                 return Err(HttpResponse::error(400, "invalid_module_name",
                     Some(&format!("module dir '{}' tiene caracteres inválidos", name))));
             }
-            module_names.push(name);
+            modules.push((p, name));
         }
-        if module_names.is_empty() {
+        if modules.is_empty() {
             return Err(HttpResponse::error(422, "no_modules_found",
                 Some("repo no tiene __manifest__.py en raíz ni en subdirs de primer nivel")));
         }
     }
 
-    // Pre-check de conflictos: cada módulo destino debe (a) no existir, o
-    // (b) ser de este mismo repo (según `.nkr-source`). Si es de otro repo
-    // → 409 sin modificar nada.
+    // Pre-check de conflictos vs módulos preexistentes en addons/: cada
+    // módulo destino debe (a) no existir, o (b) ser de este mismo repo
+    // (según `.nkr-source`). Si es de otro repo → 409 module_conflict
+    // sin modificar nada. Distinto del module_name_collision (que es
+    // dentro del mismo deploy).
     let mut conflicts: Vec<serde_json::Value> = Vec::new();
-    for m in &module_names {
+    for (_, m) in &modules {
         let dst = format!("{}/{}", addons_dir, m);
         let dst_path = std::path::Path::new(&dst);
         if !dst_path.exists() { continue; }
@@ -737,25 +961,37 @@ fn explode_modules(
         })));
     }
 
-    // Mover. Single-module: tmp en bloque. Multi-módulo: por subdir.
-    if manifest_at_root {
-        let dst = format!("{}/{}", addons_dir, subdir_hint);
-        let _ = std::fs::remove_dir_all(&dst); // si era overwrite del mismo repo
+    // Mover cada módulo a su posición final. fs::rename es atómico en el
+    // mismo filesystem, por módulo. La iteración multi-módulo no es
+    // atómica en agregado — si el daemon muere a la mitad del loop, queda
+    // mezcla. Deuda preexistente (no introducida por submódulos), ver
+    // AUDIT_GH.md §4.6 sobre renameat2 para resolverlo.
+    let mut module_names: Vec<String> = Vec::with_capacity(modules.len());
+    if !has_submodules && manifest_at_root {
+        // Single-module legacy: rename del tmp entero como bloque.
+        let m = &modules[0].1;
+        let dst = format!("{}/{}", addons_dir, m);
+        let _ = std::fs::remove_dir_all(&dst);
         if let Err(e) = std::fs::rename(tmp_dir, &dst) {
             return Err(HttpResponse::error(500, "move_failed",
                 Some(&format!("rename {} → {}: {}", tmp_dir, dst, e))));
         }
         write_nkr_source(&dst, repo_url, reference, sha);
+        module_names.push(m.clone());
     } else {
-        for m in &module_names {
-            let src = format!("{}/{}", tmp_dir, m);
+        // Multi-módulo o submódulos jerárquicos: rename por módulo desde
+        // su src_path (que en el caso de submódulos puede estar a
+        // profundidad arbitraria del tmp).
+        for (src_path, m) in &modules {
             let dst = format!("{}/{}", addons_dir, m);
             let _ = std::fs::remove_dir_all(&dst);
-            if let Err(e) = std::fs::rename(&src, &dst) {
+            if let Err(e) = std::fs::rename(src_path, &dst) {
                 return Err(HttpResponse::error(500, "move_failed",
-                    Some(&format!("rename {} → {}: {}", src, dst, e))));
+                    Some(&format!("rename {} → {}: {}",
+                        src_path.display(), dst, e))));
             }
             write_nkr_source(&dst, repo_url, reference, sha);
+            module_names.push(m.clone());
         }
     }
 
@@ -946,8 +1182,19 @@ fn run_git_sync(req: &GitReq, target: &str) -> HttpResponse {
         ("clone", false) | ("sync", false) => {
             // --branch handles both branches and tags at clone time.
             // For commit SHAs, caller must clone first then pull with a ref.
-            let r = git_clone(&effective_url, target, req.reference.as_deref(),
-                              tmp_key_path.as_deref());
+            // The PAT is also forwarded so git_clone can install
+            // url.insteadOf rewrites that cover recursive submodule clones
+            // under the same owner — the parent already authenticates via
+            // effective_url, but submodule URLs read from .gitmodules
+            // (typically SSH or vanilla HTTPS) need the rewrite to inherit
+            // the credential.
+            let r = git_clone(
+                &effective_url,
+                target,
+                req.reference.as_deref(),
+                tmp_key_path.as_deref(),
+                req.github_token.as_deref(),
+            );
             ("clone", Some(r), None)
         }
         ("pull", true) | ("sync", true) => {
@@ -1083,14 +1330,56 @@ fn run_git_sync(req: &GitReq, target: &str) -> HttpResponse {
     }))
 }
 
-fn git_clone(url: &str, target: &str, reference: Option<&str>, key_path: Option<&str>) -> (bool, String, String) {
+fn git_clone(
+    url: &str,
+    target: &str,
+    reference: Option<&str>,
+    key_path: Option<&str>,
+    github_token: Option<&str>,
+) -> (bool, String, String) {
     let mut cmd = std::process::Command::new("git");
+
+    // Holders for the lifetime of the args slice. They live on the stack of
+    // this function so the &str slices below stay valid until cmd.args runs.
+    let pat_ssh;
+    let pat_https;
+
     // Disable hooks and non-user protocols — a malicious repo could bring a
     // post-checkout/post-merge hook (via templatedir, etc.) that would run as
-    // `nkr-api` during the clone.
-    let mut args: Vec<&str> = vec!["-c", "core.hooksPath=/dev/null",
-                                    "-c", "protocol.allow=user",
-                                    "clone", "--depth", "1"];
+    // `nkr-api` during the clone. These flags propagate to recursive sub-git
+    // invocations via GIT_CONFIG_PARAMETERS env var.
+    let mut args: Vec<&str> = vec![
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "protocol.allow=user",
+    ];
+
+    // If a PAT was supplied, rewrite SSH and bare-HTTPS URLs to embed the
+    // token. This makes private submodules (and submodules-of-submodules)
+    // under the same owner clone transparently with a single credential —
+    // the .gitmodules in each repo can keep declaring SSH or vanilla HTTPS
+    // URLs. The url.insteadOf rules also propagate to recursive sub-gits.
+    if let Some(pat) = github_token {
+        pat_ssh = format!(
+            "url.https://x-access-token:{}@github.com/.insteadOf=git@github.com:",
+            pat
+        );
+        pat_https = format!(
+            "url.https://x-access-token:{}@github.com/.insteadOf=https://github.com/",
+            pat
+        );
+        args.push("-c");
+        args.push(&pat_ssh);
+        args.push("-c");
+        args.push(&pat_https);
+    }
+
+    args.extend_from_slice(&[
+        "clone",
+        "--depth", "1",
+        "--recurse-submodules",   // resolve submodules recursively (any depth)
+        "--shallow-submodules",   // --depth=1 also for each submodule
+        "--jobs", "2",            // limited parallelism (see AUDIT_GH §5.7 on rate limits)
+    ]);
     if let Some(r) = reference {
         args.push("--branch");
         args.push(r);
@@ -1439,5 +1728,182 @@ mod tests {
         assert!(out.contains("éxito"));
         assert!(out.contains("café"));
         assert!(out.contains("***:***@host/r"));
+    }
+
+    // ---- Submodule tree handling ----------------------------------------
+
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn tempdir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("nkr-gh-{}-{}", label, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_manifest(dir: &std::path::Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("__manifest__.py"), b"{}").unwrap();
+    }
+
+    #[test]
+    fn scan_finds_modules_at_arbitrary_depth() {
+        let tmp = tempdir("scan-deep");
+        // Layout:
+        //   tmp/module-direct/__manifest__.py             (depth 1)
+        //   tmp/group-frontend/module-x/__manifest__.py   (depth 2)
+        //   tmp/group-backend/sub/module-z/__manifest__.py(depth 3)
+        write_manifest(&tmp.join("module-direct"));
+        write_manifest(&tmp.join("group-frontend/module-x"));
+        write_manifest(&tmp.join("group-backend/sub/module-z"));
+
+        let found = scan_modules_recursive(&tmp.to_string_lossy()).unwrap();
+        let names: std::collections::HashSet<String> =
+            found.iter().map(|(_, n)| n.clone()).collect();
+        assert_eq!(names.len(), 3, "found = {:?}", found);
+        assert!(names.contains("module-direct"));
+        assert!(names.contains("module-x"));
+        assert!(names.contains("module-z"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scan_skips_dotfile_dirs() {
+        let tmp = tempdir("scan-skip-dot");
+        // .git/ should NEVER be descended into — even if it contained a
+        // bogus __manifest__.py we must not pick it up.
+        fs::create_dir_all(tmp.join(".git/modules/foo")).unwrap();
+        fs::write(tmp.join(".git/modules/foo/__manifest__.py"), b"{}").unwrap();
+        write_manifest(&tmp.join("good-module"));
+
+        let found = scan_modules_recursive(&tmp.to_string_lossy()).unwrap();
+        let names: Vec<String> = found.iter().map(|(_, n)| n.clone()).collect();
+        assert_eq!(names, vec!["good-module".to_string()]);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scan_does_not_descend_into_a_module() {
+        // A module dir contains data/, models/, security/, wizard/ subdirs.
+        // Those are NOT modules — they are subdirs of one module. Scan must
+        // stop at the first __manifest__.py found in the chain.
+        let tmp = tempdir("scan-no-descend");
+        write_manifest(&tmp.join("module-a"));
+        fs::create_dir_all(tmp.join("module-a/models")).unwrap();
+        fs::write(tmp.join("module-a/models/__init__.py"), b"").unwrap();
+        // Stray manifest deep inside (paranoid case): ignored because the
+        // walk stops at module-a's manifest.
+        fs::write(tmp.join("module-a/models/__manifest__.py"), b"{}").unwrap();
+
+        let found = scan_modules_recursive(&tmp.to_string_lossy()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, "module-a");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn detect_collisions_flags_duplicates() {
+        let mods: Vec<(PathBuf, String)> = vec![
+            (PathBuf::from("/tmp/a/module-x"), "module-x".to_string()),
+            (PathBuf::from("/tmp/b/module-x"), "module-x".to_string()),
+            (PathBuf::from("/tmp/a/module-y"), "module-y".to_string()),
+        ];
+        let cols = detect_name_collisions(&mods);
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].0, "module-x");
+        assert_eq!(cols[0].1.len(), 2);
+    }
+
+    #[test]
+    fn detect_collisions_returns_empty_when_unique() {
+        let mods: Vec<(PathBuf, String)> = vec![
+            (PathBuf::from("/tmp/a/m1"), "m1".to_string()),
+            (PathBuf::from("/tmp/b/m2"), "m2".to_string()),
+        ];
+        let cols = detect_name_collisions(&mods);
+        assert!(cols.is_empty());
+    }
+
+    #[test]
+    fn validate_submodules_detects_empty_dir() {
+        let tmp = tempdir("val-empty");
+        fs::write(tmp.join(".gitmodules"), r#"
+[submodule "module-a"]
+    path = module-a
+    url = https://github.com/acme/module-a.git
+[submodule "module-b"]
+    path = module-b
+    url = https://github.com/acme/module-b.git
+"#).unwrap();
+        write_manifest(&tmp.join("module-a"));
+        // module-b dir created but left empty (clone of that submodule failed)
+        fs::create_dir_all(tmp.join("module-b")).unwrap();
+
+        let res = validate_submodules_populated(&tmp.to_string_lossy());
+        assert!(res.is_err());
+        let empty = res.unwrap_err();
+        assert!(empty.iter().any(|p| p.contains("module-b")),
+            "got empty list: {:?}", empty);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn validate_submodules_recurses_into_nested_gitmodules() {
+        let tmp = tempdir("val-nested");
+        fs::write(tmp.join(".gitmodules"), r#"
+[submodule "group-frontend"]
+    path = group-frontend
+    url = https://github.com/acme/group-frontend.git
+"#).unwrap();
+        fs::create_dir_all(tmp.join("group-frontend")).unwrap();
+        fs::write(tmp.join("group-frontend/.gitmodules"), r#"
+[submodule "nested-module"]
+    path = nested-module
+    url = https://github.com/acme/nested.git
+"#).unwrap();
+        // nested-module dir created but empty (auth failed for the nested repo)
+        fs::create_dir_all(tmp.join("group-frontend/nested-module")).unwrap();
+
+        let res = validate_submodules_populated(&tmp.to_string_lossy());
+        assert!(res.is_err());
+        let empty = res.unwrap_err();
+        assert!(empty.iter().any(|p| p.contains("nested-module")),
+            "got empty list: {:?}", empty);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn validate_submodules_passes_when_all_populated() {
+        let tmp = tempdir("val-ok");
+        fs::write(tmp.join(".gitmodules"), r#"
+[submodule "module-a"]
+    path = module-a
+    url = https://github.com/acme/module-a.git
+"#).unwrap();
+        write_manifest(&tmp.join("module-a"));
+
+        let res = validate_submodules_populated(&tmp.to_string_lossy());
+        assert!(res.is_ok());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn validate_submodules_returns_ok_when_no_gitmodules() {
+        // Plain repo without submodules — validation should be a no-op.
+        let tmp = tempdir("val-no-gm");
+        write_manifest(&tmp.join("module-a"));
+
+        let res = validate_submodules_populated(&tmp.to_string_lossy());
+        assert!(res.is_ok());
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
