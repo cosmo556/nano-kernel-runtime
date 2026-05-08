@@ -769,41 +769,109 @@ pub fn handle_delete(nkr_name: &str, drop_db: bool) -> IpcResponse {
     if !is_safe_identifier(nkr_name) {
         return IpcResponse::error(400, "invalid_nkr_name", None);
     }
-    match delete_instance(nkr_name, drop_db) {
-        Ok(cell) => IpcResponse::json(
+
+    // Idempotency fast-path: if the instance is already gone, return 200
+    // synchronously without spawning anything. Avoids reserving an in-flight
+    // slot for a no-op when the panel retries a DELETE.
+    if get_instance_info(nkr_name).is_err() {
+        eprintln!("[API] delete({}) idempotente: ya no existía", nkr_name);
+        return IpcResponse::json(
             200,
             serde_json::json!({
                 "deleted": true,
+                "already_deleted": true,
                 "nkr_name": nkr_name,
-                "cell": cell,
                 "drop_db": drop_db,
             }),
-        ),
-        Err(e) => {
-            // Idempotencia: si la instance ya no existe, devolver 200 con
-            // `already_deleted: true` en vez de 500. Esto evita que el panel
-            // entre en estado de error cuando hace polling y la instance
-            // desapareció en una ronda anterior, o cuando un DELETE se reintenta.
-            let msg = e.to_string();
-            if msg.contains("no encontrada") || msg.contains("not found") {
-                eprintln!("[API] delete({}) idempotente: ya no existía", nkr_name);
-                return IpcResponse::json(
-                    200,
-                    serde_json::json!({
-                        "deleted": true,
-                        "already_deleted": true,
-                        "nkr_name": nkr_name,
-                        "drop_db": drop_db,
-                    }),
-                );
+        );
+    }
+
+    // Snapshot of instance metadata BEFORE the async delete runs. The panel
+    // gets cell name + dns + addons_path back in the 202 so it can update its
+    // own UI state immediately, instead of trying GET /instances/{name}
+    // (which will start returning 404 mid-delete).
+    let info_snapshot = get_instance_info(nkr_name).ok();
+
+    // Reserve the in-flight slot — sharing the action set with handle_action,
+    // because a delete and a start/stop on the same name are mutually
+    // exclusive (the delete races with the action's writes to the same dir).
+    {
+        let mut set = match inflight_actions().lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        if set.contains(nkr_name) {
+            return IpcResponse::json(
+                409,
+                serde_json::json!({
+                    "error": "action_in_progress",
+                    "nkr_name": nkr_name,
+                    "message": "ya hay un start/stop/restart/delete en curso para esta instancia",
+                }),
+            );
+        }
+        set.insert(nkr_name.to_string());
+    }
+
+    // Detach: delete_instance can take 60-90s (SIGTERM grace period + DROP
+    // DATABASE + remove dir). Synchronous return forced panel HTTP timeouts
+    // to fire before NKR finished, leaving the panel UI stuck on 500 while
+    // the underlying delete had succeeded. Going async mirrors handle_action.
+    // The panel polls GET /instances/{name} until it returns 404.
+    let nkr_name_owned = nkr_name.to_string();
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("nkr-delete-{}", nkr_name))
+        .spawn(move || {
+            let _guard = InflightActionGuard(nkr_name_owned.clone());
+            let started = std::time::Instant::now();
+            match delete_instance(&nkr_name_owned, drop_db) {
+                Ok(cell) => eprintln!(
+                    "[API] delete({},cell={}) async ok ({}ms)",
+                    nkr_name_owned, cell, started.elapsed().as_millis()
+                ),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("no encontrada") || msg.contains("not found") {
+                        eprintln!("[API] delete({}) async: ya no existía ({}ms)",
+                            nkr_name_owned, started.elapsed().as_millis());
+                    } else {
+                        eprintln!("[API] delete({}) async error ({}ms): {}",
+                            nkr_name_owned, started.elapsed().as_millis(), msg);
+                    }
+                }
             }
-            eprintln!("[API] delete({}) error: {}", nkr_name, e);
-            IpcResponse::json(
-                500,
-                serde_json::json!({"error":"delete_failed","nkr_name":nkr_name,"message":msg}),
-            )
+        });
+
+    if let Err(e) = spawn_result {
+        // Spawn failed — release the slot manually since the guard never ran.
+        if let Ok(mut set) = inflight_actions().lock() {
+            set.remove(nkr_name);
+        }
+        eprintln!("[API] delete({}) thread spawn fail: {}", nkr_name, e);
+        return IpcResponse::json(
+            503,
+            serde_json::json!({"error":"spawn_failed","nkr_name":nkr_name}),
+        );
+    }
+
+    let mut payload = serde_json::json!({
+        "deleted": "pending",
+        "nkr_name": nkr_name,
+        "drop_db": drop_db,
+        "status": "accepted",
+        "async": true,
+        "message": "delete dispatched in background. Poll GET /instances/{name} until 404.",
+    });
+    if let Some(info) = info_snapshot {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("cell".to_string(), serde_json::Value::String(info.cell));
+            if let Some(dns) = info.dns {
+                obj.insert("dns".to_string(), serde_json::Value::String(dns));
+            }
         }
     }
+
+    IpcResponse::json(202, payload)
 }
 
 // In-flight set: una start/stop/restart en curso por nkr_name.
