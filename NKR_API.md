@@ -326,7 +326,9 @@ Uso típico del panel:
 - Después de crear, poll cada 2s hasta `nkr_status.port_8069_up == true`.
 - Renderizar el card con RAM/uptime/PID.
 
-### 4.7 `DELETE /api/v1/cells/{cell}/instances/{nkr_name}` — Eliminar
+### 4.7 `DELETE /api/v1/cells/{cell}/instances/{nkr_name}` — Eliminar (ASÍNCRONO desde v1.5.2)
+
+**ASÍNCRONO desde v1.5.2.** El endpoint encola el delete y devuelve `202` en <50 ms; antes era síncrono y bloqueaba 60–90 s (SIGTERM graceful + DROP DATABASE + remove dir). Eso forzaba al cliente HTTP del panel a cortar por timeout, devolviendo 500 falso en la UI mientras NKR seguía borrando OK por detrás. El panel ahora debe poller hasta `404`.
 
 Query params:
 - `drop_db=1` (default) — borra la DB PG también.
@@ -336,20 +338,64 @@ Query params:
 # Default: borra todo
 curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
   http://nkr-host:9090/api/v1/cells/odoo-v17/instances/odoo-v17-cliente-42
-# → 200 { "deleted":true, "cell":"odoo-v17", "drop_db":true }
+```
 
-# Preservar DB
+Respuesta 202 (<50 ms, instancia existía):
+```json
+{
+  "deleted": "pending",
+  "nkr_name": "odoo-v17-cliente-42",
+  "cell": "odoo-v17",
+  "dns": "cliente-42.systemouts.com",
+  "drop_db": true,
+  "status": "accepted",
+  "async": true,
+  "message": "delete dispatched in background. Poll GET /instances/{name} until 404."
+}
+```
+
+Respuesta 200 (instancia ya no existía — idempotente, **no es error**):
+```json
+{
+  "deleted": true,
+  "already_deleted": true,
+  "nkr_name": "odoo-v17-cliente-42",
+  "drop_db": true
+}
+```
+
+Respuesta 409 (delete o action concurrente sobre la misma instancia):
+```json
+{
+  "error": "action_in_progress",
+  "nkr_name": "odoo-v17-cliente-42",
+  "message": "ya hay un start/stop/restart/delete en curso para esta instancia"
+}
+```
+
+**Importante para el panel:**
+
+- Tratá `200 already_deleted=true` igual que un delete exitoso. Es la respuesta a un retry o a un delete sobre algo ya borrado.
+- Tras `202`, polear `GET /api/v1/cells/{cell}/instances/{name}` cada **1 s** hasta `404 not_found`. Cuando llegue el 404, la instancia terminó de borrarse (filesystem + DB + compose block).
+- Cadencia: hasta **180 s**. La DB de un tenant grande puede tardar más en hacer `DROP DATABASE` si tiene miles de tablas (Odoo con muchos módulos).
+- En `409 action_in_progress`: NO reintentar inmediatamente. Polear el `GET /instances/{name}` que confirme la acción previa, después reenviar el DELETE.
+- El campo `dns` del 202 es solo informativo. **El panel debe llamar explícitamente a `DELETE /api/v1/cells/{cell}/instances/{name}/dns`** (§4.14) antes del delete de la instancia para limpiar el vhost de nginx — el delete de instancia no toca DNS automáticamente.
+
+```bash
+# Preservar DB (útil para migrar la DB a otra instancia)
 curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
   "http://nkr-host:9090/api/v1/cells/odoo-v17/instances/odoo-v17-cliente-42?drop_db=0"
 ```
 
-Acciones internas del delete:
-1. SIGTERM a la VM (espera hasta 25s shutdown graceful).
-2. Drop DB (opcional).
-3. Remueve bloque del `nkr-compose.yml` (con backup `.bak.<ts>`).
-4. Libera `vm_id` del registry.
+Acciones internas del delete (en background tras 202):
+1. SIGTERM a la VM (espera hasta 90 s shutdown graceful, si timeout SIGKILL).
+2. Drop DB (opcional, contra pgbouncer de la cell).
+3. Remueve bloque del `nkr-compose.yml` (con backup `.bak.<ts>`, rotado a las últimas 20 versiones).
+4. Libera `vm_id` del registry (con flock + atomic rename).
 5. Borra `instance_dir` completo.
-6. Limpia `.nkr-data/<short>-*` (filestore + overrides).
+6. Limpia `.nkr-data/<short>-*` (filestore + overrides + per-instance ext4s).
+
+**Concurrencia:** un delete en curso bloquea simultáneamente cualquier `start/stop/restart/delete` sobre el mismo `nkr_name`. Otras instancias de la misma cell no se ven afectadas — cada nombre tiene su propio slot inflight.
 
 ### 4.8 `POST /api/v1/cells/{cell}/instances/{nkr_name}/actions` — Start / Stop / Restart
 
@@ -1425,17 +1471,24 @@ El panel nunca hace `git pull` ni `ssh`. Todo por los endpoints HTTPS del proxy.
 
 ```
 (a) panel → DELETE .../instances/{nkr_name}/dns?delete_cert=1
-    ← 200 (vhost nginx + cert Let's Encrypt removidos)
+    ← 200 (síncrono: vhost nginx + cert Let's Encrypt removidos en ~1-2 s)
 
 (b) panel → DELETE .../instances/{nkr_name}?drop_db=1
-    ← 200 (VM killed, dir borrado, DB dropped, compose limpiado)
+    ← 202 deleted=pending, async=true                        (instancia existía)
+        — o —
+    ← 200 deleted=true, already_deleted=true                 (ya estaba borrada)
 
-(c) panel elimina el webhook GitHub correspondiente
+(c) panel polea GET .../instances/{nkr_name} cada 1 s, hasta 180 s
+    ← 404 not_found  → delete completo, panel marca tenant deleted en su UI
 
-(d) panel elimina el A record DNS en su proveedor
+(d) panel elimina el webhook GitHub correspondiente
+
+(e) panel elimina el A record DNS en su proveedor
 ```
 
 **Orden importante:** DNS delete primero (mientras la VM todavía responde `:8069` por si certbot necesita validar algo) → luego instance delete. En la práctica certbot `delete` no requiere validación, así que podés hacerlo al revés, pero mantener este orden evita estados inconsistentes donde el vhost apunta a un guest_ip reciclado por NKR para otro tenant.
+
+**Por qué el delete pasó a async (v1.5.2):** un delete típico tarda 60–90 s (SIGTERM graceful + DROP DATABASE + remove dir). El cliente HTTP del panel cortaba por timeout antes de los 60 s y mostraba 500 al operador, dejando la instancia "fantasma" en la UI a pesar de que NKR ya la había borrado correctamente. Con la respuesta 202 inmediata + polling a 404, el panel UI se mantiene consistente con el estado real del backend.
 
 ### 6.4 Backup antes de delete (preservando DB)
 
