@@ -645,16 +645,24 @@ mount -o bind /newroot/tmp/hosts /newroot/etc/hosts
       break
     fi
   done
-  # Generic (Odoo, pgbouncer, anything else): broadcast SIGTERM to everything
-  # except PID 1 and kernel threads. killall5 respects init and its own session.
+  # Generic path: VMs sin postgres (Odoo tenants, pgbouncer, otros).
+  # Cada servicio corre en su PROPIA VM con su propia copia de este initramfs;
+  # el path se elige según qué encuentre en /var/lib/postgresql/. Si no hay
+  # postgres → caemos acá. Broadcast SIGTERM a todos los procesos excepto PID 1
+  # y kernel threads. killall5 respeta init y su propia sesión.
   if [ "$_HANDLED" = "0" ]; then
     echo "[NKR-{label}] Broadcast SIGTERM (killall5) — app sin handler específico"
     /bin/busybox killall5 -15 2>/dev/null || true
     _w=0
-    # Wait up to 25s for userspace processes to exit.
+    # Wait up to 5s (era 25s pre-v1.6.1) para que los procesos userspace terminen.
+    # Justificación: el path postgres (arriba) ya tiene su propio timer de 15s
+    # vía postmaster.pid. Acá solo caen apps que responden a SIGTERM en <2s
+    # típico (Odoo workers: 1-2s, pgbouncer: <1s). El timeout viejo de 25s era
+    # overhead pagado innecesariamente — el restart de tenants Odoo baja de
+    # ~70s a ~25s con esto. PG no se afecta (corre por path propio).
     # Heuristic: userspace processes have /proc/N/cmdline NON-empty.
     # Kernel threads (kthreadd, ksoftirqd, etc.) have empty cmdline.
-    while [ $_w -lt 25 ]; do
+    while [ $_w -lt 5 ]; do
       _USER=0
       for _p in /proc/[0-9]*; do
         _pidn=${{_p#/proc/}}

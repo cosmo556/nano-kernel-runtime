@@ -1267,6 +1267,7 @@ pub fn clone_instance_with_opts(
         limit_memory_soft: opts.limit_memory_soft,
         limit_memory_hard: opts.limit_memory_hard,
         addons_path: opts.addons_path.clone(),
+        tier: opts.tier,
         created_at: now_unix_secs(),
     };
     save_instance_meta(&dst_dir, &meta)?;
@@ -1303,6 +1304,45 @@ pub enum InstanceMode {
 pub enum Edition {
     Community,
     Enterprise,
+}
+
+/// Tier de la instancia — determina sizing, hot-reload, rate-limit, cache,
+/// y reglas de bootstrap.
+///
+/// - **Production** (default, back-compat): workers≥2, sin dev_mode, rate-limit
+///   en /web/login, cache de assets nginx, sin debug logs. El panel debe
+///   restartear explícitamente para que cambios de código Python tomen efecto.
+///   Para staging-style "copia con cambios", usar tier=staging.
+///
+/// - **Staging**: workers=1 (para que upgrade refleje código en TODOS los
+///   workers), ram=2GB, dev_mode=reload+qweb+xml en odoo.conf (hot-reload via
+///   inotify), log_level=debug, sin rate-limit en login, sin cache nginx.
+///   REQUIERE `source` (clona DB de un tenant production existente). Útil para
+///   probar cambios de código contra datos reales sin tocar prod.
+///
+/// - **Dev**: idéntico a staging en runtime (workers=1, dev_mode, sin
+///   rate-limit, sin cache), pero **NO clona DB** — arranca con DB vacía via
+///   /web/database/create. NO acepta `source` (se ignora con warning si se
+///   pasa). Útil para desarrollar módulos nuevos desde cero. **Las instancias
+///   dev no son clonables** (no se pueden usar como `source` de otro tenant).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    Production,
+    Staging,
+    Dev,
+}
+
+impl Default for Tier {
+    fn default() -> Self { Tier::Production }
+}
+
+impl Tier {
+    /// Si el tier requiere comportamiento "dev-like" (workers=1 + dev_mode +
+    /// sin cache/rate-limit). Cubre staging y dev.
+    pub fn is_dev_like(self) -> bool {
+        matches!(self, Tier::Staging | Tier::Dev)
+    }
 }
 
 /// Clone options sent by the panel.
@@ -1345,6 +1385,9 @@ pub struct CloneOptions {
     /// (mode=production usa el template de la cell, mode=dev usa el source
     /// explícito del panel).
     pub skip_db_clone: bool,
+    /// Tier del tenant (production/staging/dev). Se propaga a meta.json,
+    /// odoo.conf (dev_mode/log_level) y vhost (rate-limit/cache off).
+    pub tier: Tier,
 }
 
 impl Default for InstanceMode {
@@ -1377,6 +1420,10 @@ pub struct InstanceMeta {
     pub limit_memory_hard: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub addons_path: Option<String>,
+    /// Tier de la instancia. Determina workers, dev_mode, rate-limit, cache.
+    /// Default Production cuando ausente (back-compat para meta.json viejos).
+    #[serde(default)]
+    pub tier: Tier,
     pub created_at: u64,
 }
 
@@ -1673,9 +1720,31 @@ fn rewrite_odoo_conf_full(
     // dejando GET /logs vacío. El template legacy puede traer "logfile = None".
     upsert_key(&mut lines, "logfile", "/var/log/odoo/odoo.log");
 
+    // Tier-aware overrides para staging/dev:
+    //   - dev_mode = reload,qweb,xml → inotify watcher restart workers en
+    //     cambios de .py + hot-reload de QWeb templates + XML views sin upgrade
+    //   - limit_time_cpu/real más amplios → permite debugger / breakpoints
+    //   - list_db = True → /web/database/manager accesible (override del
+    //     False forzado arriba para tier production)
+    //
+    // NOTA: NO seteamos log_level=debug. Genera ruido excesivo de werkzeug,
+    // sql_db, modules.loading, etc. — usable solo para debugging puntual.
+    // Si el dev necesita traces de algo específico, edita odoo.conf manualmente
+    // con log_handler granular (ej. `log_handler = odoo.addons.mi_modulo:DEBUG`).
+    if opts.tier.is_dev_like() {
+        upsert_key(&mut lines, "dev_mode", "reload,qweb,xml");
+        upsert_key(&mut lines, "limit_time_cpu", "600");
+        upsert_key(&mut lines, "limit_time_real", "1200");
+        upsert_key(&mut lines, "list_db", "True");
+    }
+
     fs::write(&conf_path, lines.join("\n") + "\n")?;
-    eprintln!("[NKR-CLONE] odoo.conf actualizado: dbfilter, workers, list_db=False, proxy_mode={}, admin_passwd={}, logfile=/var/log/odoo/odoo.log",
-        proxy_mode_on, if opts.admin_passwd.is_some() { "set" } else { "preserved" });
+    eprintln!("[NKR-CLONE] odoo.conf actualizado: dbfilter, workers, list_db={}, proxy_mode={}, admin_passwd={}, logfile=/var/log/odoo/odoo.log, tier={:?}{}",
+        if opts.tier.is_dev_like() { "True (dev/staging)" } else { "False" },
+        proxy_mode_on,
+        if opts.admin_passwd.is_some() { "set" } else { "preserved" },
+        opts.tier,
+        if opts.tier.is_dev_like() { ", dev_mode=reload,qweb,xml log_level=debug" } else { "" });
     Ok(())
 }
 
@@ -2297,6 +2366,7 @@ pub fn get_instance_info(nkr_name: &str) -> Result<InstanceInfo, Box<dyn std::er
             limit_memory_soft: None,
             limit_memory_hard: None,
             addons_path: None,
+            tier: Tier::default(),
             created_at: 0,
         }
     });

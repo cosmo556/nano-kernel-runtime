@@ -31,7 +31,7 @@ use crate::api_http::{is_safe_addons_path, is_safe_dns, is_safe_identifier};
 use crate::cell::{
     clone_instance_with_opts, count_odoo_instances, delete_instance,
     ensure_cell_prefix, get_instance_info, load_cell, lookup_cell_id,
-    patch_odoo_conf, select_cell_for_version, CloneOptions, Edition, InstanceMode,
+    patch_odoo_conf, select_cell_for_version, CloneOptions, Edition, InstanceMode, Tier,
     MAX_ODOOS_PER_CELL,
 };
 use crate::ipc::IpcResponse;
@@ -45,7 +45,12 @@ pub struct CreateInstanceReq {
     /// Instance name. Can be short ("tst-1") or full ("company_client-tst-1");
     /// it auto-prefixes with the cell name if missing.
     pub nkr_name: String,
-    /// `dev` (clone with DB) or `production` (clone without DB).
+    /// `dev` (clone with DB) o `production` (clone without DB). **Opcional.**
+    /// Default `production`. **Sólo aplica cuando `tier=production`** (legacy).
+    /// Cuando se manda `tier=staging` o `tier=dev`, este campo es ignorado
+    /// (el tier dicta la semántica internamente). Tip: el panel puede mandar
+    /// solo `tier` y olvidarse de `mode`.
+    #[serde(default)]
     pub mode: InstanceMode,
     /// Required: each cell supports a single Odoo version; the panel
     /// sends it and the backend validates the cell matches.
@@ -97,6 +102,27 @@ pub struct CreateInstanceReq {
     /// inflating beyond half the guest RAM can stall the guest.
     #[serde(default)]
     pub balloon_mb: Option<u32>,
+    /// Tier de la instancia: `production` (default), `staging` o `dev`.
+    /// Determina sizing, dev_mode (hot-reload), rate-limit y cache nginx.
+    /// Reglas de bootstrap:
+    /// - `production`: comportamiento actual (source opcional, default = primer
+    ///   instance alfabético de la cell como template).
+    /// - `staging`: REQUIERE `source` (clona DB de un tenant production existente).
+    ///   No se puede crear staging sin source. Workers=1 forzado, dev_mode on.
+    /// - `dev`: NO acepta `source` (rechazado). Arranca con DB vacía via
+    ///   /web/database/create. Workers=1 forzado, dev_mode on. Las instancias
+    ///   dev no son clonables (no se pueden usar como source).
+    /// Si se omite, default `production` (back-compat).
+    #[serde(default)]
+    pub tier: Tier,
+    /// **Opcional.** Override de `chrs` (CPU quota cgroup; 1 chr = 20% de un
+    /// core). Si se omite, NKR aplica el default por tier:
+    /// - production: `(2N+1)` donde N=workers (5 chrs para workers=2)
+    /// - staging/dev: 10 chrs (= 2 cores quota, dev iteration friendly)
+    /// Rango válido: 1..=50. chrs es QUOTA, no reserva — los chrs no usados
+    /// quedan disponibles para otros tenants.
+    #[serde(default)]
+    pub chrs: Option<u32>,
 }
 
 /// Recursos derivados a partir del workers count. Single source of truth para
@@ -125,15 +151,38 @@ pub struct DerivedResources {
 }
 
 pub fn derive_resources(workers: u32) -> DerivedResources {
-    let w = workers as u64;
-    let ram_mb: u32 = 1024 * workers;
-    let limit_memory_soft: u64 = 400 * w * 1024 * 1024;
-    let limit_memory_hard: u64 = 750 * w * 1024 * 1024;
+    derive_resources_for_tier(workers, Tier::Production)
+}
+
+/// Variante tier-aware de `derive_resources`.
+/// Para `Staging`/`Dev` (perfil fijo, NO modificable desde panel):
+///   - workers=1 forzado.
+///   - ram base=2GB.
+///   - chrs=5 (= quota de 1 core full). Suficiente para iteración dev — asset
+///     compile + debugger sin throttling, sin sobrecargar la cell.
+///   El panel NO puede overridear estos valores en POST /instances ni en
+///   PATCH /config. Si querés más recursos, promové el tenant a production.
+/// Production usa la lógica original (sizing por workers) y acepta override
+/// de `chrs` desde el panel (rango 1..=50).
+pub fn derive_resources_for_tier(workers: u32, tier: Tier) -> DerivedResources {
+    let effective_workers = if tier.is_dev_like() { 1 } else { workers };
+    let w = effective_workers as u64;
+
+    let (ram_mb, limit_memory_soft, limit_memory_hard, chrs) = if tier.is_dev_like() {
+        let ram_mb: u32 = 2048;
+        let soft: u64 = 1536 * 1024 * 1024;  // 1.5 GB
+        let hard: u64 = 1843 * 1024 * 1024;  // 1.8 GB
+        let chrs: u32 = 5;                    // 1 core de quota (perfil dev fijo)
+        (ram_mb, soft, hard, chrs)
+    } else {
+        let ram_mb: u32 = 1024 * effective_workers;
+        let soft: u64 = 400 * w * 1024 * 1024;
+        let hard: u64 = 750 * w * 1024 * 1024;
+        let chrs: u32 = (2 * effective_workers) + 1;
+        (ram_mb, soft, hard, chrs)
+    };
 
     // Balloon = ram_mb - limit_memory_hard_mb - 256 MB headroom.
-    // Floor: if the formula yields less than 64 MB the device's overhead
-    // (host bookkeeping, guest driver jitter) outweighs the savings — better
-    // to disable the balloon entirely (0).
     let limit_hard_mb = (limit_memory_hard / (1024 * 1024)) as u32;
     let raw = ram_mb
         .saturating_sub(limit_hard_mb)
@@ -141,8 +190,8 @@ pub fn derive_resources(workers: u32) -> DerivedResources {
     let balloon_mb = if raw < 64 { 0 } else { raw };
 
     DerivedResources {
-        workers,
-        chrs: (2 * workers) + 1,
+        workers: effective_workers,
+        chrs,
         ram_mb,
         limit_memory_soft,
         limit_memory_hard,
@@ -387,23 +436,101 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
         );
     }
 
-    // Source resolution (regla nueva, v1.6+):
-    //   - mode=production: NKR fuerza source = "<cell>-odoo-template" (DB del
-    //     template vacío, base+web preinstalados). Panel NO debe mandar
-    //     `source` (si lo manda → 409).
-    //   - mode=dev: panel DEBE mandar `source` apuntando al tenant a clonar
-    //     (ej. clonar producción para staging). Si falta → 400.
-    let source = match req.mode {
-        InstanceMode::Production => {
+    // Source resolution: el tier determina las reglas. Ver la doc de `Tier`.
+    //   - tier=production (default): comportamiento legacy según `mode`.
+    //     · mode=production: source PROHIBIDO, NKR usa template de cell.
+    //     · mode=dev: source REQUERIDO (clone de otro tenant).
+    //   - tier=staging: source REQUERIDO + el source DEBE ser tier=production.
+    //     Mantenemos staging clonable de prod para reproducir bugs con datos
+    //     reales. Internamente clonamos como `mode=dev` (DB completa).
+    //   - tier=dev: source PROHIBIDO. Internamente clonamos como
+    //     `mode=production` (DB del template, vacía) — el dev hidrata módulos
+    //     desde Apps. Bootstrap de DB completamente fresca queda para sesión
+    //     futura (hoy reusamos template_DB del cell).
+    //
+    // El tier también fuerza `effective_mode` para mantener consistencia:
+    // staging→Dev (clone full), dev→Production (cell template).
+    let effective_mode = match req.tier {
+        Tier::Production => req.mode,
+        Tier::Staging => InstanceMode::Dev,
+        Tier::Dev => InstanceMode::Production,
+    };
+
+    let source = match req.tier {
+        Tier::Production => match req.mode {
+            InstanceMode::Production => {
+                if req.source.is_some() {
+                    return IpcResponse::json(409, serde_json::json!({
+                        "error": "source_not_allowed_in_production",
+                        "message": "mode=production siempre clona del template de la cell. Para clonar de otro tenant usá mode=dev con 'source' explícito o tier=staging.",
+                        "cell": resolved_cell.name,
+                    }));
+                }
+                let tpl = format!("{}-odoo-template", resolved_cell.name);
+                let tpl_dir = crate::cell::cells_dir()
+                    .join(&resolved_cell.name)
+                    .join("instances")
+                    .join(&tpl);
+                if !tpl_dir.exists() {
+                    return IpcResponse::json(409, serde_json::json!({
+                        "error": "cell_template_missing",
+                        "message": format!("La cell '{}' no tiene template '{}'. Crearlo o reseed la cell.", resolved_cell.name, tpl),
+                        "cell": resolved_cell.name,
+                        "expected_template": tpl,
+                    }));
+                }
+                tpl
+            }
+            InstanceMode::Dev => match req.source.clone() {
+                Some(s) => s,
+                None => {
+                    return IpcResponse::error(400, "source_required",
+                        Some("mode=dev requiere 'source' explícito (nkr_name del tenant fuente). Para crear un tenant fresh usá mode=production."));
+                }
+            },
+        },
+        Tier::Staging => {
+            let s = match req.source.clone() {
+                Some(s) => s,
+                None => {
+                    return IpcResponse::error(400, "source_required",
+                        Some("tier=staging requiere 'source' explícito (nkr_name del tenant production a clonar)."));
+                }
+            };
+            // Validar que el source sea tier=production. Leemos su meta.json.
+            // Si el meta.json no existe (tenant sin metadata) o no tiene tier,
+            // asumimos production (back-compat con instancias previas a esta
+            // feature). Solo bloqueamos si meta.json existe Y tiene tier
+            // explícito staging/dev.
+            let src_meta_path = crate::cell::cells_dir()
+                .join(&resolved_cell.name)
+                .join("instances")
+                .join(&s)
+                .join("meta.json");
+            if let Ok(buf) = std::fs::read(&src_meta_path) {
+                if let Ok(src_meta) = serde_json::from_slice::<crate::cell::InstanceMeta>(&buf) {
+                    if src_meta.tier != Tier::Production {
+                        return IpcResponse::json(409, serde_json::json!({
+                            "error": "source_must_be_production",
+                            "message": format!("tier=staging solo puede clonar de un tenant tier=production. Source '{}' es tier={:?}.",
+                                s, src_meta.tier),
+                            "source": s,
+                            "source_tier": src_meta.tier,
+                        }));
+                    }
+                }
+            }
+            s
+        }
+        Tier::Dev => {
             if req.source.is_some() {
                 return IpcResponse::json(409, serde_json::json!({
-                    "error": "source_not_allowed_in_production",
-                    "message": "mode=production siempre clona del template de la cell. Para clonar de otro tenant usá mode=dev con 'source' explícito.",
+                    "error": "source_not_allowed_in_dev",
+                    "message": "tier=dev no acepta 'source' (las instancias dev son standalone, no clonables). Para clonar de prod usá tier=staging.",
                     "cell": resolved_cell.name,
                 }));
             }
             let tpl = format!("{}-odoo-template", resolved_cell.name);
-            // Sanity: existe el template en disco?
             let tpl_dir = crate::cell::cells_dir()
                 .join(&resolved_cell.name)
                 .join("instances")
@@ -418,20 +545,42 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
             }
             tpl
         }
-        InstanceMode::Dev => match req.source.clone() {
-            Some(s) => s,
-            None => {
-                return IpcResponse::error(400, "source_required",
-                    Some("mode=dev requiere 'source' explícito (nkr_name del tenant fuente). Para crear un tenant fresh usá mode=production."));
-            }
-        },
     };
 
     let dst_name = ensure_cell_prefix(&resolved_cell.name, &req.nkr_name);
 
-    // Derivar TODOS los recursos a partir de workers (single source of truth).
-    // Si el panel omitió workers → default 2.
-    let r = derive_resources(req.workers.unwrap_or(2));
+    // Derivar TODOS los recursos a partir de workers + tier. Para tier
+    // staging/dev: se fuerza workers=1 + ram=2GB internamente (ver
+    // derive_resources_for_tier). Si el panel envió workers=N para staging,
+    // se ignora y se loguea un debug aviso (no error — el valor era una
+    // sugerencia que tier=staging contradice por diseño).
+    if req.tier.is_dev_like() && req.workers.is_some() && req.workers != Some(1) {
+        eprintln!("[API] {}: tier={:?} fuerza workers=1 (panel pidió {}), ignorando.",
+            req.nkr_name, req.tier, req.workers.unwrap());
+    }
+    let r = derive_resources_for_tier(req.workers.unwrap_or(2), req.tier);
+
+    // Override de chrs SOLO en tier=production. Para dev/staging el perfil
+    // es fijo (2GB + chrs=5 forzado) y se ignora cualquier override del
+    // panel — si el dev necesita más CPU, el operador promueve a production.
+    let effective_chrs = if req.tier.is_dev_like() {
+        if req.chrs.is_some() && req.chrs != Some(r.chrs) {
+            eprintln!("[API] {}: tier={:?} fuerza chrs={} (panel pidió {}), ignorando.",
+                req.nkr_name, req.tier, r.chrs, req.chrs.unwrap());
+        }
+        r.chrs
+    } else {
+        match req.chrs {
+            Some(c) => {
+                if !(1..=50).contains(&c) {
+                    return IpcResponse::error(400, "invalid_chrs",
+                        Some("chrs must be 1..=50 (1 chr = 20% de un core)"));
+                }
+                c
+            }
+            None => r.chrs,
+        }
+    };
 
     // Si el panel pide edition=enterprise, validar que la cell tenga el repo
     // enterprise descargado. Sin esto el tenant arrancaría con manifests
@@ -470,7 +619,7 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
     let admin_passwd_to_persist = req.admin_passwd.clone();
 
     let opts = CloneOptions {
-        mode: req.mode,
+        mode: effective_mode,
         no_compose: false,
         dns: req.dns,
         edition: req.edition,
@@ -485,13 +634,10 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
         admin_passwd: Some(admin_passwd_to_persist),
         proxy_mode: req.proxy_mode,
         ram_mb: Some(r.ram_mb),
-        chrs: Some(r.chrs),
-        // Balloon: if the panel passed an explicit `balloon_mb`, it wins.
-        // Otherwise we apply the derived default (`r.balloon_mb`), which is
-        // computed from `workers` to leave Odoo enough working set under
-        // peak load (see `derive_resources` for the formula).
+        chrs: Some(effective_chrs),
         balloon_mb: Some(req.balloon_mb.unwrap_or(r.balloon_mb)),
-        skip_db_clone: false, // HTTP API always clones the DB.
+        skip_db_clone: false,
+        tier: req.tier,
     };
 
     let admin_user_pwd = req.admin_user_password.clone();
@@ -1575,8 +1721,11 @@ pub fn handle_create_dns(nkr_name: &str, dns: &str, enable_ws: bool) -> IpcRespo
         }
     }
 
-    // 2. Generar vhost.
-    let vhost_body = render_tenant_vhost(nkr_name, dns, &guest_ip, enable_ws);
+    // 2. Generar vhost. El tier de la instancia (production / staging / dev)
+    // determina si se aplica rate-limit en /web/login + cache nginx en
+    // /web/static y /web/assets. Para tier dev-like, todo eso se desactiva
+    // para que el dev iterando no se topa con caches/throttling.
+    let vhost_body = render_tenant_vhost(nkr_name, dns, &guest_ip, enable_ws, info.meta.tier);
     let vhost_path = format!("{}/{}", NGINX_SITES_AVAILABLE, nkr_name);
     if let Err(e) = std::fs::write(&vhost_path, &vhost_body) {
         return IpcResponse::error(500, "vhost_write_failed", Some(&e.to_string()));
@@ -2030,9 +2179,10 @@ fn http_post_form(host: &str, port: u16, path: &str, body: &str, timeout_secs: u
     Ok((code, body_part))
 }
 
-fn render_tenant_vhost(nkr_name: &str, dns: &str, guest_ip: &str, enable_ws: bool) -> String {
+fn render_tenant_vhost(nkr_name: &str, dns: &str, guest_ip: &str, enable_ws: bool, tier: Tier) -> String {
     let http_upstream = format!("up_{}", nkr_name.replace('-', "_"));
     let ws_upstream = format!("{}_ws", http_upstream);
+    let dev_like = tier.is_dev_like();
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -2066,6 +2216,11 @@ server {{
     include /etc/nginx/snippets/nkr-ssl.conf;
     # Hardening universal: bloquea .php/.env/.git/.zip + paths CMS (444 close).
     include /etc/nginx/snippets/nkr-hardening.conf;
+    # Edge dual: real-IP rewriting cuando CF está proxied. En modo direct
+    # (DNS-only) este snippet es no-op porque ningún IP del cliente cae en
+    # los rangos CF. Switch entre modos se hace en CF (panel flipea
+    # `proxied: true|false`), NKR no requiere cambios. Ver NKR_API.md §7.1.
+    include /etc/nginx/snippets/nkr-real-ip.conf;
 
     client_max_body_size 200M;
     proxy_read_timeout 720s;
@@ -2076,10 +2231,15 @@ server {{
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
 
-    # Rate limit anti brute-force sobre login + database manager.
+"));
+    // Rate limit /web/login: SOLO en tier=production. Para dev/staging, el
+    // operador hace muchos logins probando código y el throttle confunde.
+    if !dev_like {
+        out.push_str(&format!(
+"    # Rate limit anti brute-force sobre login + database manager.
     # Burst 5 nodelay: 5 reqs simultáneos pasan; 6to en adelante 429.
-    # Funciona porque CF NO está proxied (DNS-only) y $binary_remote_addr
-    # es la IP real del atacante, no del edge CF.
+    # $binary_remote_addr funciona en AMBOS modos de edge (direct/CF proxied)
+    # gracias al snippet nkr-real-ip.conf incluido arriba.
     location ~ ^/web/(login|database/selector|database/manager) {{
         limit_req zone=nkr_login_limit burst=5 nodelay;
         limit_req_status 429;
@@ -2087,6 +2247,15 @@ server {{
     }}
 
 "));
+    } else {
+        out.push_str(&format!(
+"    # tier={tier:?}: sin rate-limit en /web/login (iteración dev sin throttle).
+    location ~ ^/web/(login|database/selector|database/manager) {{
+        proxy_pass http://{http_upstream};
+    }}
+
+"));
+    }
     if enable_ws {
         out.push_str(&format!(
 "    # WebSocket / long-polling → :8072 (gevent worker)
@@ -2105,7 +2274,12 @@ server {{
 
 "));
     }
-    out.push_str(&format!(
+    // Cache nginx en /web/static/* y /web/assets/<hash>/*: SOLO en
+    // tier=production. Para dev/staging, los assets recién compilados pueden
+    // venir cacheados del request anterior y confunden ("toqué el archivo y
+    // el browser sigue mostrando el viejo"). Mejor sin cache para iteración.
+    if !dev_like {
+        out.push_str(&format!(
 "    # /web/static/* — assets de módulos (img, fonts, css de módulos).
     # Cache server-side 24h. proxy_buffering on local: el server padre
     # tiene buffering off (necesario para SSE/long-polling), pero cache
@@ -2140,7 +2314,24 @@ server {{
         add_header Cache-Control \"public, immutable, max-age=2592000\" always;
     }}
 
-    location / {{
+"));
+    } else {
+        out.push_str(&format!(
+"    # tier={tier:?}: cache nginx desactivado, no-cache headers para forzar
+    # al browser a re-bajar assets en cada request (iteración dev limpia).
+    location /web/static/ {{
+        proxy_pass http://{http_upstream};
+        add_header Cache-Control \"no-cache, no-store, must-revalidate\" always;
+    }}
+    location ~ ^/web/assets/[a-f0-9]+/ {{
+        proxy_pass http://{http_upstream};
+        add_header Cache-Control \"no-cache, no-store, must-revalidate\" always;
+    }}
+
+"));
+    }
+    out.push_str(&format!(
+"    location / {{
         proxy_pass http://{http_upstream};
     }}
 }}
@@ -2159,6 +2350,13 @@ pub struct PatchConfigReq {
     /// reescribe atómicamente. Rango 1..=16.
     #[serde(default)]
     pub workers: Option<u32>,
+    /// Override de chrs (CPU quota cgroup). Si se manda, NKR escribe ese
+    /// valor en el compose y aplica al próximo restart. Si se omite junto a
+    /// `workers`, mantiene el chrs actual del compose. Rango 1..=50.
+    /// Útil para upgradear momentáneamente la CPU de un tenant en horarios
+    /// pico sin tocar workers (ej. fin de mes contable).
+    #[serde(default)]
+    pub chrs: Option<u32>,
 
     // ─── SMTP saliente del tenant ───────────────────────────────────────────
     // El panel manda estos campos cuando quiere configurar el servidor de mail
@@ -2223,11 +2421,17 @@ pub fn handle_patch_config(nkr_name: &str, body_json: &str) -> IpcResponse {
         Err(_) => return IpcResponse::error(400, "invalid_json", None),
     };
 
-    // workers es la única input de sizing; el resto se deriva.
+    // workers es input de sizing; el resto se deriva. chrs es override opcional.
     if let Some(w) = req.workers {
         if !(1..=16).contains(&w) {
             return IpcResponse::error(400, "invalid_workers",
                 Some("workers must be 1..=16"));
+        }
+    }
+    if let Some(c) = req.chrs {
+        if !(1..=50).contains(&c) {
+            return IpcResponse::error(400, "invalid_chrs",
+                Some("chrs must be 1..=50 (1 chr = 20% de un core)"));
         }
     }
     if let Some(ref host) = req.smtp_server {
@@ -2266,6 +2470,22 @@ pub fn handle_patch_config(nkr_name: &str, body_json: &str) -> IpcResponse {
         Ok(i) => i,
         Err(_) => return IpcResponse::error(404, "instance_not_found", None),
     };
+
+    // Tenants dev/staging tienen perfil fijo (2GB + workers=1 + chrs=5).
+    // Si el panel intenta overridear workers o chrs en una instancia dev-like,
+    // 409: tienen que promover a production primero (cambiar tier en meta.json
+    // — endpoint PATCH /tier no implementado todavía, requiere edit manual).
+    if info.meta.tier.is_dev_like() && (req.workers.is_some() || req.chrs.is_some()) {
+        return IpcResponse::json(409, serde_json::json!({
+            "error": "sizing_locked_for_tier",
+            "message": format!("tier={:?} tiene perfil fijo (workers=1, ram=2GB, chrs=5). \
+                                Para overridear sizing, promover el tenant a production primero.",
+                info.meta.tier),
+            "tier": info.meta.tier,
+            "locked_fields": ["workers", "chrs"],
+            "remediation": "Editar meta.json a mano (tier=production) + restart, o esperar a que se exponga PATCH /tier.",
+        }));
+    }
 
     // Construir set de upserts. Solo entran los campos que el panel mandó.
     let mut upserts: Vec<(String, String)> = Vec::new();
@@ -2336,15 +2556,28 @@ pub fn handle_patch_config(nkr_name: &str, body_json: &str) -> IpcResponse {
     }
     if let Some(ref r) = workers_resources {
         // When workers changes we re-derive ALL the compose-level resources
-        // that depend on it: ram, chrs, and balloon_mb. Keeping balloon in
-        // sync with ram is critical — leaving the old balloon when ram grows
-        // wastes density; leaving it when ram shrinks can starve Odoo.
+        // that depend on it: ram, chrs (override del panel gana), balloon_mb.
+        // Keeping balloon in sync with ram is critical — leaving the old
+        // balloon when ram grows wastes density; leaving it when ram shrinks
+        // can starve Odoo.
+        let final_chrs = req.chrs.unwrap_or(r.chrs);
         if let Err(e) = crate::cell::patch_compose_block_resources(
-            nkr_name, Some(r.ram_mb), Some(r.chrs), Some(r.balloon_mb))
+            nkr_name, Some(r.ram_mb), Some(final_chrs), Some(r.balloon_mb))
         {
             eprintln!("[API] patch_config({}) compose failed: {}", nkr_name, e);
             return IpcResponse::error(500, "patch_compose_failed", Some(&e.to_string()));
         }
+        restart_required = true;
+    } else if let Some(c) = req.chrs {
+        // chrs solo (sin workers): patch puntual del compose, no re-deriva
+        // ram/balloon. Útil para boost de CPU sin reescribir todo el sizing.
+        if let Err(e) = crate::cell::patch_compose_block_resources(
+            nkr_name, None, Some(c), None)
+        {
+            eprintln!("[API] patch_config({}) compose chrs-only failed: {}", nkr_name, e);
+            return IpcResponse::error(500, "patch_compose_failed", Some(&e.to_string()));
+        }
+        applied.push("chrs");
         restart_required = true;
     }
 

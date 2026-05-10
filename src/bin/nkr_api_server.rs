@@ -626,7 +626,8 @@ fn handle_addons_git(cell: &str, instance: &str, body: &[u8]) -> HttpResponse {
 
     let sha = git_head_sha(&tmp_target).unwrap_or_else(|| "unknown".to_string());
 
-    // Detectar layout y explotear.
+    // Detectar layout y explotear. Devuelve además el diff per-módulo
+    // (added/updated/unchanged) basado en tree-hash git per-módulo.
     let explode_result = explode_modules(
         &tmp_target,
         &addons_dir,
@@ -640,15 +641,95 @@ fn handle_addons_git(cell: &str, instance: &str, body: &[u8]) -> HttpResponse {
     let _ = std::fs::remove_dir_all(&tmp_target);
 
     match explode_result {
-        Ok(modules) => HttpResponse::json(200, serde_json::json!({
+        Ok(deploy) => HttpResponse::json(200, serde_json::json!({
             "repo_url": req.repo_url,
             "ref": req.reference,
             "sha": sha,
-            "module_count": modules.len(),
-            "modules": modules,
+            "module_count": deploy.modules.len(),
+            "modules": deploy.modules,
+            "added": deploy.added,
+            "updated": deploy.updated,
+            "unchanged": deploy.unchanged,
         })),
         Err(err_resp) => err_resp,
     }
+}
+
+/// Resultado de `explode_modules`: lista plana de módulos publicados +
+/// clasificación por diff vs el estado previo del addons/ (basado en
+/// tree-hash git per-módulo guardado en `.nkr-source`).
+struct ExplodeResult {
+    modules: Vec<String>,    // back-compat: nombres en orden de descubrimiento
+    added: Vec<String>,      // no existían antes en addons/
+    updated: Vec<String>,    // existían y el tree-hash cambió
+    unchanged: Vec<String>,  // existían y el tree-hash es idéntico
+}
+
+/// Encuentra el directorio git "más cercano" subiendo desde `start` hasta
+/// `ceiling` (inclusive). En el caso de submódulos hay múltiples .git en
+/// el árbol; cada módulo debe usar el suyo (el del submódulo) o el del
+/// padre, según donde viva.
+///
+/// `.git` puede ser un dir (repo normal) o un archivo (puntero al
+/// `.git/modules/<name>` del padre cuando es submódulo). Ambos cuentan.
+fn nearest_git_root(
+    start: &std::path::Path,
+    ceiling: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let mut cur = start.to_path_buf();
+    loop {
+        if cur.join(".git").exists() {
+            return Some(cur);
+        }
+        if cur == *ceiling {
+            return None;
+        }
+        match cur.parent() {
+            Some(p) if p.starts_with(ceiling) || p == ceiling => cur = p.to_path_buf(),
+            _ => return None,
+        }
+    }
+}
+
+/// Llama `git rev-parse HEAD:<rel_path>` para obtener el tree-hash (SHA-1
+/// hex de 40 chars) del subdir dentro del repo. Es determinístico — cualquier
+/// cambio en el contenido recursivo del subdir produce un hash distinto.
+/// Devuelve None si git falla o el path no está en HEAD.
+fn git_tree_hash(git_root: &std::path::Path, rel_path: &str) -> Option<String> {
+    let arg = if rel_path.is_empty() || rel_path == "." {
+        "HEAD^{tree}".to_string()
+    } else {
+        format!("HEAD:{}", rel_path)
+    };
+    let out = std::process::Command::new("git")
+        .arg("-C").arg(git_root)
+        .arg("rev-parse").arg(&arg)
+        .output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let trimmed = s.trim();
+    if trimmed.len() != 40 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Lee `content_hash=<sha>` de un `.nkr-source` existente. Devuelve None si
+/// el archivo no existe, no tiene la línea, o el formato es inválido.
+fn read_prev_content_hash(module_dir: &str) -> Option<String> {
+    let path = format!("{}/.nkr-source", module_dir);
+    let s = std::fs::read_to_string(&path).ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("content_hash=") {
+            let h = rest.trim();
+            if h.len() == 40 && h.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(h.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Walks `tmp_dir` recursively looking for any directory whose entry list
@@ -800,7 +881,7 @@ fn explode_modules(
     repo_url: &str,
     reference: Option<&str>,
     sha: &str,
-) -> Result<Vec<String>, HttpResponse> {
+) -> Result<ExplodeResult, HttpResponse> {
     let tmp = std::path::Path::new(tmp_dir);
     let manifest_at_root = tmp.join("__manifest__.py").exists();
     let has_submodules = tmp.join(".gitmodules").is_file();
@@ -961,12 +1042,60 @@ fn explode_modules(
         })));
     }
 
+    // Pre-compute per-module content hash ANTES del rename. Para cada módulo
+    // buscamos el `.git` más cercano arriba (puede ser el del repo padre o
+    // el de un submódulo) y corremos `git rev-parse HEAD:<rel>`. El tree-hash
+    // de un dir cambia ⟺ cambió cualquier archivo dentro recursivamente.
+    //
+    // Side-effect: leemos también el hash previo guardado en
+    // `addons/<m>/.nkr-source` (si existe) para clasificar added/updated/
+    // unchanged. El hash previo se lee ANTES del remove_dir_all del rename.
+    let tmp_path = std::path::Path::new(tmp_dir);
+    let mut new_hashes: Vec<Option<String>> = Vec::with_capacity(modules.len());
+    let mut prev_hashes: Vec<Option<String>> = Vec::with_capacity(modules.len());
+    for (src_path, m) in &modules {
+        let new_hash = if !has_submodules && manifest_at_root {
+            // Single-module: el módulo ES el repo. Tree-hash de HEAD.
+            git_tree_hash(tmp_path, "")
+        } else {
+            // Walk up para encontrar el .git más cercano (parent o submódulo).
+            match nearest_git_root(src_path, tmp_path) {
+                Some(git_root) => {
+                    let rel = src_path.strip_prefix(&git_root)
+                        .ok()
+                        .and_then(|p| p.to_str())
+                        .unwrap_or("");
+                    git_tree_hash(&git_root, rel)
+                }
+                None => None,
+            }
+        };
+        new_hashes.push(new_hash);
+
+        let dst = format!("{}/{}", addons_dir, m);
+        prev_hashes.push(read_prev_content_hash(&dst));
+    }
+
     // Mover cada módulo a su posición final. fs::rename es atómico en el
     // mismo filesystem, por módulo. La iteración multi-módulo no es
     // atómica en agregado — si el daemon muere a la mitad del loop, queda
     // mezcla. Deuda preexistente (no introducida por submódulos), ver
     // AUDIT_GH.md §4.6 sobre renameat2 para resolverlo.
     let mut module_names: Vec<String> = Vec::with_capacity(modules.len());
+    let mut added: Vec<String> = Vec::new();
+    let mut updated: Vec<String> = Vec::new();
+    let mut unchanged: Vec<String> = Vec::new();
+
+    let classify = |m: &str, prev: &Option<String>, new: &Option<String>,
+                    added: &mut Vec<String>, updated: &mut Vec<String>,
+                    unchanged: &mut Vec<String>| {
+        match (prev, new) {
+            (None, _) => added.push(m.to_string()),
+            (Some(p), Some(n)) if p == n => unchanged.push(m.to_string()),
+            (Some(_), _) => updated.push(m.to_string()),
+        }
+    };
+
     if !has_submodules && manifest_at_root {
         // Single-module legacy: rename del tmp entero como bloque.
         let m = &modules[0].1;
@@ -976,13 +1105,16 @@ fn explode_modules(
             return Err(HttpResponse::error(500, "move_failed",
                 Some(&format!("rename {} → {}: {}", tmp_dir, dst, e))));
         }
-        write_nkr_source(&dst, repo_url, reference, sha);
+        let new_hash = new_hashes[0].clone().unwrap_or_default();
+        write_nkr_source(&dst, repo_url, reference, sha, &new_hash);
+        classify(m, &prev_hashes[0], &new_hashes[0],
+                 &mut added, &mut updated, &mut unchanged);
         module_names.push(m.clone());
     } else {
         // Multi-módulo o submódulos jerárquicos: rename por módulo desde
         // su src_path (que en el caso de submódulos puede estar a
         // profundidad arbitraria del tmp).
-        for (src_path, m) in &modules {
+        for (idx, (src_path, m)) in modules.iter().enumerate() {
             let dst = format!("{}/{}", addons_dir, m);
             let _ = std::fs::remove_dir_all(&dst);
             if let Err(e) = std::fs::rename(src_path, &dst) {
@@ -990,20 +1122,35 @@ fn explode_modules(
                     Some(&format!("rename {} → {}: {}",
                         src_path.display(), dst, e))));
             }
-            write_nkr_source(&dst, repo_url, reference, sha);
+            let new_hash = new_hashes[idx].clone().unwrap_or_default();
+            write_nkr_source(&dst, repo_url, reference, sha, &new_hash);
+            classify(m, &prev_hashes[idx], &new_hashes[idx],
+                     &mut added, &mut updated, &mut unchanged);
             module_names.push(m.clone());
         }
     }
 
-    Ok(module_names)
+    Ok(ExplodeResult {
+        modules: module_names,
+        added,
+        updated,
+        unchanged,
+    })
 }
 
-fn write_nkr_source(module_dir: &str, repo_url: &str, reference: Option<&str>, sha: &str) {
+fn write_nkr_source(
+    module_dir: &str,
+    repo_url: &str,
+    reference: Option<&str>,
+    sha: &str,
+    content_hash: &str,
+) {
     let content = format!(
-        "repo_url={}\nref={}\nsha={}\n",
+        "repo_url={}\nref={}\nsha={}\ncontent_hash={}\n",
         repo_url,
         reference.unwrap_or(""),
         sha,
+        content_hash,
     );
     let _ = std::fs::write(format!("{}/.nkr-source", module_dir), content);
 }

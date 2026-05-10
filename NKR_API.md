@@ -38,7 +38,11 @@ export TOK="Authorization: Bearer $NKR_API_TOKEN"
   1. `POST /instances` con `mode=production` (cliente nuevo) o `mode=dev + source` (clone de tenant existente). NKR clona archivos + DB.
   2. `POST /addons/git` / `PUT /pylibs` — opcional, con VM apagada.
   3. `POST /actions {action:"start"}` — devuelve `202` en <50 ms (async desde v1.5.1). El boot real tarda ~30-60 s; el panel **debe polear** `GET /instances/{name}` → `nkr_status.phase` hasta `loading|ready`.
-  4. Updates posteriores (git pull de addons, pip install nuevo) → `POST /actions {action:"restart"}` (también async — ver §4.8).
+  4. Updates posteriores — **la estrategia depende del tier** (ver §7.0):
+     - **`tier=staging` o `tier=dev`** (con `dev_mode=reload` activo): `POST /addons/git` y listo. El watcher inotify de Odoo detecta el cambio en `.py` y reinicia los workers automáticamente en ~2 s. **No llamar restart NI upgrade**.
+     - **`tier=production`, módulo NUEVO**: `POST /addons/git` y listo. Visible para Install desde Apps (UI). No requiere restart.
+     - **`tier=production`, módulo ya instalado que cambió código**: `POST /addons/git` + `POST /actions {action:"restart"}`. **NO usar `POST /modules/upgrade` automático en multi-worker** — solo refresca código en el worker que procesa el upgrade, los demás siguen con código viejo (gotcha conocido de Odoo en `workers≥2`). El restart es la opción correcta para garantizar que TODOS los workers cargan el código nuevo. Tiempo: ~15-25s de downtime con el initramfs v1.6.1+ (timer drain reducido a 5s). En workflows con CI/CD apuntando a prod, el restart automático tras git push es válido — solo asegurate de que el panel polee `nkr_status.port_8069_up` para no servir tráfico mid-restart.
+     - **Cambio de pip libs / odoo.conf / kernel** (cualquier tier): requiere `POST /actions {action:"restart"}`.
 - **Para probar sin romper nada**: usá nombres con prefijo `test-` o `smoke-`. El endpoint `DELETE` te los limpia después (incluye drop de DB). Ver §12 al final.
 
 ### Primer request de prueba
@@ -155,12 +159,13 @@ El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la 
 ```json
 {
   "nkr_name": "cliente-42",
-  "mode": "dev",
+  "tier": "production",
   "odoo_version": "17.0",
   "admin_passwd": "panel-lo-genera-y-guarda-encriptado-16-a-128-chars",
   "workers": 2,
   "dns": "cliente-42.systemouts.com",
   "edition": "community",
+  "mode": "production",
   "proxy_mode": null,
   "source": null,
   "cell": null,
@@ -171,7 +176,18 @@ El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la 
 }
 ```
 
-**Campos obligatorios:** `nkr_name`, `mode`, `odoo_version`, `admin_passwd`. Todo lo demás es opcional.
+**Campos obligatorios:** `nkr_name`, `odoo_version`, `admin_passwd`. Todo lo demás es opcional.
+
+**`tier` vs `mode` — orden de prioridad:**
+- Si mandás **`tier`** (recomendado, ver §7.0): NKR ignora `mode` y aplica las reglas del tier:
+  - `tier=production` → comportamiento legacy (cell template, sin source).
+  - `tier=staging` → clona DB de un tenant production (source REQUERIDO).
+  - `tier=dev` → standalone con DB del template, sin source (rejected si lo mandás).
+- Si **NO** mandás `tier`: default `tier=production`. Entonces `mode` controla:
+  - `mode=production` (default si tampoco se manda) → cell template, sin source.
+  - `mode=dev` → clone de tenant existente, source REQUERIDO.
+
+**Tip:** mandar solo `tier` y olvidarse de `mode`. `mode` queda para back-compat con paneles que no conocen el campo `tier` todavía.
 
 **Sizing — `workers` es la única input.** El panel sólo manda `workers` (entero). NKR deriva automáticamente el resto:
 - **Compose (VM-level):** `chrs` (CPU quota cgroup, 1 chr = 20 % de un core), `ram` (MB de RAM física que KVM asigna al guest), `balloon_mb` (MB que el guest devuelve al host vía VirtIO-Balloon en el boot).
@@ -179,8 +195,11 @@ El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la 
 
 | Campo | Valor | Efecto |
 |-------|-------|--------|
-| `mode` | `"production"` | **Tenant fresh para cliente nuevo.** NKR clona archivos + DB del template `<cell>-odoo-template` (DB con base+web preinstalados, sin datos). `source` no se debe mandar — NKR lo fuerza al template. Boot rápido (~30-60 s). |
-| `mode` | `"dev"` | **Clone de un tenant existente** (typical: clonar producción para staging). `source` **obligatorio** (nkr_name del tenant a clonar). NKR hace `CREATE DATABASE ... TEMPLATE` desde la DB del source. |
+| `tier` | `"production"` (default si se omite) | **Tenant productivo** con sizing real (workers≥2), rate-limit en /web/login, cache nginx. Para módulo nuevo en prod, restart manual o automatizado tras webhook. Ver §7.0. |
+| `tier` | `"staging"` | Workers=1, RAM 2GB, `dev_mode=reload,qweb,xml`. Clona DB de un tenant `tier=production` (source REQUERIDO). Para reproducir bugs con datos reales sin tocar prod. Ver §7.0. |
+| `tier` | `"dev"` | Igual config que staging pero standalone — DB del template (sin source). Source PROHIBIDO (rejected con 409). Las dev no son clonables. Ideal para módulos nuevos desde cero. Ver §7.0. |
+| `mode` | `"production"` (default, **opcional** si mandás `tier`) | **Legacy / back-compat.** Cuando `tier=production`: tenant fresh con DB del template, sin source. NKR fuerza `source = <cell>-odoo-template`. Cuando se manda `tier=staging`/`tier=dev`, este campo se ignora. |
+| `mode` | `"dev"` (**opcional**) | **Legacy / back-compat.** Cuando `tier=production`: clone de un tenant existente — `source` obligatorio. Para el caso "clonar de producción para testing" usar `tier=staging` (más explícito y aplica config dev). |
 | `cell` | `null` | Auto-selecciona la cell con `odoo_version` match y menos `used_odoos`. |
 | `cell` | `"foo"` | Fuerza esa cell; 409 si versión no matchea o está llena. |
 | `source` | `null` (con `mode=production`) | NKR usa `<cell>-odoo-template` automáticamente. **No mandar source en mode=production**: si lo mandás, 409 `source_not_allowed_in_production`. |
@@ -447,22 +466,58 @@ NKR mantiene un slot por `nkr_name` mientras la acción está en vuelo (evita ra
 | Acción | Duración real | Notas |
 |---|---|---|
 | `start` | 5–15 s | `nkr compose up -d` + boot kernel + Odoo inicializa workers. |
-| `stop` | 1–30 s (típ. 2–5) | SIGTERM + drain de workers + cleanup. PG con checkpoint puede subir a 60 s. |
-| `restart` | 5–35 s | stop + 200 ms + start. `skip_warmup=true` en clones evita los 55 s de warmup HTTP. |
+| `stop` | 1–10 s (típ. 2–5) | SIGTERM + drain de workers + cleanup. **Path generic** (Odoo, pgbouncer, otros): timer drain 5s desde v1.6.1, era 25s. **Path postgres**: timer propio de 15s (lee `postmaster.pid`, hace SIGTERM coordinado al postmaster). |
+| `restart` | **5–25 s** (Odoo / pgbouncer) / 20–40 s (postgres) | stop + 200 ms + start. Tenants Odoo y pgbouncer: ~25s post-v1.6.1 (path generic con timer 5s). Postgres: ~20-40s (15s SIGTERM coordinado + checkpoint final). `skip_warmup=true` en clones evita los 55 s de warmup HTTP. |
 
-**Cómo el panel debe orquestar un webhook (`git push` → restart):**
+**Nota:** los tiempos arriba aplican a **instancias creadas o re-iniciadas después de v1.6.1** (con el initramfs nuevo que reduce el timer de drain genérico de 25s → 5s). Instancias creadas previamente usan el initramfs viejo hasta su próximo `compose up` (ahí se regenera). Para forzar la regeneración: `nkr compose down && nkr compose up -d` desde el dir de la cell.
+
+**Cómo el panel debe orquestar un webhook (`git push`):**
+
+**La estrategia depende del tier del tenant** (ver §7.0):
+
 ```
-1. POST /addons/git { action:"sync" }      → 200 con sha nuevo
-2. POST /actions    { action:"restart" }   → 202 instantáneo (async:true)
-3. while (true):                              ← polling
-     info = GET /instances/{name}
-     if info.nkr_status.port_8069_up: break
-     if elapsed > 180s: alert; break
-     sleep 1s
-4. log "[panel] restart OK en Xs, sha=…"
+tier=staging o tier=dev (con dev_mode=reload activo):
+─────────────────────────────────────────────────────
+1. POST /addons/git                     → 200 con sha + diff
+2. (NADA MÁS — el inotify watcher de Odoo detecta el cambio en
+   .py y reinicia los workers automáticamente en ~2 segundos)
+
+Total: ~5-7 segundos. Cero llamadas extra al API.
+
+tier=production:
+────────────────
+1. POST /addons/git                     → 200 con sha + diff
+2. POST /actions { action:"restart" }   → 202 instantáneo (async)
+3. Polear GET /instance hasta nkr_status.port_8069_up == true
+   (típicamente ~15-25s post-v1.6.1).
+
+Total: ~20-30s. Restart es la herramienta correcta — garantiza que
+TODOS los workers reinician con código fresco del disco.
+
+⚠️  NO automatizar `POST /modules/upgrade` en producción multi-worker.
+Razón: solo refresca código en el worker que procesa el upgrade —
+los demás workers siguen con el código viejo en sys.modules
+(gotcha conocido de Odoo cuando workers≥2). El usuario que pega un
+worker "no upgradeado" ve comportamiento del código viejo, sin error
+visible. Es un bug silencioso. Para reflejar cambios de código en
+TODOS los workers, restart es la única opción confiable.
+
+upgrade es válido SOLO para:
+  - Cambios de schema (campos nuevos en models, vistas XML nuevas)
+    que requieren correr migraciones — pero esos también necesitan
+    restart después para que el código en memoria coincida.
+  - Tenants con workers=1 (tier=staging/dev) — ahí no hay otros
+    workers que queden con código viejo.
 ```
 
-Si entre (2) y (3) el panel mete otro `POST /actions` (típico en CI con re-runs), el segundo recibe `409 action_in_progress` — **no es un fallo**, simplemente hay que polear hasta que el primero termine y luego decidir si re-disparar.
+Si entre llamadas el panel mete otro `POST /actions` o `POST /modules/{op}` para la misma instancia, el segundo recibe `409 action_in_progress` — **no es un fallo**, polear hasta que el primero termine.
+
+**Tiempos comparados (mismo cambio: 1 módulo OCA con código Python modificado):**
+| Tier | Estrategia | Tiempo total | Garantía de refresh en TODOS los workers |
+|------|-----------|--------------|-------------------------------------------|
+| `staging` / `dev` | `addons/git` (inotify reload) | **~5-7 s** | ✅ (workers=1, todos al día siempre) |
+| `production` | `addons/git` + `actions {restart}` | **~20-30 s** (post-v1.6.1) | ✅ (full restart, todos los workers fresh) |
+| `production` | `addons/git` + `modules/upgrade` | 10-15 s | ❌ (solo el worker upgrader; los demás con código viejo) ⚠️ |
 
 ### 4.8.1 `nkr_status` — campos y máquina de estados
 
@@ -656,9 +711,23 @@ instances/<tenant>/addons/
   "module_count": 5,
   "modules":  ["account_chart_update", "account_payment_term_extension",
                "account_journal_lock_date", "account_move_name_sequence",
-               "account_fiscal_year"]
+               "account_fiscal_year"],
+  "added":     ["account_fiscal_year"],
+  "updated":   ["account_chart_update"],
+  "unchanged": ["account_payment_term_extension",
+                "account_journal_lock_date",
+                "account_move_name_sequence"]
 }
 ```
+
+**Diff per-módulo (`added` / `updated` / `unchanged`):** NKR computa `git rev-parse HEAD:<path>` per-módulo (tree-hash determinístico) y lo persiste en `.nkr-source` (campo `content_hash`). Al próximo `POST /addons/git`:
+- **`added`** — el módulo no existía antes en `addons/`, o el `.nkr-source` previo no tenía `content_hash` (caso de migración: primer push después de upgrade a v1.6.1+). El panel debe tratarlo como "disponible para Install" — no requiere `upgrade`.
+- **`updated`** — existía y el tree-hash cambió. La acción correcta depende del tier (ver §7.0 + §4.8): `tier=staging`/`tier=dev` → nada (inotify reload automático). `tier=production` → `POST /actions {restart}` (NO `/modules/upgrade` automático: en multi-worker solo refresca un worker, los demás siguen viejo). Si el módulo no estaba instalado, basta con Install desde Apps cuando convenga.
+- **`unchanged`** — existía y el tree-hash es idéntico. **Cero acción necesaria** (típico cuando el push no tocó ese módulo). Permite al panel evitar `upgrade` innecesarios.
+
+**Granularidad**: el diff funciona uniformemente con cualquier layout (single-module, multi-módulo, submódulos profundos). Para repos multi-módulo el tree-hash es **per-subdir**, así que un commit que sólo toca `module-a/` reporta `module-a` en `updated` y el resto en `unchanged`. Para submódulos: el `.git` más cercano al módulo es el del submódulo, y NKR usa ese para el rev-parse.
+
+**Limitación conocida (migración):** las instancias creadas antes de v1.6.1 tienen `.nkr-source` sin `content_hash`. El primer `POST /addons/git` después de upgradear NKR clasificará TODO como `added` aunque los módulos no hayan cambiado realmente — falso positivo benigno (no rompe nada, sólo el diff es ruidoso ese deploy). Llamadas subsecuentes funcionan correctamente.
 
 **Errores:**
 - `400 invalid_repo_url` — URL fuera del whitelist o con metacaracteres de shell.
@@ -698,7 +767,15 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 # → { "module_count": 1, "modules": ["propio"] }
 ```
 
-**Para que Odoo vea los módulos nuevos:** después del clone el panel debe (1) `POST /actions {action:"restart"}` para que Odoo recargue manifests y los módulos aparezcan en la tabla `ir_module_module`, o (2) en la UI ir a Apps → Update Apps List. **Sin restart o Update Apps List los módulos siguen invisibles aunque estén físicamente en `addons/`.**
+**Para que Odoo vea los módulos nuevos** (que físicamente ya están en `/mnt/extra-addons` después del clone, propagados por virtio-fs en tiempo real):
+
+| Escenario | Acción recomendada | Tiempo |
+|-----------|-------------------|--------|
+| **Módulo nuevo** (no estaba antes) | UI Odoo → Apps → "Update Apps List" → Install. **Sin restart.** El path ya está en `addons_path` desde el primer boot. | <1 s + duración del Install |
+| **Módulo ya instalado que cambió código** | `POST /modules/upgrade` con `{modules:["mod"]}` (§4.17). Odoo recarga in-process. | 10-15 s |
+| **Módulo nuevo, panel quiere automatizar sin UI** | Hoy falla — `install` busca el módulo en `ir_module_module` y no lo encuentra (update_list no corrió). Workaround: el panel ejecuta `update_list` vía `/psql` antes del install, o hace el flow vía UI. | n/a |
+
+**El `POST /actions {action:"restart"}` ya NO es la recomendación primaria** para módulos. Es overkill: tarda 60-70 s (mayormente shutdown gracioso del guest, ver §4.8) y reinicia toda la VM cuando Odoo puede recargar el código en-proceso vía `upgrade`. Reservalo para cambios fuera del ámbito de Odoo (pip libs, `odoo.conf` keys non-hot-reloadable, etc.).
 
 **Timeout:** 180s. Si el repo es muy grande, el panel debería hacer el clone en vertientes (primero `--depth 1`, después fetch de refs adicionales).
 
@@ -1631,6 +1708,207 @@ curl -s http://127.0.0.1:9090/api/v1/health
 NKR_API_BASE = https://nkr.cliente.com     (nginx al frente → 127.0.0.1:9090)
 NKR_API_TOKEN = <token compartido>
 ```
+
+---
+
+## 7.0 Tiers de instancia (`production` / `staging` / `dev`)
+
+NKR diferencia 3 tiers para que **dev iteración no pague el costo del rate-limit + cache + multi-worker upgrade gotcha** que tiene production. El tier se manda en el body de `POST /instances` (campo opcional `tier`, default `production`).
+
+### Tabla comparativa
+
+| Aspecto | `production` (default) | `staging` | `dev` |
+|---------|------------------------|-----------|-------|
+| **Workers** | configurable (default 2) | **forzado a 1** | **forzado a 1** |
+| **RAM guest** | derivado de workers (1024·N MB) | **forzado a 2 GB** | **forzado a 2 GB** |
+| **chrs (CPU quota)** | `(2N+1)`: 5 chrs (workers=2), 9 (workers=4). **Override desde panel via `chrs` en POST/PATCH** (rango 1..=50). | **5 chrs (= 1 core quota), perfil fijo, NO override** | **5 chrs (= 1 core quota), perfil fijo, NO override** |
+| **`limit_memory_soft/hard`** | proporcional a workers | 1.5 GB / 1.8 GB | 1.5 GB / 1.8 GB |
+| **`limit_time_cpu/real`** | 60s / 120s (Odoo default) | 600s / 1200s (debugger-friendly) | 600s / 1200s |
+| **`dev_mode` en odoo.conf** | (vacío) | `reload,qweb,xml` | `reload,qweb,xml` |
+| **`log_level`** | info | info (no se cambia — debug genera demasiado ruido) | info (idem) |
+| **`list_db`** | False | True | True |
+| **Rate-limit nginx en /web/login** | 5 burst + 3r/s | desactivado | desactivado |
+| **Cache nginx /web/static y /web/assets** | 24h / 30d | desactivado | desactivado |
+| **Cloneable como `source`?** | sí | no | **no** (instancias dev son standalone) |
+| **Requiere `source` en POST /instances** | opcional (default = template de cell) | **REQUERIDO** (debe ser tier=production) | **PROHIBIDO** (rejected con 409) |
+| **DB inicial** | template_DB de la cell (vacío bootstrap) | clone de la DB del source production | template_DB de la cell |
+| **Reflejo de cambio de código Python** | requiere full restart de VM (~70s) | inotify watcher (`dev_mode=reload`) → ~2s | inotify watcher → ~2s |
+
+### `dev_mode = reload,qweb,xml` — el game changer
+
+Cuando tier es staging o dev, NKR escribe en `odoo.conf`:
+```ini
+dev_mode = reload,qweb,xml
+```
+
+Esto activa en Odoo:
+- **`reload`**: filesystem watcher (inotify) sobre el `addons_path`. Cualquier cambio en un `.py` mata los workers y los respawnea con código fresco. **~2 segundos** vs los 70s de `POST /actions {restart}` en multi-worker.
+- **`qweb`**: re-renderiza templates QWeb sin cache.
+- **`xml`**: re-carga views XML sin necesidad de `Apps → Upgrade`.
+
+Para tu workflow de iteración:
+```
+git push (modules) → webhook → panel → POST /addons/git → 5s
+                                       ↓
+                                  inotify detecta cambio en .py
+                                       ↓
+                                  workers respawn con código nuevo
+                                       ↓
+                                  ~2s después: el cambio está vivo
+```
+
+Sin necesidad de `restart`, sin necesidad de `upgrade` (excepto para schema changes, donde sí va Apps → Upgrade desde la UI).
+
+### Reglas de bootstrap
+
+**`tier=production`** (comportamiento actual, sin cambios):
+- `mode=production` + sin `source` → clona del `<cell>-odoo-template`
+- `mode=dev` + `source` → clona de ese tenant
+
+**`tier=staging`**:
+- `source` REQUERIDO. Debe apuntar a un tenant tier=production existente.
+- NKR clona DB completa (igual que `mode=dev` legacy) pero aplica config dev.
+- Si `source` apunta a un tenant tier=staging o tier=dev → 409 `source_must_be_production`.
+
+**`tier=dev`**:
+- `source` PROHIBIDO. Si se manda → 409 `source_not_allowed_in_dev`.
+- NKR usa `<cell>-odoo-template` como fuente (DB del template).
+- Para desarrollo de módulos nuevos desde cero. El dev hidrata módulos desde Apps.
+
+### Ejemplos curl
+
+**Crear staging** (clon de un cliente production para reproducir bug):
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  http://nkr-api.cliente.com/api/v1/instances \
+  -d '{
+    "nkr_name": "cliente-staging-bug42",
+    "tier": "staging",
+    "source": "company_client-cliente-prod",
+    "odoo_version": "17.0",
+    "dns": "cliente-staging-bug42.dev.tudominio.com",
+    "admin_passwd": "Adm.16chars.MinPwd-..."
+  }'
+```
+
+**Crear dev** (módulo nuevo en sandbox limpio):
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  http://nkr-api.cliente.com/api/v1/instances \
+  -d '{
+    "nkr_name": "mi-nuevo-modulo-dev",
+    "tier": "dev",
+    "odoo_version": "17.0",
+    "dns": "mi-nuevo-modulo.dev.tudominio.com",
+    "admin_passwd": "Adm.16chars.MinPwd-..."
+  }'
+```
+
+### Errores específicos
+
+| HTTP | error | Cuándo |
+|------|-------|--------|
+| 400 | `source_required` | tier=staging sin `source` |
+| 409 | `source_not_allowed_in_dev` | tier=dev con `source` (instancias dev no clonables) |
+| 409 | `source_must_be_production` | tier=staging con `source` apuntando a otro staging/dev |
+
+### Migración de tenants existentes
+
+Tenants creados antes de v1.6.1 (sin campo `tier` en su `meta.json`) se interpretan como **`tier=production`** automáticamente (back-compat). El daemon escribe `tier: "production"` en sucesivas mutaciones del meta.
+
+Si querés cambiar el tier de un tenant existente: NO hay endpoint `PATCH /tier` todavía (planeado para sesión futura). Workaround temporal: editar `meta.json` a mano y `POST /actions {restart}`.
+
+---
+
+## 7.1 Edge dual: Cloudflare proxied + direct (failover sin downtime)
+
+NKR soporta **dos modos de edge** simultáneamente, con switch instantáneo desde el panel sin tocar el host. La idea: estar cubierto si Cloudflare se cae sin perder la protección que da CF cuando está disponible.
+
+### Modos
+
+| Modo | Tráfico | Protección | Dependencia |
+|------|---------|-----------|-------------|
+| **`cloudflare` (proxied / 🟧)** | client → CF anycast → host → guest Odoo | WAF + DDoS + bot mgmt + CDN + rate-limit global de CF + nginx local | Salud de CF |
+| **`direct` (DNS-only / 🟦)** | client → host → guest Odoo | Solo nginx local (hardening 444 + rate-limit /web/login) | Cero |
+
+El switch entre modos lo hace el panel **flipando el flag `proxied` del DNS record en Cloudflare** (vía CF API). Propagación: 1-5 min. NKR no requiere reload de nginx ni cambios runtime — la config soporta ambos modos a la vez.
+
+### Cómo nginx soporta ambos modos transparentemente
+
+NKR vhost incluye `/etc/nginx/snippets/nkr-real-ip.conf` que declara los rangos IPv4/IPv6 oficiales de Cloudflare (lista pública en `https://www.cloudflare.com/ips-v4/` y `/ips-v6/`):
+
+```nginx
+set_real_ip_from 173.245.48.0/20;
+set_real_ip_from 103.21.244.0/22;
+... (15 rangos IPv4 + 7 IPv6)
+real_ip_header CF-Connecting-IP;
+real_ip_recursive on;
+```
+
+Comportamiento:
+- **Si traffic viene de un IP de CF** → nginx **reescribe** `$remote_addr` al valor del header `CF-Connecting-IP` (la IP real del cliente final). El rate-limit y access log usan automáticamente la IP correcta.
+- **Si traffic NO viene de CF** (modo direct) → `$remote_addr` ya es la IP real del cliente. Mismo rate-limit, mismo log, sin diferencias.
+
+Resultado: **el rate-limit `nkr_login_limit` y los `add_header X-Real-IP $remote_addr` funcionan idénticos en ambos modos sin reconfigurar nada**. El panel solo flipea CF.
+
+### Responsabilidad del panel
+
+El panel guarda credenciales de Cloudflare (API token + `zone_id` por dominio raíz) y expone un toggle por instancia (o global por dominio):
+
+```
+[ Edge Mode for aintech.oa-odoo.com ]
+  ( ) 🟧 Cloudflare proxied (recomendado por default)
+  ( ) 🟦 Direct (fallback si CF tiene incidentes)
+```
+
+Cuando el operador clickea, el panel hace:
+```bash
+# Flipear a CF proxied
+curl -X PATCH -H "Authorization: Bearer $CF_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"proxied": true}' \
+  https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID
+
+# Flipear a direct
+curl -X PATCH -H "Authorization: Bearer $CF_API_TOKEN" \
+  ... -d '{"proxied": false}'
+```
+
+**NKR no participa en este call** — Cloudflare API es directo desde el panel. Esto evita que credenciales CF estén en el host NKR (defense in depth).
+
+### SSL/TLS
+
+- **Modo direct**: el cert Let's Encrypt del host sirve directamente al cliente (renovación vía `/.well-known/acme-challenge/` que ya existe en el vhost).
+- **Modo CF proxied**: CF termina TLS al cliente. CF→origin debe usar **"Full (strict)"** en CF SSL/TLS settings. El cert LE del host valida correctamente porque CF resuelve por SNI igual que un browser.
+- **Renovación LE en modo proxied**: `certbot` necesita acceso al `/.well-known/acme-challenge/` del host. Con CF en proxied + cache, hay que excluir el path del cache (CF lo hace por default para `*.acme-challenge*`). Si falla la renovación: flipear a direct temporalmente, renovar, volver a proxied.
+
+### Auto-failover (opcional, fuera de NKR)
+
+Si querés failover automático cuando CF se cae:
+1. Panel hace health-check periódico contra CF (ej. `https://www.cloudflare.com/cdn-cgi/trace`).
+2. Si N fallos consecutivos → flipea TODOS los DNS records de tus dominios a `proxied: false`.
+3. Cuando CF vuelve → flipea de vuelta.
+
+**Riesgo**: false positives. Si el panel detecta mal "CF caído" cuando solo hubo glitch local, flipea a direct innecesariamente. **Recomendación: empezar con switch manual** y agregar auto-failover solo si la frecuencia de incidentes CF lo justifica.
+
+### Limitación conocida — IPs de CF
+
+NKR mantiene la lista de rangos CF en el snippet `nkr-real-ip.conf` (15 IPv4 + 7 IPv6 al momento de escribir). Cloudflare actualiza estos rangos raramente (~1 cambio/año), pero si agregan un rango nuevo, hay que regenerar el snippet. Comando manual para refresh:
+
+```bash
+# Re-generar la lista canónica (script idempotente)
+{
+  echo "# Cloudflare IPv4 — regenerar con: curl https://www.cloudflare.com/ips-v4"
+  curl -s https://www.cloudflare.com/ips-v4 | sed 's/^/set_real_ip_from /; s/$/;/'
+  echo "# Cloudflare IPv6"
+  curl -s https://www.cloudflare.com/ips-v6 | sed 's/^/set_real_ip_from /; s/$/;/'
+  echo "real_ip_header CF-Connecting-IP;"
+  echo "real_ip_recursive on;"
+} > /etc/nginx/snippets/nkr-real-ip.conf
+nginx -t && systemctl reload nginx
+```
+
+Si NKR detecta que un IP fuera de la lista CF está enviando `CF-Connecting-IP` headers (potencial spoof), nginx **ignora** el header y mantiene `$remote_addr` como el IP del conector (correcto, defensivo).
 
 ---
 

@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "nkr",
-    version = "1.3.0",
-    about = "NKR — Nano-Kernel Runtime v1.3 Full Elastic Connection: Contenedores ultra-rápidos con micro-VMs",
+    version = "1.6.1",
+    about = "NKR — Nano-Kernel Runtime v1.6.1: tier system + edge dual + faster restart",
     long_about = "NKR reemplaza Docker usando micro-VMs con KVM.\nCada contenedor corre en su propia VM con aislamiento total y acceso directo al hardware."
 )]
 pub struct Cli {
