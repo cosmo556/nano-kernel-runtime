@@ -1,6 +1,6 @@
 [package]
 name = "nkr"
-version = "1.6.1"
+version = "1.6.4"
 edition = "2021"
 authors = ["NKR Contributors"]
 description = """
@@ -34,6 +34,9 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
 io-uring = "0.6"       # Feature B — async I/O para block y net (degradación silenciosa en kernel < 5.1)
+hmac = "0.12"          # SSO: HMAC-SHA256 sobre el session_id firmado entregado al browser
+sha2 = "0.10"          # idem (backend de hmac)
+base64 = "0.22"        # idem (encoding URL-safe del payload firmado)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Binary targets

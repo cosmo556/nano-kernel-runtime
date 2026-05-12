@@ -147,56 +147,141 @@ pub struct DerivedResources {
     pub ram_mb: u32,
     pub limit_memory_soft: u64, // bytes
     pub limit_memory_hard: u64, // bytes
+    /// Target ACTIVE del balloon — VALOR DE BOOT (MB inflados al arrancar).
+    /// La VM debe nacer en ACTIVE para que Odoo tenga RAM suficiente para
+    /// bootstrap; si arrancara en IDLE (squeeze a 256 MB en DEV) el OOM
+    /// killer del guest masacraría a Odoo durante el load de módulos.
     pub balloon_mb: u32,
+    /// Target IDLE del balloon — al cual transiciona la VM tras
+    /// `balloon_decay_secs` sin renovación SIGUSR2. Si == `balloon_mb`,
+    /// la VM se queda estática (sin transición). PROD: == 0 (siempre ACTIVE,
+    /// sin decay, doctrina anti-latencia). DEV/STAG: != balloon_mb (dinámico).
+    pub balloon_idle_mb: u32,
 }
 
 pub fn derive_resources(workers: u32) -> DerivedResources {
     derive_resources_for_tier(workers, Tier::Production)
 }
 
-/// Variante tier-aware de `derive_resources`.
-/// Para `Staging`/`Dev` (perfil fijo, NO modificable desde panel):
-///   - workers=1 forzado.
-///   - ram base=2GB.
-///   - chrs=5 (= quota de 1 core full). Suficiente para iteración dev — asset
-///     compile + debugger sin throttling, sin sobrecargar la cell.
-///   El panel NO puede overridear estos valores en POST /instances ni en
-///   PATCH /config. Si querés más recursos, promové el tenant a production.
-/// Production usa la lógica original (sizing por workers) y acepta override
-/// de `chrs` desde el panel (rango 1..=50).
+/// Tier-aware resource derivation. **Aplica SOLO a tenants Odoo creados via
+/// API.** Las VMs de pg/pgbouncer (creadas vía `nkr compose up` desde YAML)
+/// no pasan por este flow — siguen su propio sizing en cell.yml.
+///
+/// Tabla canónica (CLAUDE.md v2.2 + ajuste v1.6.2 post-OOM Odoo 19):
+///
+/// | Tier    | VM RAM  | Workers | Soft  | Hard   | Bal ACTIVE (boot) | Bal IDLE (post-decay) | Decay |
+/// |---------|---------|---------|-------|--------|-------------------|------------------------|-------|
+/// | DEV     | 1300 MB | 0       | 800   | 1000   | 0                 | 256                    | 600s  |
+/// | STAGING | 1024 MB | 0       | 600   | 700    | 256               | 768                    | 600s  |
+/// | PROD    | 2048 MB | 2       | 640×W | 768×W  | 0                 | 0                      | n/a   |
+///
+/// DEV se subió de 768→1300 MB y soft/hard 400/512→800/1000 (v1.6.2 tras
+/// observar `Server memory limit reached` ciclando con Odoo 19 + 31 módulos
+/// custom en threaded mode — el soft de 400 MB era inalcanzable bajo carga
+/// normal de DEV).
+///
+/// Ballooning IDLE/ACTIVE (CLAUDE.md v2.2):
+///   - **La VM nace ACTIVE**: balloon_mb es el target de boot. Para DEV es 0
+///     (toda la RAM al guest), para STAG 256, para PROD 0.
+///   - Tras `balloon_decay_secs` (600s = 10 min) sin renovación SIGUSR2 desde
+///     el panel, vmm transiciona a IDLE: balloon = VM_RAM - 256 (la VM se
+///     queda con el mínimo del kernel, máxima densidad para el host).
+///   - PROD se queda en ACTIVE estáticamente (balloon_idle_mb == balloon_mb
+///     == 0) — el state machine no se activa cuando ambos coinciden.
+///     Doctrina: "PROD evita latencia de desinflado en picos de tráfico".
+///   - **Por qué nacer en ACTIVE**: si la VM arrancara en IDLE (DEV con 256 MB
+///     reales), Odoo no completaría bootstrap — kernel + initramfs + Odoo
+///     necesitan >256 MB. El OOM killer del guest masacraría init antes de
+///     que Odoo levante el puerto 8069. Doctrina cita explícita:
+///     "La VM NUNCA puede bajar de 256 MB de RAM real disponible".
+///
+/// workers=0 = Odoo threaded mode (un solo proceso werkzeug multi-thread,
+/// SIN master prefork). `dev_mode` queda VACÍO (v1.6.3 — `reload` agota
+/// inotify en virtio-fs, `qweb,xml` recompila templates en cada request →
+/// cuelgues; ver BUG_inotify_dev_mode.md). Iteración rápida vía REL_OD/HVC0:
+/// `POST /reload` → SIGTERM al proceso → el supervisor loop de nkr-start.sh
+/// lo respawnea con código fresh del disco.
+///
+/// PROD con workers≥4: ver `validate_workers_ram_budget()` para la fórmula
+/// `VM_RAM >= 256 + 256 + W*768` y la regla del Grifo (balloon=0 si W>4).
 pub fn derive_resources_for_tier(workers: u32, tier: Tier) -> DerivedResources {
-    let effective_workers = if tier.is_dev_like() { 1 } else { workers };
-    let w = effective_workers as u64;
-
-    let (ram_mb, limit_memory_soft, limit_memory_hard, chrs) = if tier.is_dev_like() {
-        let ram_mb: u32 = 2048;
-        let soft: u64 = 1536 * 1024 * 1024;  // 1.5 GB
-        let hard: u64 = 1843 * 1024 * 1024;  // 1.8 GB
-        let chrs: u32 = 5;                    // 1 core de quota (perfil dev fijo)
-        (ram_mb, soft, hard, chrs)
-    } else {
-        let ram_mb: u32 = 1024 * effective_workers;
-        let soft: u64 = 400 * w * 1024 * 1024;
-        let hard: u64 = 750 * w * 1024 * 1024;
-        let chrs: u32 = (2 * effective_workers) + 1;
-        (ram_mb, soft, hard, chrs)
-    };
-
-    // Balloon = ram_mb - limit_memory_hard_mb - 256 MB headroom.
-    let limit_hard_mb = (limit_memory_hard / (1024 * 1024)) as u32;
-    let raw = ram_mb
-        .saturating_sub(limit_hard_mb)
-        .saturating_sub(256);
-    let balloon_mb = if raw < 64 { 0 } else { raw };
-
-    DerivedResources {
-        workers: effective_workers,
-        chrs,
-        ram_mb,
-        limit_memory_soft,
-        limit_memory_hard,
-        balloon_mb,
+    match tier {
+        Tier::Dev => DerivedResources {
+            workers: 0,
+            chrs: 5,
+            ram_mb: 1300,
+            limit_memory_soft: 800 * 1024 * 1024,
+            limit_memory_hard: 1000 * 1024 * 1024,
+            balloon_mb: 0,            // ACTIVE (boot): toda la RAM al guest
+            // IDLE post-decay conservador: 256 MB squeeze. Deja 1044 MB al
+            // guest, suficiente para Odoo idle sin chocar con el hard limit
+            // de 1000 MB. (La fórmula clásica ram-256 daría 1044 squeeze →
+            // chocaría con el hard, OOM al primer pico de uso post-IDLE.)
+            balloon_idle_mb: 256,
+        },
+        Tier::Staging => DerivedResources {
+            workers: 0,
+            chrs: 5,
+            ram_mb: 1024,
+            limit_memory_soft: 600 * 1024 * 1024,
+            limit_memory_hard: 700 * 1024 * 1024,
+            balloon_mb: 256,          // ACTIVE (boot): 1024 - 768 = 256 inflados
+            balloon_idle_mb: 768,     // IDLE post-decay: 1024 - 256 = 768
+        },
+        Tier::Production => {
+            let w = workers.max(1);
+            // Fórmula canónica (per-worker × N + master reserve + OS tax):
+            //   VM_RAM ≥ 256 (OS) + 256 (master) + 768 × W
+            // Soft/Hard PER WORKER son los de la tabla.
+            DerivedResources {
+                workers: w,
+                chrs: (2 * w) + 1,
+                // Default: 2 workers → 2048MB. Si la API recibe override de
+                // workers > 2, el caller debe haber pasado el chequeo de
+                // validate_workers_ram_budget. Acá simplemente derivamos.
+                ram_mb: (256 + 256 + 768 * w).max(1024),
+                limit_memory_soft: 640 * (w as u64) * 1024 * 1024,
+                limit_memory_hard: 768 * (w as u64) * 1024 * 1024,
+                // PROD siempre ACTIVE: balloon=0 estático. Con
+                // balloon_idle_mb == balloon_mb, el state machine no se
+                // activa en vmm — sin decay, sin transitions. Doctrine:
+                // "PROD evita latencia de desinflado en picos de tráfico".
+                // También cubre regla del Grifo (W>4 → balloon=0).
+                balloon_mb: 0,
+                balloon_idle_mb: 0,
+            }
+        }
     }
+}
+
+/// Valida overrides de workers contra la fórmula de seguridad de CLAUDE.md
+/// (Reglas del "Grifo" + RAM_INSUFFICIENT_FOR_WORKERS). Solo para tier=
+/// production con override explícito (panel pasa workers > default).
+///
+/// `VM_RAM >= 256 + 256 + (workers × 768)`
+///
+/// Devuelve `Some(error_response)` si falla, `None` si pasa.
+///
+/// Hoy no se llama desde el create flow (ram_mb es derivado por la fórmula
+/// → siempre cumple). Reservada para el día que la API exponga `ram_mb`
+/// override explícito en el body, donde el panel podría violar la fórmula.
+#[allow(dead_code)]
+pub fn validate_workers_ram_budget(workers: u32, ram_mb: u32) -> Option<IpcResponse> {
+    let required = 256u32 + 256u32 + workers.saturating_mul(768);
+    if ram_mb < required {
+        return Some(IpcResponse::json(400, serde_json::json!({
+            "error": "ram_insufficient_for_workers",
+            "message": format!(
+                "VM_RAM {}MB < {} (= 256 OS + 256 master + workers×768). \
+                 Subí ram_mb o bajá workers.",
+                ram_mb, required
+            ),
+            "workers_requested": workers,
+            "ram_mb_provided": ram_mb,
+            "ram_mb_required": required,
+        })));
+    }
+    None
 }
 
 
@@ -554,9 +639,22 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
     // derive_resources_for_tier). Si el panel envió workers=N para staging,
     // se ignora y se loguea un debug aviso (no error — el valor era una
     // sugerencia que tier=staging contradice por diseño).
-    if req.tier.is_dev_like() && req.workers.is_some() && req.workers != Some(1) {
-        eprintln!("[API] {}: tier={:?} fuerza workers=1 (panel pidió {}), ignorando.",
+    if req.tier.is_dev_like() && req.workers.is_some() && req.workers != Some(0) {
+        eprintln!("[API] {}: tier={:?} fuerza workers=0 (threaded, panel pidió {}), ignorando.",
             req.nkr_name, req.tier, req.workers.unwrap());
+    }
+    // Validación per-CLAUDE.md (Reglas del Grifo) — solo aplica a tier=production
+    // con override explícito de workers. Dev/Staging tienen perfil fijo.
+    if matches!(req.tier, Tier::Production) {
+        if let Some(w) = req.workers {
+            if w > 16 {
+                return IpcResponse::error(400, "invalid_workers",
+                    Some("workers must be 1..=16"));
+            }
+            // VM RAM derivado automáticamente cumple la fórmula. Solo si el
+            // panel pasara `ram_mb` explícito (no implementado en el body
+            // actual) tendríamos que validarlo aparte. Por ahora skip.
+        }
     }
     let r = derive_resources_for_tier(req.workers.unwrap_or(2), req.tier);
 
@@ -636,62 +734,220 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
         ram_mb: Some(r.ram_mb),
         chrs: Some(effective_chrs),
         balloon_mb: Some(req.balloon_mb.unwrap_or(r.balloon_mb)),
+        balloon_idle_mb: Some(r.balloon_idle_mb),
+        balloon_decay_secs: Some(600),
         skip_db_clone: false,
         tier: req.tier,
     };
 
     let admin_user_pwd = req.admin_user_password.clone();
-    match clone_instance_with_opts(&source, &dst_name, &opts) {
-        Ok(info) => {
-            // Si el panel envió admin_user_password: NKR garantiza tenant
-            // arrancado + password de login del user admin seteada antes del
-            // 201. Cierra la ventana donde admin/admin (heredada del template)
-            // funciona. Si fail acá, 503 con detalle — el clone ya está hecho
-            // pero no listo para producción.
-            if let Some(new_pwd) = admin_user_pwd {
-                let is_enterprise = matches!(req.edition, Some(crate::cell::Edition::Enterprise));
-                if let Err(e) = boot_and_set_admin_password(&info, &new_pwd, is_enterprise) {
-                    eprintln!("[API] admin_password_setup_failed: {}", e);
-                    return IpcResponse::json(503, serde_json::json!({
-                        "error": "admin_password_setup_failed",
-                        "message": e,
-                        "cell": resolved_cell.name,
-                        "nkr_name": dst_name,
-                        "hint": "Tenant arrancado pero password del user 'admin' sigue siendo 'admin' (default del template). Reintentar via JSON-RPC manual o re-llamar create.",
+    let is_enterprise = matches!(req.edition, Some(crate::cell::Edition::Enterprise));
+    let cell_name = resolved_cell.name.clone();
+
+    // ── Async create (v1.6.4) ──────────────────────────────────────────────
+    // El clone + boot del tenant tarda 30-200s: filesystem reflink + DB
+    // TEMPLATE + `nkr compose up` con readiness wait (que para PROD prefork se
+    // pega al borde de 140s) + opcional set de admin_user_password. Bloquear
+    // el HTTP request hasta el final hacía que clientes con timeout corto
+    // (panel, o Cloudflare ~100s) vieran 504 aunque el create terminara OK
+    // (caso real 2026-05-11, tenant johao-y-richavo: 504 en el panel, tenant
+    // perfectamente creado y corriendo). Ahora: TODA la validación es síncrona
+    // (los 4xx se devuelven al toque), después el clone se despacha en un
+    // thread y se devuelve 202 inmediato. El panel pollea
+    //   GET /api/v1/cells/{cell}/instances/{name}/create-status
+    // hasta status=ready|failed (o GET /instances/{name} hasta phase=ready).
+    // Status file: /mnt/nkr/cells/{cell}/.nkr-creates/{name}.json — vive a
+    // nivel cell (no instancia) para sobrevivir al rollback del clone si falla.
+
+    // Colisión de nombre: si ya existe → 409, el panel no debe re-crear.
+    if get_instance_info(&dst_name).is_ok() {
+        return IpcResponse::json(409, serde_json::json!({
+            "error": "instance_already_exists",
+            "nkr_name": dst_name.clone(),
+            "cell": cell_name.clone(),
+            "message": "ya existe un tenant con ese nombre — GET /instances/{name} para ver su estado.",
+        }));
+    }
+
+    // ¿Hay un create en curso para este nombre? (idempotencia ante reintentos)
+    let status_path = create_status_path(&cell_name, &dst_name);
+    if let Ok(buf) = std::fs::read_to_string(&status_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&buf) {
+            let st = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            let started = v.get("started_at").and_then(|x| x.as_u64()).unwrap_or(0);
+            // 'provisioning' reciente (< 15 min) → 202 idempotente. Si es más
+            // viejo asumimos que el daemon murió a mitad → permitimos re-crear.
+            if st == "provisioning" && now_unix().saturating_sub(started) < 900 {
+                return IpcResponse::json(202, serde_json::json!({
+                    "nkr_name": dst_name.clone(),
+                    "cell": cell_name.clone(),
+                    "status": "accepted",
+                    "async": true,
+                    "message": "ya hay un create en curso para este nombre; poll GET /api/v1/cells/{cell}/instances/{name}/create-status.",
+                    "poll": format!("/api/v1/cells/{}/instances/{}/create-status", cell_name, dst_name),
+                    "job": v,
+                }));
+            }
+        }
+    }
+
+    // Guard atómico in-memory contra dos POST /instances concurrentes del mismo nombre.
+    {
+        let mut set = match inflight_creates().lock() { Ok(s) => s, Err(p) => p.into_inner() };
+        if set.contains(&dst_name) {
+            return IpcResponse::json(409, serde_json::json!({
+                "error": "create_in_progress",
+                "nkr_name": dst_name.clone(),
+                "cell": cell_name.clone(),
+                "message": "ya hay un POST /instances en curso para este nombre.",
+            }));
+        }
+        set.insert(dst_name.clone());
+    }
+
+    // Persistir status 'provisioning' ANTES del spawn — un poll inmediato del
+    // panel debe ver el job en curso, no un 404.
+    let started_at = now_unix();
+    if let Some(dir) = status_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&status_path, serde_json::json!({
+        "nkr_name": dst_name.clone(),
+        "cell": cell_name.clone(),
+        "source": source.clone(),
+        "status": "provisioning",
+        "phase": "cloning",
+        "started_at": started_at,
+    }).to_string());
+
+    let source_owned = source.clone();
+    let dst_owned = dst_name.clone();
+    let cell_owned = cell_name.clone();
+    let status_owned = status_path.clone();
+
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("nkr-create-{}", dst_name))
+        .spawn(move || {
+            let _guard = InflightCreateGuard(dst_owned.clone());
+            let t0 = std::time::Instant::now();
+            let write_status = |v: serde_json::Value| { let _ = std::fs::write(&status_owned, v.to_string()); };
+
+            match clone_instance_with_opts(&source_owned, &dst_owned, &opts) {
+                Ok(info) => {
+                    if let Some(new_pwd) = admin_user_pwd {
+                        write_status(serde_json::json!({
+                            "nkr_name": dst_owned, "cell": cell_owned, "source": source_owned,
+                            "status": "provisioning", "phase": "setting_admin_pwd",
+                            "started_at": started_at,
+                        }));
+                        if let Err(e) = boot_and_set_admin_password(&info, &new_pwd, is_enterprise) {
+                            eprintln!("[API] create({}) async: admin_password_setup_failed: {}", dst_owned, e);
+                            write_status(serde_json::json!({
+                                "nkr_name": dst_owned, "cell": cell_owned, "source": source_owned,
+                                "status": "failed", "phase": "setting_admin_pwd",
+                                "error": "admin_password_setup_failed", "message": e,
+                                "started_at": started_at, "finished_at": now_unix(),
+                                "elapsed_ms": t0.elapsed().as_millis() as u64,
+                                "hint": "El tenant se clonó y arrancó, pero el password del user 'admin' sigue siendo el del template. Reintentar via JSON-RPC/PATCH, o borrar y re-crear.",
+                            }));
+                            return;
+                        }
+                    }
+                    eprintln!("[API] create({}) async ok ({}ms)", dst_owned, t0.elapsed().as_millis());
+                    write_status(serde_json::json!({
+                        "nkr_name": dst_owned, "cell": cell_owned, "source": source_owned,
+                        "status": "ready", "phase": "done",
+                        "started_at": started_at, "finished_at": now_unix(),
+                        "elapsed_ms": t0.elapsed().as_millis() as u64,
+                        "running": info.nkr_status.running,
+                        "port_8069_up": info.nkr_status.port_8069_up,
+                        "guest_ip": info.guest_ip,
+                        "db_name": info.db_name,
+                        "dns": info.dns,
+                    }));
+                }
+                Err(e) => {
+                    eprintln!("[API] create({}) async error ({}ms): {}", dst_owned, t0.elapsed().as_millis(), e);
+                    write_status(serde_json::json!({
+                        "nkr_name": dst_owned, "cell": cell_owned, "source": source_owned,
+                        "status": "failed", "phase": "cloning",
+                        "error": "clone_failed", "message": e.to_string(),
+                        "started_at": started_at, "finished_at": now_unix(),
+                        "elapsed_ms": t0.elapsed().as_millis() as u64,
                     }));
                 }
             }
-            let payload = serde_json::to_value(&info).unwrap_or(serde_json::json!({}));
-            IpcResponse::json(201, payload)
-        }
-        Err(e) => {
-            eprintln!("[API] clone_failed: {}", e);
-            IpcResponse::json(
-                500,
-                serde_json::json!({
-                    "error": "clone_failed",
-                    "message": e.to_string(),
-                    "cell": resolved_cell.name,
-                    "source": source,
-                    "nkr_name": dst_name,
-                }),
-            )
+        });
+
+    if let Err(e) = spawn_result {
+        if let Ok(mut set) = inflight_creates().lock() { set.remove(&dst_name); }
+        let _ = std::fs::remove_file(&status_path);
+        eprintln!("[API] create({}) thread spawn fail: {}", dst_name, e);
+        return IpcResponse::json(503, serde_json::json!({
+            "error": "spawn_failed", "nkr_name": dst_name, "cell": cell_name,
+        }));
+    }
+
+    let poll_path = format!("/api/v1/cells/{}/instances/{}/create-status", cell_name, dst_name);
+    IpcResponse::json(202, serde_json::json!({
+        "nkr_name": dst_name,
+        "cell": cell_name,
+        "source": source,
+        "status": "accepted",
+        "async": true,
+        "message": "create despachado en background (30-200s típico; PROD prefork es más lento). Poll GET /api/v1/cells/{cell}/instances/{name}/create-status hasta status=ready|failed, o GET /instances/{name} hasta nkr_status.phase=ready.",
+        "poll": poll_path,
+        "started_at": started_at,
+    }))
+}
+
+/// `GET /api/v1/cells/{cell}/instances/{name}/create-status` — estado de un
+/// create asíncrono lanzado por `POST /instances`. Lee el status file en
+/// `/mnt/nkr/cells/{cell}/.nkr-creates/{name}.json`. Si no hay registro pero
+/// la instancia existe (creada con un NKR previo síncrono, o el status file ya
+/// se purgó), devuelve `status: ready`. Si no hay ni registro ni instancia → 404.
+pub fn handle_create_status(cell: &str, nkr_name: &str) -> IpcResponse {
+    if !is_safe_identifier(cell) {
+        return IpcResponse::error(400, "invalid_cell", None);
+    }
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    let dst = ensure_cell_prefix(cell, nkr_name);
+    let path = create_status_path(cell, &dst);
+    match std::fs::read_to_string(&path) {
+        Ok(buf) => match serde_json::from_str::<serde_json::Value>(&buf) {
+            Ok(v) => IpcResponse::json(200, v),
+            Err(_) => IpcResponse::json(200, serde_json::json!({
+                "nkr_name": dst, "cell": cell, "status": "unknown",
+                "note": "status file corrupto", "raw": buf,
+            })),
+        },
+        Err(_) => {
+            if let Ok(info) = get_instance_info(&dst) {
+                IpcResponse::json(200, serde_json::json!({
+                    "nkr_name": dst, "cell": cell,
+                    "status": "ready",
+                    "note": "sin registro de create async — la instancia ya existe (creada con NKR previo, o status file purgado)",
+                    "running": info.nkr_status.running,
+                }))
+            } else {
+                IpcResponse::json(404, serde_json::json!({
+                    "error": "no_create_record",
+                    "nkr_name": dst, "cell": cell,
+                    "message": "no hay create en curso ni instancia con ese nombre",
+                }))
+            }
         }
     }
 }
 
-/// Para usuarios que pidieron `admin_user_password` en POST /instances:
-/// (1) `nkr compose up -d` para arrancar el tenant, (2) polling TCP :8069 hasta
-/// que responda, (3) JSON-RPC login admin/admin → res.users.change_password.
-/// Si `is_enterprise=true`, además: (4) `ir.module.module.update_list()` para
-/// registrar manifests de /mnt/extra-enterprise/, y (5) install web_enterprise
-/// para activar el theme enterprise.
-/// Bloquea hasta ~120s + ~3-5min si is_enterprise. Errores propagan al caller.
-fn boot_and_set_admin_password(
-    info: &crate::cell::InstanceInfo,
-    new_pwd: &str,
-    is_enterprise: bool,
-) -> Result<(), String> {
+/// Arranca el tenant (`nkr compose up -d`) y bloquea hasta que el puerto
+/// 8069 responda (max 120s). Idempotente: si la VM ya está arriba, el
+/// compose up detecta y retorna inmediato. Usado tanto por
+/// `boot_and_set_admin_password` (cuando hay admin password) como por
+/// `handle_create` directamente cuando `auto_start=true` sin password.
+fn compose_up_and_wait_ready(info: &crate::cell::InstanceInfo) -> Result<(), String> {
     use std::time::{Duration, Instant};
 
     // 1. Compose up — disparar el tenant. Idempotente: si ya estaba arriba,
@@ -706,25 +962,41 @@ fn boot_and_set_admin_password(
         .status()
         .map_err(|e| format!("compose up spawn: {}", e))?;
 
-    // 2. Wait HTTP :8069 — polling cada 2s, max 120s.
+    // 2. Wait HTTP :8069 — polling cada 2s, max 120s. POST /web/database/list
+    //    es buen probe: no requiere auth, responde 200 cuando Odoo está listo
+    //    para servir requests.
     let host = &info.guest_ip;
     let deadline = Instant::now() + Duration::from_secs(120);
-    let mut http_up = false;
     while Instant::now() < deadline {
         let r = http_post_json(host, 8069, "/web/database/list",
             "{\"jsonrpc\":\"2.0\",\"method\":\"call\",\"params\":{}}",
             None, 3);
         if let Ok((code, _, _)) = r {
             if (200..400).contains(&code) {
-                http_up = true;
-                break;
+                return Ok(());
             }
         }
         std::thread::sleep(Duration::from_secs(2));
     }
-    if !http_up {
-        return Err(format!("tenant {} no respondió :8069 en 120s", host));
-    }
+    Err(format!("tenant {} no respondió :8069 en 120s", host))
+}
+
+/// Para usuarios que pidieron `admin_user_password` en POST /instances:
+/// (1) `nkr compose up -d` para arrancar el tenant, (2) polling TCP :8069 hasta
+/// que responda, (3) JSON-RPC login admin/admin → res.users.change_password.
+/// Si `is_enterprise=true`, además: (4) `ir.module.module.update_list()` para
+/// registrar manifests de /mnt/extra-enterprise/, y (5) install web_enterprise
+/// para activar el theme enterprise.
+/// Bloquea hasta ~120s + ~3-5min si is_enterprise. Errores propagan al caller.
+fn boot_and_set_admin_password(
+    info: &crate::cell::InstanceInfo,
+    new_pwd: &str,
+    is_enterprise: bool,
+) -> Result<(), String> {
+    // 1+2: compose up + wait :8069 — extraído al helper para que el flow
+    // `auto_start=true sin admin_user_password` también lo pueda usar.
+    compose_up_and_wait_ready(info)?;
+    let host = &info.guest_ip;
 
     // 3. JSON-RPC login con admin/admin (default heredada del template).
     let auth_body = serde_json::json!({
@@ -1038,6 +1310,42 @@ impl Drop for InflightActionGuard {
         };
         set.remove(&self.0);
     }
+}
+
+// In-flight set para creates asíncronos (POST /instances). Evita que dos POST
+// concurrentes del mismo nkr_name disparen dos clones a la vez.
+fn inflight_creates() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static INFLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    INFLIGHT.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+struct InflightCreateGuard(String);
+impl Drop for InflightCreateGuard {
+    fn drop(&mut self) {
+        let mut set = match inflight_creates().lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        set.remove(&self.0);
+    }
+}
+
+/// Unix epoch en segundos (best-effort: 0 si el reloj está antes de 1970).
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Path del status file de un create asíncrono. Vive a nivel CELL (no
+/// instancia) para sobrevivir al rollback del clone si éste falla.
+fn create_status_path(cell: &str, dst_name: &str) -> std::path::PathBuf {
+    crate::cell::cells_dir()
+        .join(cell)
+        .join(".nkr-creates")
+        .join(format!("{}.json", dst_name))
 }
 
 pub fn handle_action(nkr_name: &str, action_str: &str) -> IpcResponse {
@@ -1798,6 +2106,33 @@ pub fn handle_create_dns(nkr_name: &str, dns: &str, enable_ws: bool) -> IpcRespo
     }))
 }
 
+/// Auto-seal de `web.base.url` post-init-db (recomendación #4 del panel).
+/// Se invoca al final del job background de `handle_init_db` si la DB se creó
+/// exitosamente. Best-effort: errores se loguean pero no fallan el init-db
+/// (la DB ya está creada y usable).
+///
+/// Si `dns` es None, el tenant no tiene vhost provisionado todavía → no hay
+/// nada que sellar (el panel debe llamar `POST /dns` después, lo cual TAMBIÉN
+/// intenta el seal — el código `base_url_update` del response cubre eso).
+fn auto_seal_base_url(nkr_name: &str, cell: &str, db_name: &str, dns: Option<&str>) {
+    let Some(dns) = dns else {
+        eprintln!("[API] init-db({}) auto-seal skipped: no DNS provisioned yet",
+            nkr_name);
+        return;
+    };
+    let https_url = format!("https://{}", dns);
+    match update_tenant_base_url(cell, db_name, &https_url) {
+        Ok(()) => {
+            eprintln!("[API] init-db({}) auto-sealed web.base.url={}",
+                nkr_name, https_url);
+        }
+        Err(e) => {
+            eprintln!("[API] init-db({}) auto-seal failed (best-effort): {}",
+                nkr_name, e);
+        }
+    }
+}
+
 /// Setea `web.base.url=<https_url>` y `web.base.url.freeze=True` en la DB del
 /// tenant. Si la DB no existe, retorna Err("db_not_present") (caller decide).
 ///
@@ -2014,6 +2349,21 @@ pub fn handle_init_db(
     let admin_login_owned = admin_login.to_string();
     let guest_ip = info.guest_ip.clone();
     let status_path_owned = status_path.clone();
+    // Auto-seal de web.base.url (recomendación #4 del panel): si ya hay vhost
+    // provisionado para este tenant, tras el CREATE DATABASE exitoso sellamos
+    // `web.base.url=https://<dns>` + freeze. Esto cierra la ventana donde
+    // Odoo 19 auto-asignaba el host del primer request (http://...) y rompía
+    // el form de login por mixed-content. Sin esto el panel debía recordar
+    // re-llamar /dns post-init-db.
+    let cell_for_seal = info.cell.clone();
+    let dns_for_seal: Option<String> = {
+        let vhost_path = format!("/etc/nginx/sites-available/{}", nkr_name_owned);
+        if std::path::Path::new(&vhost_path).exists() {
+            info.dns.clone()
+        } else {
+            None
+        }
+    };
     eprintln!("[API] init-db({}) arrancando job background (db={})",
         nkr_name_owned, db_name_owned);
 
@@ -2030,6 +2380,9 @@ pub fn handle_init_db(
             Ok((code, _body_snippet)) if (200..400).contains(&code) => {
                 eprintln!("[API] init-db({}) OK en {}ms (code={})",
                     nkr_name_owned, elapsed_ms, code);
+                // Auto-seal web.base.url si hay DNS provisionado.
+                auto_seal_base_url(&nkr_name_owned, &cell_for_seal,
+                    &db_name_owned, dns_for_seal.as_deref());
                 serde_json::json!({
                     "status": "success",
                     "db_name": db_name_owned,
@@ -2044,6 +2397,10 @@ pub fn handle_init_db(
                 let lowered = body_snippet.to_lowercase();
                 if lowered.contains("already exists") || lowered.contains("database already") {
                     eprintln!("[API] init-db({}) ya existía (idempotente)", nkr_name_owned);
+                    // Idempotente: la DB ya estaba, igual sellamos por si el
+                    // vhost se creó después.
+                    auto_seal_base_url(&nkr_name_owned, &cell_for_seal,
+                        &db_name_owned, dns_for_seal.as_deref());
                     serde_json::json!({
                         "status": "success",
                         "db_name": db_name_owned,
@@ -2184,6 +2541,16 @@ fn render_tenant_vhost(nkr_name: &str, dns: &str, guest_ip: &str, enable_ws: boo
     let ws_upstream = format!("{}_ws", http_upstream);
     let dev_like = tier.is_dev_like();
 
+    // Puerto del WebSocket / longpolling según modo Odoo:
+    //   - threaded (workers=0, DEV/STAG): NO existe gevent separado en :8072.
+    //     El mismo werkzeug del :8069 maneja WebSocket upgrades. Apuntar
+    //     nginx a :8072 daría connection refused → cliente ve "se perdió la
+    //     conexión en tiempo real" (chat, bus, longpolling muertos).
+    //   - prefork (workers>0, PROD): gevent corre como proceso separado en
+    //     :8072 para longpolling/WebSocket — sin él, el master werkzeug se
+    //     bloquearía cada longpoll y mataría la concurrencia.
+    let ws_port = if dev_like { 8069 } else { 8072 };
+
     let mut out = String::new();
     out.push_str(&format!(
 "# Auto-generated by NKR for tenant '{nkr_name}'. DO NOT EDIT MANUALLY.
@@ -2193,7 +2560,7 @@ upstream {http_upstream} {{ server {guest_ip}:8069; keepalive 16; }}
 "));
     if enable_ws {
         out.push_str(&format!(
-"upstream {ws_upstream} {{ server {guest_ip}:8072; keepalive 16; }}
+"upstream {ws_upstream} {{ server {guest_ip}:{ws_port}; keepalive 16; }}
 "));
     }
     out.push_str(&format!(
@@ -2258,7 +2625,9 @@ server {{
     }
     if enable_ws {
         out.push_str(&format!(
-"    # WebSocket / long-polling → :8072 (gevent worker)
+"    # WebSocket / long-polling → :{ws_port}
+    #   - DEV/STAG (threaded, workers=0): mismo werkzeug del :8069.
+    #   - PROD (prefork, workers>0): gevent separado en :8072.
     location /websocket {{
         proxy_pass http://{ws_upstream};
         proxy_http_version 1.1;
@@ -2963,6 +3332,431 @@ pub fn handle_purge_cache() -> IpcResponse {
     }))
 }
 
+/// SSO one-shot (Plan E): genera URL firmada HMAC para auto-login en el
+/// tenant sin necesidad de conocer el password del usuario.
+///
+/// Flujo:
+/// 1. Lee `nkr_sso_secret` del odoo.conf del tenant.
+/// 2. Construye payload `<user>|<expires_at>` (TTL 30s).
+/// 3. Firma con HMAC-SHA256 usando `nkr_sso_secret`.
+/// 4. Devuelve URL `https://<dns>/nkr-sso?u=<user>&exp=<ts>&sig=<hex>`.
+///
+/// El módulo `nkr_sso` del tenant valida la firma con el MISMO secret
+/// (leído del odoo.conf vía `tools.config.get('nkr_sso_secret')`), busca
+/// el user en `res.users` y crea sesión sudo — sin pedir password.
+///
+/// Por qué es seguro:
+/// - El `nkr_sso_secret` (256 bits) vive sólo en odoo.conf del host.
+/// - El password de los users del tenant **jamás entra al flujo** — NKR
+///   no lo necesita ni lo conoce.
+/// - HMAC garantiza que sólo quien tiene el secret puede emitir URLs.
+/// - TTL 30s limita la ventana de uso.
+/// - Funciona para CUALQUIER user del tenant (no sólo admin).
+///
+/// Compromiso de `nkr_sso_secret`: permite login arbitrario al tenant
+/// hasta rotar. Rotación = editar odoo.conf + REL_OD (≤5s, el módulo
+/// re-lee la conf al respawn).
+pub fn handle_sso(nkr_name: &str, user: &str) -> IpcResponse {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    // Login válido: alfanum + _-.@ (acepta emails). Max 128.
+    if user.is_empty() || user.len() > 128
+        || user.bytes().any(|b| !(b.is_ascii_alphanumeric()
+            || matches!(b, b'_' | b'-' | b'.' | b'@'))) {
+        return IpcResponse::error(400, "invalid_user", None);
+    }
+
+    let info = match get_instance_info(nkr_name) {
+        Ok(i) => i,
+        Err(_) => return IpcResponse::error(404, "instance_not_found", None),
+    };
+    if !info.nkr_status.running {
+        return IpcResponse::error(409, "not_running",
+            Some("Tenant apagado — start primero"));
+    }
+    let dns = match info.dns.as_deref() {
+        Some(d) if !d.is_empty() => d.to_string(),
+        _ => return IpcResponse::error(409, "no_dns_provisioned",
+            Some("Tenant sin DNS. Llamar POST /dns primero.")),
+    };
+
+    // Lee la HMAC key del odoo.conf. Ubicación preferida: sección `[nkr_sso]`
+    // clave `secret` (no genera el WARNING "unknown option" de Odoo). Legacy:
+    // clave `nkr_sso_secret` en `[options]` (tenants no migrados). admin_passwd
+    // ya no se usa. Debe matchear cómo lo lee el módulo Odoo `nkr_sso`.
+    let conf = match std::fs::read_to_string(&info.config_path) {
+        Ok(c) => c,
+        Err(e) => return IpcResponse::error(500, "conf_read_failed",
+            Some(&format!("{}: {}", info.config_path, e))),
+    };
+    let sso_secret = parse_conf_value(&conf, "secret")
+        .or_else(|| parse_conf_value(&conf, "nkr_sso_secret"))
+        .unwrap_or_default();
+    if sso_secret.is_empty() {
+        return IpcResponse::error(500, "sso_secret_missing",
+            Some("Tenant sin HMAC key en odoo.conf ([nkr_sso] secret = ... , o \
+                  legacy nkr_sso_secret en [options]). Aplicable sólo a tenants \
+                  creados con NKR ≥1.6.3. Setear manualmente y recargar Odoo \
+                  (REL_OD vía POST /reload)."));
+    }
+
+    // Payload firmado: <user>|<exp>. NKR no toca el guest — solo firma.
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0) + 30;
+    let payload = format!("{}|{}", user, exp);
+
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = match HmacSha256::new_from_slice(sso_secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return IpcResponse::error(500, "hmac_key_invalid", None),
+    };
+    mac.update(payload.as_bytes());
+    let sig_bytes = mac.finalize().into_bytes();
+    let sig_hex: String = sig_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+    let url = format!(
+        "https://{}/nkr-sso?u={}&exp={}&sig={}",
+        dns,
+        url_encode(user),
+        exp,
+        sig_hex
+    );
+
+    eprintln!("[API] sso({}, user={}): URL emitida (TTL 30s, HMAC-only)",
+        nkr_name, user);
+    IpcResponse::json(200, serde_json::json!({
+        "url": url,
+        "user": user,
+        "expires_in": 30,
+        "nkr_name": nkr_name,
+        "dns": dns,
+    }))
+}
+
+fn parse_conf_value(conf: &str, key: &str) -> Option<String> {
+    for line in conf.lines() {
+        let t = line.trim_start();
+        if t.starts_with('#') || t.starts_with(';') {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix(key) {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let v = rest.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[allow(dead_code)]
+fn extract_session_id(set_cookie: &str) -> Option<String> {
+    // `Set-Cookie: session_id=<sid>; HttpOnly; Path=/; ...` — extraer <sid>.
+    // Si vienen múltiples cookies (separadas por coma o newline), buscar
+    // específicamente la session_id.
+    for part in set_cookie.split([',', '\n']) {
+        let t = part.trim_start();
+        if let Some(rest) = t.strip_prefix("session_id=") {
+            // hasta el primer ; o whitespace
+            let end = rest.find(|c: char| c == ';' || c.is_whitespace())
+                .unwrap_or(rest.len());
+            let sid = &rest[..end];
+            if !sid.is_empty() {
+                return Some(sid.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Minimal percent-encoding para query string. Codifica solo lo que importa
+/// para URLs (espacios, `&`, `=`, `+`, `?`, `#`). Resto se deja literal —
+/// el session_id de Odoo es base64-url-safe igual.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.bytes() {
+        match c {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' => out.push(c as char),
+            _ => out.push_str(&format!("%{:02X}", c)),
+        }
+    }
+    out
+}
+
+/// Diagnóstico HOST-side de un tenant: captura stacks de kernel + wchan +
+/// CPU% + estado TCP por cada thread del proceso `nkr` de la VM.
+///
+/// Útil para diagnosticar cuelgues donde el HOST está en busy loop o un
+/// virtio handler se quedó stuck. NO requiere shell al guest — toda la info
+/// viene de `/proc/<pid>/{task,stat,...}` que el daemon (root) puede leer.
+///
+/// Output: text/plain con un dump multi-sección. Idempotente, ~50ms.
+/// Lo invoca el operador (curl o `nkr diag`) cuando el watchdog detectó
+/// `port_8069_up=false` o el panel ve latencia anómala.
+///
+/// Fase 1: solo HOST. Si el cuelgue es del guest (no del nkr), esta info
+/// muestra `vcpu_thread blocked en kvm_run` que ya es una pista. Fase 2
+/// agregará inyección de DIAG por hvc0 + script guest.
+pub fn handle_diag(nkr_name: &str) -> IpcResponse {
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    let info = match get_instance_info(nkr_name) {
+        Ok(i) => i,
+        Err(_) => return IpcResponse::error(404, "instance_not_found", None),
+    };
+    if !info.nkr_status.running {
+        return IpcResponse::error(409, "not_running",
+            Some("Tenant apagado — no hay proceso vivo que diagnosticar"));
+    }
+    let pid = match info.nkr_status.pid {
+        Some(p) if p > 0 => p,
+        _ => return IpcResponse::error(409, "pid_unknown", None),
+    };
+    let mut out = String::new();
+    use std::fmt::Write;
+    let _ = writeln!(out, "=== nkr diag: {} (PID {}, cell {}) ===",
+        nkr_name, pid, info.cell);
+    let _ = writeln!(out, "captured_at: {}", chrono_like_now());
+    let _ = writeln!(out, "guest_ip:    {}", info.guest_ip);
+    let _ = writeln!(out, "port_8069_up: {}", info.nkr_status.port_8069_up);
+    let _ = writeln!(out, "ram_mb (RSS): {:?}", info.nkr_status.ram_mb);
+    let _ = writeln!(out, "uptime_s:    {:?}", info.nkr_status.uptime_s);
+    let _ = writeln!(out);
+
+    // /proc/<pid>/stat — overall state
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) {
+        let _ = writeln!(out, "=== /proc/{}/stat ===", pid);
+        let _ = writeln!(out, "{}", stat.trim());
+        let _ = writeln!(out);
+    }
+    // /proc/<pid>/status — VmRSS, Threads, State, voluntary_ctxt_switches
+    if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+        let _ = writeln!(out, "=== /proc/{}/status (resumen) ===", pid);
+        for line in status.lines() {
+            if line.starts_with("State:") || line.starts_with("Threads:")
+                || line.starts_with("VmRSS:") || line.starts_with("VmSize:")
+                || line.starts_with("voluntary") || line.starts_with("nonvoluntary") {
+                let _ = writeln!(out, "{}", line);
+            }
+        }
+        let _ = writeln!(out);
+    }
+
+    // Per-thread: stack, wchan, comm, state
+    let task_dir = format!("/proc/{}/task", pid);
+    let _ = writeln!(out, "=== threads (/proc/{}/task/) ===", pid);
+    if let Ok(entries) = std::fs::read_dir(&task_dir) {
+        let mut tids: Vec<String> = entries.flatten()
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .collect();
+        tids.sort();
+        for tid in tids {
+            let base = format!("{}/{}", task_dir, tid);
+            let comm = std::fs::read_to_string(format!("{}/comm", base))
+                .unwrap_or_default().trim().to_string();
+            let wchan = std::fs::read_to_string(format!("{}/wchan", base))
+                .unwrap_or_default().trim().to_string();
+            let state = std::fs::read_to_string(format!("{}/status", base))
+                .ok()
+                .and_then(|s| s.lines().find(|l| l.starts_with("State:"))
+                    .map(|l| l.trim_start_matches("State:").trim().to_string()))
+                .unwrap_or_default();
+            let _ = writeln!(out, "--- task {} comm={} state={} wchan={}",
+                tid, comm, state, wchan);
+            // Stack: solo si el thread está en kernel space (no R userspace)
+            // — para R, /proc/.../stack devuelve vacío. Aún así lo leemos
+            // por completitud.
+            if let Ok(stack) = std::fs::read_to_string(format!("{}/stack", base)) {
+                let trimmed: String = stack.lines().take(20).collect::<Vec<_>>().join("\n");
+                if !trimmed.is_empty() {
+                    let _ = writeln!(out, "{}", trimmed);
+                }
+            }
+        }
+    }
+    let _ = writeln!(out);
+
+    // TCP del host hacia el guest
+    let _ = writeln!(out, "=== ss -tn al guest_ip {} ===", info.guest_ip);
+    if let Ok(o) = Command::new("ss").args(["-tn"]).output() {
+        let s = String::from_utf8_lossy(&o.stdout);
+        for line in s.lines() {
+            if line.contains(&info.guest_ip) {
+                let _ = writeln!(out, "{}", line);
+            }
+        }
+    }
+    let _ = writeln!(out);
+
+    // dmesg tail (host) — para ver si hubo OOM-kill / hung tasks / etc
+    let _ = writeln!(out, "=== dmesg tail (últimas 15 líneas del HOST) ===");
+    if let Ok(o) = Command::new("dmesg").args(["-T", "--", "-time-format=iso"]).output() {
+        let s = String::from_utf8_lossy(&o.stdout);
+        let lines: Vec<&str> = s.lines().collect();
+        for line in lines.iter().rev().take(15).rev() {
+            let _ = writeln!(out, "{}", line);
+        }
+    }
+
+    IpcResponse::text(200, "text/plain; charset=utf-8", out)
+}
+
+/// Timestamp legible para output `nkr diag`. Minimal — no necesitamos
+/// precisión sub-segundo ni timezone.
+fn chrono_like_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    format!("unix={} ({}s ago boot)", secs, uptime_secs())
+}
+
+fn uptime_secs() -> u64 {
+    std::fs::read_to_string("/proc/uptime").ok()
+        .and_then(|s| s.split('.').next().and_then(|n| n.parse().ok()))
+        .unwrap_or(0)
+}
+
+/// Reload de workers Odoo SIN reiniciar la VM. Daemon manda SIGUSR1 al PID
+/// del proceso de la VM (state.json), vmm.rs catch SIGUSR1 → setea flag
+/// RELOAD_REQUESTED → vcpu loop la consume → inyecta "REL_OD\n" por hvc0 →
+/// el watcher del initramfs recarga Odoo según el modo: workers>0 (prefork)
+/// → SIGHUP al master (respawnea workers, master vivo); workers=0 (threaded)
+/// → SIGTERM al proceso (el supervisor loop de nkr-start.sh lo relanza). En
+/// ambos casos código fresh del disco, ~3s, sin downtime de la VM. Idempotente.
+///
+/// Caso de uso primario: post `addons/git`. virtio-fs+inotify NO propagan
+/// eventos del host al guest (limitación FUSE), entonces `dev_mode=reload`
+/// del Odoo no detecta cambios. Trigger explícito desde el host vía SIGUSR1
+/// es la solución arquitectónicamente correcta.
+pub fn handle_reload_workers(nkr_name: &str) -> IpcResponse {
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    // Resolver PID desde state.json. Si no está corriendo → 409, no tiene
+    // sentido reload de algo apagado (el panel debería START primero).
+    let info = match get_instance_info(nkr_name) {
+        Ok(i) => i,
+        Err(_) => return IpcResponse::error(404, "instance_not_found", None),
+    };
+    if !info.nkr_status.running {
+        return IpcResponse::error(409, "not_running",
+            Some("Tenant está apagado — start primero"));
+    }
+    let pid = match info.nkr_status.pid {
+        Some(p) if p > 0 => p,
+        _ => return IpcResponse::error(409, "pid_unknown",
+            Some("PID de la VM no disponible en state — VM en provisioning?")),
+    };
+
+    // SIGUSR1 al PID. El handler de vmm.rs setea RELOAD_REQUESTED, el vcpu
+    // loop consume la flag e inyecta "REL_OD\n" por hvc0 al guest.
+    let r = unsafe { libc::kill(pid as i32, libc::SIGUSR1) };
+    if r != 0 {
+        let err = std::io::Error::last_os_error();
+        eprintln!("[API] reload_workers({}): kill SIGUSR1 PID {} falló: {}",
+            nkr_name, pid, err);
+        return IpcResponse::error(500, "signal_failed",
+            Some(&format!("kill PID {}: {}", pid, err)));
+    }
+    eprintln!("[API] reload_workers({}): SIGUSR1 → PID {} OK", nkr_name, pid);
+    // El guest (watcher hvc0 del initramfs) diferencia por modo Odoo:
+    //   workers>0 (prefork)  → SIGHUP al master → respawnea workers (master vivo)
+    //   workers=0 (threaded) → SIGTERM al proceso → supervisor loop lo relanza
+    // En ambos casos: código fresh del disco, sin downtime de la VM, ~3s.
+    IpcResponse::json(202, serde_json::json!({
+        "nkr_name": nkr_name,
+        "status": "accepted",
+        "mechanism": "SIGUSR1 → vmm → hvc0 REL_OD → guest reload Odoo (SIGHUP master si prefork, SIGTERM+respawn si threaded)",
+        "estimated_seconds": 3,
+        "note": "Odoo recarga con código fresh del disco. Sin downtime de la VM."
+    }))
+}
+
+/// Marca la VM como ACTIVE en el ballooning dinámico. Sólo tiene efecto si
+/// la VM se levantó con `balloon_idle_mb != balloon_mb` (típicamente DEV/
+/// STAG por tier). Comportamiento (CLAUDE.md v2.2):
+///   - SIGUSR2 al PID de la VM
+///   - vmm setea BALLOON_ACTIVE_REQUESTED_TS = now() y el vcpu loop, en su
+///     próximo iter (≤5s), aplica `set_target_mb(active_mb) + IRQ config_change`
+///   - Tras `balloon_decay_secs` (default 600s) sin renovación, vmm aplica
+///     IDLE automáticamente.
+///
+/// Si la VM tiene balloon estático (PROD = 0/0), la señal se entrega pero
+/// el state machine ignora (BALLOON_ACTIVE_MB == 0 en vmm) — fire-and-forget,
+/// idempotente. Devolvemos 202 igual: el panel no necesita conocer el tier.
+pub fn handle_balloon_active(nkr_name: &str) -> IpcResponse {
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    let info = match get_instance_info(nkr_name) {
+        Ok(i) => i,
+        Err(_) => return IpcResponse::error(404, "instance_not_found", None),
+    };
+    if !info.nkr_status.running {
+        return IpcResponse::error(409, "not_running",
+            Some("Tenant está apagado — start primero"));
+    }
+    let pid = match info.nkr_status.pid {
+        Some(p) if p > 0 => p,
+        _ => return IpcResponse::error(409, "pid_unknown",
+            Some("PID de la VM no disponible en state")),
+    };
+
+    // Safety check: la VM debe haber sido lanzada con el daemon ≥1.6.2
+    // (que registra el handler SIGUSR2). VMs lanzadas con daemons viejos
+    // tratan SIGUSR2 con la disposición default = TERMINATE → mataríamos
+    // al tenant.
+    //
+    // Heurística: leer la cmdline del proceso de la VM y verificar que
+    // contiene `--balloon-idle-mb`. Si no, la VM corre con balloon
+    // estático (PROD por tier, o instancia legacy pre-1.6.2) y mandar
+    // SIGUSR2 sería peligroso o no haría nada. Devolvemos 202 igual
+    // (idempotente desde el panel) pero marcamos `applied=false`.
+    let cmdline_path = format!("/proc/{}/cmdline", pid);
+    let cmdline = std::fs::read(&cmdline_path).unwrap_or_default();
+    // /proc/<pid>/cmdline está NUL-separated; convertimos a string lossy.
+    let cmdline_str = String::from_utf8_lossy(&cmdline);
+    if !cmdline_str.contains("balloon-idle-mb") {
+        eprintln!("[API] balloon_active({}): VM PID {} sin --balloon-idle-mb \
+                   en cmdline (daemon viejo o tier=production sin balloon \
+                   dinámico). No mando SIGUSR2 — riesgo de matar el tenant.",
+            nkr_name, pid);
+        return IpcResponse::json(202, serde_json::json!({
+            "nkr_name": nkr_name,
+            "status": "accepted",
+            "applied": false,
+            "reason": "vm_static_balloon_or_legacy",
+            "note": "La VM no tiene ballooning dinámico configurado (tier=production o lanzada antes del upgrade del daemon). SIGUSR2 no enviado para evitar terminate por handler ausente. Restart la VM para activar ballooning dinámico si su tier (dev/staging) lo justifica.",
+        }));
+    }
+
+    let r = unsafe { libc::kill(pid as i32, libc::SIGUSR2) };
+    if r != 0 {
+        let err = std::io::Error::last_os_error();
+        eprintln!("[API] balloon_active({}): kill SIGUSR2 PID {} falló: {}",
+            nkr_name, pid, err);
+        return IpcResponse::error(500, "signal_failed",
+            Some(&format!("kill PID {}: {}", pid, err)));
+    }
+    eprintln!("[API] balloon_active({}): SIGUSR2 → PID {} OK", nkr_name, pid);
+    IpcResponse::json(202, serde_json::json!({
+        "nkr_name": nkr_name,
+        "status": "accepted",
+        "mechanism": "SIGUSR2 → vmm BALLOON_ACTIVE_TS=now → set_target_mb(active) + IRQ config_change",
+        "note": "Renueva el TS active. Tras balloon_decay_secs sin nueva señal, decae a IDLE. Si la VM tiene balloon estático (tier=production), la señal se ignora silenciosamente.",
+    }))
+}
+
 /// Estado del repo Odoo Enterprise descargado en una cell.
 /// Lo usa el panel para chequear si puede aceptar `edition: "enterprise"`
 /// al crear tenants — si no hay repo descargado, mejor rechazar antes de
@@ -3064,33 +3858,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn derive_resources_balloon_formula() {
-        // Reference table from the doc comment.
-        // workers=1: 1024 - 750 - 256 = 18 → floor 0 (below 64 MB minimum).
+    fn derive_resources_production_table() {
+        // Tabla canónica CLAUDE.md v2.2 (production):
+        //   VM_RAM = 256 + 256 + W*768
+        //   Soft = W*640 MB, Hard = W*768 MB (per worker)
+        //   Balloon: PROD siempre ACTIVE = 0 (sin transición IDLE/ACTIVE).
+        //   Doctrine: "PROD evita latencia de desinflado en picos de tráfico".
         let r1 = derive_resources(1);
-        assert_eq!(r1.ram_mb, 1024);
+        assert_eq!(r1.ram_mb, 1280);
+        assert_eq!(r1.limit_memory_soft, 640 * 1024 * 1024);
+        assert_eq!(r1.limit_memory_hard, 768 * 1024 * 1024);
         assert_eq!(r1.balloon_mb, 0);
+        assert_eq!(r1.balloon_idle_mb, 0);
 
-        // workers=2: 2048 - 1500 - 256 = 292.
         let r2 = derive_resources(2);
-        assert_eq!(r2.ram_mb, 2048);
-        assert_eq!(r2.balloon_mb, 292);
+        assert_eq!(r2.ram_mb, 2048);  // 256 + 256 + 768*2
+        assert_eq!(r2.limit_memory_soft, 1280 * 1024 * 1024);
+        assert_eq!(r2.limit_memory_hard, 1536 * 1024 * 1024);
+        assert_eq!(r2.balloon_mb, 0);
 
-        // workers=4: 4096 - 3000 - 256 = 840.
         let r4 = derive_resources(4);
-        assert_eq!(r4.ram_mb, 4096);
-        assert_eq!(r4.balloon_mb, 840);
+        assert_eq!(r4.ram_mb, 3584);  // 256 + 256 + 768*4
+        assert_eq!(r4.balloon_mb, 0);
 
-        // workers=8: 8192 - 6000 - 256 = 1936.
         let r8 = derive_resources(8);
-        assert_eq!(r8.ram_mb, 8192);
-        assert_eq!(r8.balloon_mb, 1936);
+        assert_eq!(r8.ram_mb, 6656);  // 256 + 256 + 768*8
+        assert_eq!(r8.balloon_mb, 0);  // Regla del Grifo además
     }
 
     #[test]
-    fn derive_resources_balloon_floor() {
-        // The 64 MB floor must clamp small results to 0.
-        // workers=1 yields 18 → 0.
-        assert_eq!(derive_resources(1).balloon_mb, 0);
+    fn derive_resources_dev_tier_fixed_profile() {
+        // Tabla v1.6.2 (dev): 1300 MB RAM, workers=0, soft=800/hard=1000.
+        // Subido de 768/400/512 tras observar `Server memory limit reached`
+        // ciclando con Odoo 19 + 31 módulos custom — el soft de 400 MB era
+        // inalcanzable bajo carga normal de DEV en threaded mode.
+        // Balloon dinámico: ACTIVE=0 (boot, toda la RAM), IDLE=256 (squeeze
+        // suave; deja 1044 al guest, suficiente para Odoo idle sin chocar
+        // con el hard de 1000).
+        let r = derive_resources_for_tier(99, Tier::Dev);  // workers ignorado
+        assert_eq!(r.workers, 0);
+        assert_eq!(r.ram_mb, 1300);
+        assert_eq!(r.limit_memory_soft, 800 * 1024 * 1024);
+        assert_eq!(r.limit_memory_hard, 1000 * 1024 * 1024);
+        assert_eq!(r.balloon_mb, 0,
+            "DEV debe arrancar ACTIVE (balloon=0 al boot) para evitar OOM");
+        assert_eq!(r.balloon_idle_mb, 256);
+        assert_ne!(r.balloon_mb, r.balloon_idle_mb,
+            "DEV debe tener balloon dinámico (active != idle)");
+    }
+
+    #[test]
+    fn derive_resources_staging_tier_fixed_profile() {
+        // STAGING: ram=1024, ACTIVE=256 (boot, ram-768), IDLE=768 (post-decay, ram-256).
+        let r = derive_resources_for_tier(99, Tier::Staging);
+        assert_eq!(r.workers, 0);
+        assert_eq!(r.ram_mb, 1024);
+        assert_eq!(r.limit_memory_soft, 600 * 1024 * 1024);
+        assert_eq!(r.limit_memory_hard, 700 * 1024 * 1024);
+        assert_eq!(r.balloon_mb, 256);
+        assert_eq!(r.balloon_idle_mb, 768);
+    }
+
+    #[test]
+    fn validate_workers_ram_budget_rejects_insufficient_ram() {
+        // 10 workers × 768 + 512 = 8192 MB requeridos
+        let res = validate_workers_ram_budget(10, 2048);
+        assert!(res.is_some());
+        // RAM suficiente pasa
+        assert!(validate_workers_ram_budget(2, 2048).is_none());
     }
 }

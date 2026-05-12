@@ -76,9 +76,20 @@ pub struct ServiceConfig {
     #[serde(default = "default_burst")]
     pub burst: bool,
     /// Inflate VirtIO-Balloon at boot by N MB: the guest returns that RAM to host.
-    /// 0 = disabled (default). Typical value: 256 for a 1024 MB Odoo VM.
+    /// Bajo doctrine v2.2 este es el target ACTIVE (valor de boot). DEV=0,
+    /// STAG=256, PROD=0. La VM nace con este balloon — debe ser bajo para
+    /// que Odoo arranque sin OOM. 0 = disabled (default).
     #[serde(default)]
     pub balloon_mb: u32,
+    /// Target IDLE del balloon dinámico (MB inflados sin tráfico). Si == 0
+    /// o == `balloon_mb`, la VM se queda con balloon estático (sin transición
+    /// ACTIVE↔IDLE). Con valor distinto, tras `balloon_decay_secs` sin
+    /// SIGUSR2 (= POST /balloon), vmm transiciona a este target.
+    #[serde(default)]
+    pub balloon_idle_mb: u32,
+    /// Segundos sin renovación antes de transicionar de ACTIVE a IDLE. Default 600s (10 min).
+    #[serde(default = "default_balloon_decay_secs")]
+    pub balloon_decay_secs: u32,
     /// Skip HTTP warmup post-TCP-UP. Default `false` (performs warmup).
     /// It's set to `true` automatically when cloning via API because the clone
     /// already carries `ir_attachment` populated via `CREATE DATABASE TEMPLATE`
@@ -104,6 +115,7 @@ pub struct ServiceConfig {
 // access that would saturate host page-cache per VM.
 fn default_pmem() -> bool { true }
 fn default_burst() -> bool { true }
+fn default_balloon_decay_secs() -> u32 { 600 }
 
 /// Build configuration for a service (Nkrfile)
 #[derive(Deserialize, Clone)]
@@ -1109,6 +1121,8 @@ except Exception:\n    \
             rootfs: svc.rootfs.clone(),
             use_pmem: svc.pmem,
             balloon_mb: svc.balloon_mb,
+            balloon_idle_mb: svc.balloon_idle_mb,
+            balloon_decay_secs: svc.balloon_decay_secs,
             burst: svc.burst,
             cell_id,
         };
@@ -1168,6 +1182,12 @@ except Exception:\n    \
         if config.balloon_mb > 0 {
             cmd.arg("--balloon-mb").arg(config.balloon_mb.to_string());
         }
+        // Sólo pasar idle-mb/decay si difieren del ACTIVE (boot) — convención:
+        // idle==balloon_mb ó idle==0 → balloon estático, sin transición.
+        if config.balloon_idle_mb != 0 && config.balloon_idle_mb != config.balloon_mb {
+            cmd.arg("--balloon-idle-mb").arg(config.balloon_idle_mb.to_string());
+            cmd.arg("--balloon-decay-secs").arg(config.balloon_decay_secs.to_string());
+        }
 
         // Redirect stdout and stderr to add per-service prefix
         cmd.stdout(Stdio::piped());
@@ -1195,15 +1215,34 @@ except Exception:\n    \
 
         eprintln!("[NKR-COMPOSE] VM '{}' iniciada (PID {})", name, child.id());
 
+        // Per-instance VM boot log: captura el serial console del guest (stdout
+        // de `nkr run`, donde van los echos del initramfs + el dmesg del guest)
+        // y los logs del propio VMM (stderr). Hasta ahora todo eso se mezclaba
+        // en `nkr-compose.log` (compartido + rotado) — esto deja un archivo
+        // dedicado por instancia, útil para diagnosticar mounts virtio-fs,
+        // panics del guest, etc. Vive junto al disco de la instancia
+        // (`<instance_dir>/.<name>-vm-boot.log`), fuera de los shares virtio-fs
+        // (no aparece dentro del guest). Se trunca en cada arranque.
+        let boot_log_path: Option<PathBuf> = config.disks.first()
+            .and_then(|d| Path::new(d).parent())
+            .map(|dir| dir.join(format!(".{}-vm-boot.log", config_name)));
+        if let Some(ref p) = boot_log_path {
+            let _ = fs::File::create(p); // truncate
+        }
+
         // Thread to prefix stdout (guest serial) + service-ready detection
         let svc_name_out = name.clone();
+        let boot_log_out = boot_log_path.clone();
         if let Some(stdout) = child.stdout.take() {
             thread::spawn(move || {
+                let mut blog = boot_log_out.as_ref()
+                    .and_then(|p| fs::OpenOptions::new().create(true).append(true).open(p).ok());
                 let reader = BufReader::new(stdout);
                 let mut ready_announced = false;
                 for line in reader.lines() {
                     if let Ok(line) = line {
                         eprintln!("[{}] {}", svc_name_out, line);
+                        if let Some(f) = blog.as_mut() { let _ = writeln!(f, "{}", line); }
                         if !ready_announced {
                             if line.contains("database system is ready to accept connections")
                                 || line.contains("listening on")
@@ -1223,12 +1262,16 @@ except Exception:\n    \
 
         // Thread to prefix stderr (NKR logs)
         let svc_name_err = name.clone();
+        let boot_log_err = boot_log_path.clone();
         if let Some(stderr) = child.stderr.take() {
             thread::spawn(move || {
+                let mut blog = boot_log_err.as_ref()
+                    .and_then(|p| fs::OpenOptions::new().create(true).append(true).open(p).ok());
                 let reader = BufReader::new(stderr);
                 for line in reader.lines() {
                     if let Ok(line) = line {
                         eprintln!("[{}] {}", svc_name_err, line);
+                        if let Some(f) = blog.as_mut() { let _ = writeln!(f, "{}", line); }
                     }
                 }
             });

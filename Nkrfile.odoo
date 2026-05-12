@@ -35,10 +35,13 @@ RUN chown odoo:odoo /etc/odoo/odoo.conf
 #       /mnt/extra-addons      — custom addons del cliente (virtiofs del panel)
 #       /mnt/extra-enterprise  — Odoo Enterprise (clonado por cell)
 #       /mnt/extra-pylibs      — libs Python del cliente
-#     El odoo.conf lista los 3 en addons_path + PYTHONPATH. ──
-RUN mkdir -p /mnt/extra-enterprise /mnt/extra-pylibs \
-    && touch /mnt/extra-enterprise/.keep /mnt/extra-pylibs/.keep \
-    && chown -R odoo:odoo /mnt/extra-enterprise /mnt/extra-pylibs
+#       /mnt/systemouts-addons — addons internos de NKR cell-level (nkr_sso, etc.),
+#                                RO, invisibles al cliente. Montado desde
+#                                cells/<cell>/systemouts-addons/ por cada instancia.
+#     El odoo.conf los lista en addons_path + PYTHONPATH. ──
+RUN mkdir -p /mnt/extra-enterprise /mnt/extra-pylibs /mnt/systemouts-addons \
+    && touch /mnt/extra-enterprise/.keep /mnt/extra-pylibs/.keep /mnt/systemouts-addons/.keep \
+    && chown -R odoo:odoo /mnt/extra-enterprise /mnt/extra-pylibs /mnt/systemouts-addons
 
 # ── (Opcional) Copiar módulos directamente al disco ──
 # COPY ./modules/ /mnt/extra-addons/

@@ -12,6 +12,41 @@ use libc;
 
 /// Global flag for clean shutdown (SIGTERM → vcpu loop exits → extract_volumes)
 pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Global flag for live reload (SIGUSR1 → inject "REL_OD" via hvc0 → guest
+/// triggers SIGHUP al master Odoo → workers respawnean con código fresh).
+/// El daemon NKR setea SIGUSR1 al PID de la VM tras un addons/git exitoso o
+/// cuando el panel llama POST /reload. Ver src/console.rs y nkr_api_server.rs.
+pub static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+// ─── Ballooning ACTIVE/IDLE state machine (CLAUDE.md v2.2) ─────────────────
+// La VM nace ACTIVE: balloon_mb es el target de boot (DEV=0, STAG=256, PROD=0).
+// Esto evita que el OOM killer del guest masacre Odoo durante bootstrap, lo
+// cual ocurriría si arrancara en IDLE (squeeze a 256 MB).
+//
+// SIGUSR2 (POST /balloon) → renueva BALLOON_ACTIVE_TS = now(). El vcpu loop:
+//   - Si TS != 0 y now-TS < decay_secs → ACTIVE → target=BALLOON_ACTIVE_MB
+//   - Si TS != 0 y now-TS >= decay_secs → IDLE auto → target=BALLOON_IDLE_MB
+//
+// Boot: TS se setea a now() — la VM cuenta como recién renovada y se queda
+// ACTIVE durante el bootstrap completo (~60s) + grace period (10 min default
+// hasta que `nkr compose` confirme NKR-READY y el panel mande su primer
+// SIGUSR2). Tras 600s sin renovación, transición a IDLE.
+//
+// Si BALLOON_IDLE_MB == BALLOON_ACTIVE_MB (PROD por tier), el state machine
+// no se activa — la VM se queda estática en balloon_mb del boot (=0).
+// `BALLOON_LAST_APPLIED_STATE` evita raise_config_change redundante (0=idle, 1=active).
+use std::sync::atomic::AtomicU32;
+pub static BALLOON_ACTIVE_REQUESTED_TS: AtomicU64 = AtomicU64::new(0);
+pub static BALLOON_LAST_APPLIED_STATE: AtomicU8 = AtomicU8::new(1); // boot = ACTIVE
+pub static BALLOON_IDLE_MB: AtomicU32 = AtomicU32::new(0);
+pub static BALLOON_ACTIVE_MB: AtomicU32 = AtomicU32::new(0);
+pub static BALLOON_DECAY_SECS: AtomicU32 = AtomicU32::new(600);
+/// Unix ts of the last statsq drain — we consume the balloon stats virtqueue
+/// at most every BALLOON_STATS_INTERVAL_SECS (consuming on every guest kick
+/// would ping-pong with the guest's refill).
+static BALLOON_STATS_LAST_TS: AtomicU64 = AtomicU64::new(0);
+const BALLOON_STATS_INTERVAL_SECS: u64 = 30;
 /// 0=idle, 1=shutdown injected (waiting for VcpuExit::Shutdown or timeout)
 use std::sync::atomic::AtomicU8;
 static SHUTDOWN_PHASE: AtomicU8 = AtomicU8::new(0);
@@ -1078,14 +1113,28 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2c. VirtIO-Balloon (v1.3) — elastic RAM reclaim
-    // Active if --balloon-mb > 0; the guest driver adjusts in background.
+    // Advertised to the guest if --balloon-mb > 0 (estático) O si hay
+    // ballooning dinámico configurado (--balloon-idle-mb != --balloon-mb): en
+    // ese caso la VM nace ACTIVE con target = balloon_mb (típicamente 0 en
+    // tier=dev) pero el state machine necesita el driver del guest attacheado
+    // para poder inflar al transicionar a IDLE. Si NO emitimos el MMIO device
+    // en el cmdline cuando balloon_mb==0, el guest nunca probea el driver y el
+    // `set_target_mb(idle)` posterior es un no-op (bug pre-v1.6.4: tier=dev
+    // "tenía" ballooning dinámico que en realidad nunca inflaba).
     // We pass ram_mb so the device caps its HashSet of inflated pages to the
     // guest's total RAM — defense against host DoS from a hostile guest.
+    let balloon_dynamic = config.balloon_idle_mb != 0
+        && config.balloon_idle_mb != config.balloon_mb;
+    let balloon_advertised = config.balloon_mb > 0 || balloon_dynamic;
     let mut balloon_dev = VirtioBalloonDevice::new(guest_mem.clone(), config.ram_mb);
     if config.balloon_mb > 0 {
         balloon_dev.set_target_mb(config.balloon_mb);
-        eprintln!("[NKR] Balloon: objetivo {} MB [MMIO {:#X}, IRQ {}]",
-            config.balloon_mb, BALLOON_MMIO_ADDR, BALLOON_IRQ);
+    }
+    if balloon_advertised {
+        eprintln!("[NKR] Balloon: objetivo boot {} MB{} [MMIO {:#X}, IRQ {}]",
+            config.balloon_mb,
+            if balloon_dynamic { format!(" (dinámico, IDLE={} MB)", config.balloon_idle_mb) } else { String::new() },
+            BALLOON_MMIO_ADDR, BALLOON_IRQ);
     }
     vm.register_irqfd(&balloon_dev.irqfd, BALLOON_IRQ)
         .unwrap_or_else(|e| eprintln!("[NKR-BALLOON] irqfd: {e}"));
@@ -1115,7 +1164,7 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    configure_linux_boot(&guest_mem, initrd_size, ram_bytes, &guest_ip, &block_configs, &fs_shares, &blk_share_mounts, pmem_dev_opt.as_ref(), config.balloon_mb > 0, rootfs_tag.as_deref())?;
+    configure_linux_boot(&guest_mem, initrd_size, ram_bytes, &guest_ip, &block_configs, &fs_shares, &blk_share_mounts, pmem_dev_opt.as_ref(), balloon_advertised, rootfs_tag.as_deref())?;
     write_page_tables(&guest_mem)?;
     write_gdt(&guest_mem)?;
 
@@ -1221,6 +1270,10 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
         use_dax: pmem_dev_opt.is_some() || config.rootfs.is_some(), // DAX via pmem OR virtio-fs master rootfs
         balloon_mb: config.balloon_mb,
         cell_id: config.cell_id,
+        guest_mem_total_bytes: 0,
+        guest_mem_free_bytes: 0,
+        guest_mem_available_bytes: 0,
+        guest_mem_cached_bytes: 0,
     };
     if let Err(e) = state::register_vm(&vm_state) {
         eprintln!("[NKR] ERROR: No se pudo registrar VM en estado — 'nkr ps' no mostrará esta VM: {e}");
@@ -1243,6 +1296,41 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[NKR] Control: canal hvc0 activo [MMIO {:#X}, IRQ {}]", CONSOLE_MMIO_ADDR, CONSOLE_IRQ);
     unsafe {
         libc::signal(libc::SIGTERM, sigterm_handler as *const () as libc::sighandler_t);
+        // SIGUSR1 → reload de workers Odoo. El daemon lo manda tras
+        // addons/git exitoso o vía POST /reload del panel.
+        libc::signal(libc::SIGUSR1, sigusr1_handler as *const () as libc::sighandler_t);
+        // SIGUSR2 → marca balloon ACTIVE (renueva timestamp). Se procesa en
+        // el vcpu loop si la VM tiene ballooning dinámico configurado.
+        libc::signal(libc::SIGUSR2, sigusr2_handler as *const () as libc::sighandler_t);
+    }
+    // Configura state machine de balloon. Sólo se activa el polling si
+    // idle_mb != balloon_mb (= sólo cuando la VM realmente cambia de target).
+    if config.balloon_idle_mb != 0 && config.balloon_idle_mb != config.balloon_mb {
+        BALLOON_ACTIVE_MB.store(config.balloon_mb, Ordering::SeqCst);
+        BALLOON_IDLE_MB.store(config.balloon_idle_mb, Ordering::SeqCst);
+        BALLOON_DECAY_SECS.store(config.balloon_decay_secs, Ordering::SeqCst);
+        // Estado inicial: ACTIVE — la VM ya arrancó con
+        // balloon_dev.set_target_mb(balloon_mb) arriba (= ACTIVE), así que
+        // marcamos LAST_APPLIED_STATE=1 (active) para que el state machine
+        // no haga un re-apply redundante en el primer iter.
+        BALLOON_LAST_APPLIED_STATE.store(1, Ordering::SeqCst);
+        // TS=now() arranca el reloj de decay. La VM se queda ACTIVE durante
+        // los próximos `decay_secs` (default 600s = 10 min) — suficiente
+        // para todo el bootstrap de Odoo (~60s) + grace para que el panel
+        // mande su primer POST /balloon. Si pasan 600s sin renovación,
+        // transición automática a IDLE.
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        BALLOON_ACTIVE_REQUESTED_TS.store(now_secs, Ordering::SeqCst);
+        // Itimer cada 5s para asegurar que el vcpu loop se despierte y
+        // chequee decay incluso si el guest está en HLT (sin tráfico).
+        // SIGALRM ya tiene handler (sigalrm_handler — no-op solo para EINTR).
+        arm_balloon_itimer();
+        eprintln!("[NKR-BALLOON] Dinámico activado: ACTIVE(boot)={} MB, IDLE(post-decay)={} MB, decay={}s. \
+                   VM nace ACTIVE — grace period hasta primer decay.",
+            config.balloon_mb, config.balloon_idle_mb, config.balloon_decay_secs);
     }
 
     // Feature D — Seccomp Jailer: baseline raised to 120 syscalls for PostgreSQL.
@@ -1254,7 +1342,7 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Capture the vCPU loop result but ALWAYS run cleanup.
     // Previously, `?` caused early-return skipping unregister_vm, TAP cleanup
     // and cgroup teardown, leaving orphaned resources.
-    let loop_result = run_vcpu_loop(&mut vcpu, &mut block_devs, &mut net_dev, &mut fs_devs, &mut balloon_dev, &mut console_dev, pmem_dev_opt.as_mut(), &serial_irqfd);
+    let loop_result = run_vcpu_loop(&mut vcpu, &mut block_devs, &mut net_dev, &mut fs_devs, &mut balloon_dev, &mut console_dev, pmem_dev_opt.as_mut(), &serial_irqfd, config.cell_id, config.vm_id);
     eprintln!("[NKR-DBG] vcpu_loop salió — iniciando cleanup");
 
     // Clean up shutdown sentinel from VirtIO-FS rootfs (if it existed)
@@ -1781,13 +1869,25 @@ fn configure_linux_boot(
         cmdline_str.push_str(" memmap=8G!4G root=/dev/pmem0 rootflags=dax rw");
     }
 
-    // VirtIO-FS shares: nkr.fs{i} / nkr.fsm{i} / nkr.fsr{i}
+    // VirtIO-FS shares: nkr.fs{i} / nkr.fsm{i} / nkr.fsr{i}.
+    // El cmdline del kernel tiene un tope (COMMAND_LINE_SIZE del nano-kernel,
+    // ~1024 bytes) — con muchas shares se truncaba el final (se perdían
+    // `init=` y `nkr.ip=`, y parcialmente `nkr.rootfs=`). Para dar holgura,
+    // omitimos lo redundante (el initramfs ya tolera la ausencia):
+    //   - el rootfs (guest_path == "/") solo necesita su `virtio_mmio.device`;
+    //     el initramfs lo monta vía `nkr.rootfs=` (más abajo) y su mount loop
+    //     ya skipeaba esa entrada → omitimos `nkr.fs0/fsm0/fsr0` (~40 bytes).
+    //   - `nkr.fsr{i}=` solo se emite cuando es `ro`; el initramfs trata la
+    //     ausencia como `rw` (default) → ~13 bytes por share RW.
     for (i, (tag, guest_path, readonly, slot)) in fs_shares.iter().enumerate() {
         let addr = 0xD001_0000u64 + (*slot as u64 * 0x1000);
         let irq  = 8u32 + *slot as u32;
-        let mode = if *readonly { "ro" } else { "rw" };
-        cmdline_str.push_str(&format!(" virtio_mmio.device=4K@{:#010x}:{} nkr.fs{}={} nkr.fsm{}={} nkr.fsr{}={}",
-            addr, irq, i, tag, i, guest_path, i, mode));
+        cmdline_str.push_str(&format!(" virtio_mmio.device=4K@{:#010x}:{}", addr, irq));
+        if guest_path == "/" { continue; } // rootfs → solo el virtio_mmio.device
+        cmdline_str.push_str(&format!(" nkr.fs{}={} nkr.fsm{}={}", i, tag, i, guest_path));
+        if *readonly {
+            cmdline_str.push_str(&format!(" nkr.fsr{}=ro", i));
+        }
     }
 
     // VirtIO-BLK shares: nkr.blk{i} / nkr.blkm{i}
@@ -1966,6 +2066,50 @@ extern "C" fn sigterm_handler(_sig: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
+/// SIGUSR1 → marca pedido de reload. El vcpu loop ve la flag y dispara la
+/// inyección de "REL_OD\n" por hvc0. Idempotente: múltiples SIGUSR1 seguidos
+/// resultan en una sola inyección (la flag se reset al inyectar). Si llega
+/// SIGUSR1 mientras hay un SHUTDOWN en vuelo, el shutdown gana (la flag de
+/// shutdown se chequea primero en el loop).
+extern "C" fn sigusr1_handler(_sig: libc::c_int) {
+    RELOAD_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// SIGUSR2 → renueva el timestamp ACTIVE del balloon. El vcpu loop chequea
+/// el TS cada iter (despertado por SIGALRM o por VM exit) y aplica el target
+/// ACTIVE si la VM está en IDLE. Idempotente: múltiples SIGUSR2 seguidos sólo
+/// renuevan el TS sin re-aplicar config change redundante (LAST_APPLIED_STATE
+/// gobierna eso).
+///
+/// Si el state machine no está habilitado (BALLOON_ACTIVE_MB == 0), el TS se
+/// guarda igual pero el loop lo ignora — sin efecto secundario.
+extern "C" fn sigusr2_handler(_sig: libc::c_int) {
+    // SystemTime::now no es signal-safe estrictamente, pero clock_gettime sí
+    // y SystemTime::now lo usa internamente en Linux. Para el caso no-Linux
+    // sería problemático, pero NKR es Linux-only.
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    BALLOON_ACTIVE_REQUESTED_TS.store(secs, Ordering::SeqCst);
+}
+
+/// Arms ITIMER_REAL para SIGALRM cada 5s. Mantiene el vcpu loop despierto
+/// para chequear decay del balloon incluso si el guest está en HLT (sin
+/// tráfico). Es independiente de `arm_shutdown_itimer` — si SIGTERM llega,
+/// el shutdown reprograma el itimer a 1s (ambos usan ITIMER_REAL, sólo hay
+/// uno por proceso, el último gana).
+fn arm_balloon_itimer() {
+    unsafe {
+        libc::signal(libc::SIGALRM, sigalrm_handler as *const () as libc::sighandler_t);
+        let it = libc::itimerval {
+            it_interval: libc::timeval { tv_sec: 5, tv_usec: 0 },
+            it_value:    libc::timeval { tv_sec: 5, tv_usec: 0 },
+        };
+        libc::setitimer(libc::ITIMER_REAL, &it, std::ptr::null_mut());
+    }
+}
+
 // SIGALRM handler: no action of its own. Only used to EINTR the KVM_RUN and
 // let the loop top check SHUTDOWN_REQUESTED / the 60s timeout.
 extern "C" fn sigalrm_handler(_sig: libc::c_int) {}
@@ -1993,6 +2137,8 @@ fn run_vcpu_loop(
     console_dev: &mut VirtioConsoleDevice,
     mut pmem_dev: Option<&mut VirtioPmemDevice>,
     serial_irqfd: &vmm_sys_util::eventfd::EventFd,
+    cell_id: u8,
+    vm_id: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -2030,6 +2176,82 @@ fn run_vcpu_loop(
             }
             // Retry injection if the queue wasn't ready yet
             console_dev.poll_pending();
+        }
+
+        // Reload trigger: SIGUSR1 → inyecta "REL_OD\n" por hvc0. El watcher
+        // del init guest recarga Odoo según el modo (SIGHUP master si prefork,
+        // SIGTERM+respawn si threaded) → código fresh del disco. La flag es
+        // one-shot (se consume al inyectar). Si la cola del receiveq todavía
+        // no está lista (boot
+        // muy temprano), poll_pending re-intenta. Independiente de SHUTDOWN.
+        if RELOAD_REQUESTED.swap(false, Ordering::SeqCst) {
+            eprintln!("[NKR] SIGUSR1 recibido — enviando REL_OD por hvc0...");
+            console_dev.try_inject(b"REL_OD\n");
+            console_dev.poll_pending();
+        }
+
+        // ─── Balloon ACTIVE/IDLE state machine (CLAUDE.md v2.2) ─────────────
+        // Sólo activa si la VM tiene balloon dinámico configurado
+        // (BALLOON_IDLE_MB != 0 y distinto al ACTIVE). En caso estático
+        // (PROD: idle==active==0), el chequeo es free (un load atómico).
+        let idle_mb = BALLOON_IDLE_MB.load(Ordering::Relaxed);
+        let active_mb = BALLOON_ACTIVE_MB.load(Ordering::Relaxed);
+        if idle_mb != active_mb && idle_mb > 0 {
+            let active_ts = BALLOON_ACTIVE_REQUESTED_TS.load(Ordering::SeqCst);
+            let cur_state = BALLOON_LAST_APPLIED_STATE.load(Ordering::SeqCst);
+            if active_ts > 0 {
+                let now_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let decay = BALLOON_DECAY_SECS.load(Ordering::Relaxed) as u64;
+                if now_secs.saturating_sub(active_ts) < decay {
+                    // Dentro del decay → ACTIVE. Aplicar si veníamos de IDLE
+                    // (= LAST_APPLIED_STATE != 1). Caso típico: SIGUSR2 tras
+                    // estar en IDLE → renueva TS y re-active el target.
+                    if cur_state != 1 {
+                        balloon_dev.set_target_mb(active_mb);
+                        balloon_dev.raise_config_change();
+                        BALLOON_LAST_APPLIED_STATE.store(1, Ordering::SeqCst);
+                        // Refleja el target actual en el state file (nkr ps / metrics)
+                        state::update_balloon_mb(cell_id, vm_id, active_mb);
+                        eprintln!("[NKR-BALLOON] IDLE→ACTIVE (target={} MB)", active_mb);
+                    }
+                } else {
+                    // Decay expirado → transición a IDLE.
+                    if cur_state != 0 {
+                        balloon_dev.set_target_mb(idle_mb);
+                        balloon_dev.raise_config_change();
+                        BALLOON_LAST_APPLIED_STATE.store(0, Ordering::SeqCst);
+                        BALLOON_ACTIVE_REQUESTED_TS.store(0, Ordering::SeqCst);
+                        state::update_balloon_mb(cell_id, vm_id, idle_mb);
+                        eprintln!("[NKR-BALLOON] ACTIVE→IDLE por decay (target={} MB)", idle_mb);
+                    } else {
+                        // cur_state ya era 0 — sólo limpiar TS para no
+                        // re-evaluar este branch en cada iter.
+                        BALLOON_ACTIVE_REQUESTED_TS.store(0, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+
+        // Drain the virtio-balloon stats virtqueue at most every
+        // BALLOON_STATS_INTERVAL_SECS: read the guest's MemTotal/Free/Available/
+        // Cached etc. and persist them to the state file (the daemon exposes
+        // them via /metrics and the per-instance endpoint). Independent of the
+        // ACTIVE↔IDLE machinery — the statsq is present whenever the guest
+        // negotiated F_STATS_VQ (we always advertise it).
+        {
+            let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let last = BALLOON_STATS_LAST_TS.load(Ordering::Relaxed);
+            if now_secs.saturating_sub(last) >= BALLOON_STATS_INTERVAL_SECS {
+                BALLOON_STATS_LAST_TS.store(now_secs, Ordering::Relaxed);
+                if balloon_dev.process_stats() {
+                    let s = balloon_dev.last_stats;
+                    state::update_guest_mem(cell_id, vm_id,
+                        s.mem_total_bytes, s.mem_free_bytes, s.mem_available_bytes, s.mem_cached_bytes);
+                }
+            }
         }
 
         // Feature B — io_uring: drain completions before each KVM_RUN
@@ -2289,12 +2511,12 @@ fn run_vcpu_loop(
                             }
                             0x034 => {
                                 let qi = balloon_dev.queue_sel as usize;
-                                let qn = if qi < 2 { balloon_dev.queue_num[qi] } else { 256 };
+                                let qn = if qi < 3 { balloon_dev.queue_num[qi] } else { 256 };
                                 data.copy_from_slice(&qn.to_le_bytes());
                             }
                             0x044 => {
                                 let qi = balloon_dev.queue_sel as usize;
-                                let v = if qi < 2 && balloon_dev.queue_ready[qi] { 1u32 } else { 0u32 };
+                                let v = if qi < 3 && balloon_dev.queue_ready[qi] { 1u32 } else { 0u32 };
                                 data.copy_from_slice(&v.to_le_bytes());
                             }
                             0x060 => data.copy_from_slice(&balloon_dev.interrupt_status.to_le_bytes()),
@@ -2557,13 +2779,16 @@ fn run_vcpu_loop(
                             }
                             0x024 => { balloon_dev.driver_features_sel = val; }
                             0x030 => { balloon_dev.queue_sel = val; }
-                            0x038 => { if qi < 2 { balloon_dev.queue_num[qi] = val; } }
+                            0x038 => { if qi < 3 { balloon_dev.queue_num[qi] = val; } }
                             0x044 => {
                                 if val == 1 { balloon_dev.activate_queue(qi); }
-                                else if qi < 2 { balloon_dev.queue_ready[qi] = false; }
+                                else if qi < 3 { balloon_dev.queue_ready[qi] = false; }
                             }
                             0x050 => {
-                                // QueueNotify: 0=inflate, 1=deflate
+                                // QueueNotify: 0=inflateq, 1=deflateq, 2=statsq.
+                                // statsq is NOT consumed here (consuming on every
+                                // guest kick would ping-pong) — the balloon timer
+                                // in the vcpu loop drains it at most every ~30s.
                                 if val == 0 { balloon_dev.process_inflate(); }
                                 else if val == 1 { balloon_dev.process_deflate(); }
                             }
@@ -2571,18 +2796,18 @@ fn run_vcpu_loop(
                             0x070 => {
                                 if val == 0 {
                                     balloon_dev.status = 0;
-                                    balloon_dev.queue_ready = [false, false];
+                                    balloon_dev.queue_ready = [false, false, false];
                                 } else {
                                     balloon_dev.status = val;
                                     if val == 15 { eprintln!("[NKR-BALLOON] ¡DRIVER_OK! Balloon listo."); }
                                 }
                             }
-                            0x080 => { if qi < 2 { balloon_dev.desc_low[qi] = val; } }
-                            0x084 => { if qi < 2 { balloon_dev.desc_high[qi] = val; } }
-                            0x090 => { if qi < 2 { balloon_dev.avail_low[qi] = val; } }
-                            0x094 => { if qi < 2 { balloon_dev.avail_high[qi] = val; } }
-                            0x0A0 => { if qi < 2 { balloon_dev.used_low[qi] = val; } }
-                            0x0A4 => { if qi < 2 { balloon_dev.used_high[qi] = val; } }
+                            0x080 => { if qi < 3 { balloon_dev.desc_low[qi] = val; } }
+                            0x084 => { if qi < 3 { balloon_dev.desc_high[qi] = val; } }
+                            0x090 => { if qi < 3 { balloon_dev.avail_low[qi] = val; } }
+                            0x094 => { if qi < 3 { balloon_dev.avail_high[qi] = val; } }
+                            0x0A0 => { if qi < 3 { balloon_dev.used_low[qi] = val; } }
+                            0x0A4 => { if qi < 3 { balloon_dev.used_high[qi] = val; } }
                             _ => {}
                         }
                     }

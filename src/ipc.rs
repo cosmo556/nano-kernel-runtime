@@ -56,6 +56,9 @@ pub enum IpcRequest {
     Health,
     ListCells,
     RenderMetrics,
+    /// Per-VM metrics snapshot as JSON (the panel's per-instance Metrics tab).
+    /// Cached server-side ~30s; the disk `du` cached longer. 404 if unknown.
+    MetricsForVm { nkr_name: String },
     /// Create instance. `body_json` is the full JSON body received from the
     /// panel — daemon parses it with its typed CreateInstanceReq schema.
     CreateInstance {
@@ -146,12 +149,50 @@ pub enum IpcRequest {
     /// archivos `/web/static/` (logos, imgs, fonts), donde la URL es fija y la
     /// entry vieja serviría stale data por hasta 24h.
     PurgeCache,
+    /// Reload de workers Odoo SIN reiniciar la VM. Daemon manda SIGUSR1 al
+    /// proceso de la VM, vmm.rs inyecta "REL_OD\n" por hvc0, init guest hace
+    /// pkill -HUP odoo → master mata workers → respawnean con código fresh
+    /// del disco. ~3s, sin downtime de master ni VM. Usado tras addons/git
+    /// (auto) y vía POST /reload (manual). Idempotente — múltiples reloads
+    /// rápidos colapsan en uno solo.
+    ReloadWorkers {
+        nkr_name: String,
+    },
+    /// Marca la VM como ACTIVE en el ballooning dinámico (CLAUDE.md v2.2).
+    /// Daemon manda SIGUSR2 al proceso de la VM; vmm.rs renueva el TS y
+    /// el vcpu loop aplica el target ACTIVE en ≤5s. Si la VM tiene balloon
+    /// estático (PROD por tier), la señal es no-op — la respuesta sigue
+    /// siendo 202 para idempotencia desde el panel.
+    BalloonActive {
+        nkr_name: String,
+    },
+    /// Diagnóstico HOST-side: captura stacks/wchan/cpu de los threads del
+    /// proceso `nkr` del tenant. Devuelve text/plain con dump multi-sección.
+    /// Útil cuando el watchdog detecta cuelgue y queremos snapshot pre-restart.
+    /// Idempotente, ~50ms. Ver `api::handle_diag` para el output.
+    Diag {
+        nkr_name: String,
+    },
+    /// SSO one-shot: NKR pre-autentica con el admin_passwd del tenant y
+    /// devuelve una URL firmada (HMAC) para auto-login. Ver `handle_sso`
+    /// para el flujo completo. El password jamás sale del host.
+    Sso {
+        nkr_name: String,
+        user: String,
+    },
     /// Estado del repo Odoo Enterprise descargado en una cell. El panel lo
     /// usa para decidir si puede aceptar `edition: "enterprise"` al crear
     /// tenants — si la cell no tiene el repo descargado, el tenant arrancaría
     /// con manifests faltantes y warnings en log.
     GetEnterpriseStatus {
         cell: String,
+    },
+    /// Estado de un create asíncrono lanzado por `POST /instances` (v1.6.4+).
+    /// El panel pollea esto hasta `status` ∈ {`ready`, `failed`}. Lee el status
+    /// file en `/mnt/nkr/cells/{cell}/.nkr-creates/{nkr_name}.json`.
+    GetCreateStatus {
+        cell: String,
+        nkr_name: String,
     },
 }
 

@@ -87,8 +87,14 @@ if [ -d /sys/class/net/eth0 ]; then
     ip link set lo up
     ip link set eth0 up
     ip addr add ${GUEST_IP}/24 dev eth0
-    ip route add default via 10.0.0.1
-    echo "[NKR] eth0: ${GUEST_IP}/24"
+    # Default route: derivar del propio GUEST_IP. NKR convención
+    # (registry.rs:215): IP = 10.0.{cell_id}.{vm_id+1}. El gateway
+    # del bridge de cada cell es 10.0.{cell_id}.1. Antes estaba
+    # hardcoded 10.0.0.1 (bridge legacy nkr0) → cells > 0 no podían
+    # salir a internet (DNS / IAP / partner-autocomplete failed).
+    GW=$(echo "$GUEST_IP" | awk -F. '{print $1"."$2"."$3".1"}')
+    ip route add default via "$GW"
+    echo "[NKR] eth0: ${GUEST_IP}/24 default-gw=${GW}"
 fi
 
 mkdir -p /newroot
@@ -112,6 +118,7 @@ if [ -b /dev/pmem0 ]; then
 elif [ -n "$NKR_ROOTFS" ]; then
     echo "[NKR] rootfs: VirtIO-FS compartido (tag=$NKR_ROOTFS, RO)"
     mount -t virtiofs -o ro "$NKR_ROOTFS" /newroot
+    echo "[NKR-DEBUG] rootfs mount opts: $(grep ' /newroot ' /proc/mounts 2>/dev/null | head -1 || echo '?')"
     # Breathing zones — tmpfs overlays on RO rootfs
     mount -t tmpfs tmpfs /newroot/tmp
     mount -t tmpfs tmpfs /newroot/run
@@ -120,6 +127,15 @@ elif [ -n "$NKR_ROOTFS" ]; then
     mkdir -p /newroot/var/run/postgresql /newroot/var/log
     mount -t tmpfs tmpfs /newroot/var/run/postgresql
     mount -t tmpfs tmpfs /newroot/var/log
+    # /mnt/ → tmpfs: acá se crean los mountpoints de los virtio-fs shares
+    # (/mnt/extra-addons, /mnt/systemouts-addons, /mnt/extra-pylibs, ...).
+    # Tapa los dirs baked del rootfs (con .keep) pero los shares se montan
+    # encima, así que el contenido baked es irrelevante. Hace que un share
+    # /mnt/* NUEVO "just work" sin rebuild del rootfs maestro (que es RO → el
+    # initramfs no podría hacer mkdir del mountpoint). Mismo patrón que
+    # /var/log y /tmp arriba. Si el rootfs no tiene /mnt (raro), se skipea.
+    [ -d /newroot/mnt ] && mount -t tmpfs tmpfs /newroot/mnt \
+        && echo "[NKR] /mnt → tmpfs (mountpoints de virtio-fs shares se crean acá)"
 else
     echo "[NKR] rootfs: /dev/vda detectado (Modo bloque estándar)"
     mount -t ext4 -o rw /dev/vda /newroot
@@ -475,8 +491,9 @@ if [ -d /sys/class/net/eth0 ]; then
     ip link set lo up
     ip link set eth0 up
     ip addr add ${{GUEST_IP}}/24 dev eth0
-    ip route add default via 10.0.0.1
-    echo "[NKR-{label}] eth0: ${{GUEST_IP}}/24"
+    GW=$(echo "$GUEST_IP" | awk -F. '{{print $1"."$2"."$3".1"}}')
+    ip route add default via "$GW"
+    echo "[NKR-{label}] eth0: ${{GUEST_IP}}/24 default-gw=${{GW}}"
 fi
 
 mkdir -p /newroot
@@ -499,6 +516,7 @@ elif [ -n "$NKR_ROOTFS" ]; then
     mount -t virtiofs -o ro "$NKR_ROOTFS" /newroot \
         && echo "[NKR-{label}] [DBG] rootfs OK" \
         || echo "[NKR-{label}] [DBG] rootfs FALLO"
+    echo "[NKR-{label}] [DBG] rootfs mount opts: $(grep ' /newroot ' /proc/mounts 2>/dev/null | head -1 || echo '?')"
     # Breathing zones — tmpfs overlays on RO rootfs
     mount -t tmpfs tmpfs /newroot/tmp && echo "[NKR-{label}] [DBG] /tmp OK"
     mount -t tmpfs tmpfs /newroot/run && echo "[NKR-{label}] [DBG] /run OK"
@@ -510,6 +528,17 @@ elif [ -n "$NKR_ROOTFS" ]; then
     mount -t tmpfs tmpfs /newroot/var/log \
         && echo "[NKR-{label}] [DBG] /var/log OK" \
         || echo "[NKR-{label}] [DBG] /var/log FALLO"
+    # /mnt/ → tmpfs: acá se crean los mountpoints de los virtio-fs shares
+    # (/mnt/extra-addons, /mnt/systemouts-addons, /mnt/extra-pylibs, ...).
+    # Tapa los dirs baked del rootfs (con .keep) pero los shares se montan
+    # encima → contenido baked irrelevante. Hace que un share /mnt/* NUEVO
+    # "just work" sin rebuild del rootfs maestro (RO → no se puede mkdir el
+    # mountpoint). Mismo patrón que /var/log y /tmp arriba.
+    if [ -d /newroot/mnt ]; then
+        mount -t tmpfs tmpfs /newroot/mnt \
+            && echo "[NKR-{label}] [DBG] /mnt → tmpfs OK" \
+            || echo "[NKR-{label}] [DBG] /mnt → tmpfs FALLO"
+    fi
 else
     echo "[NKR-{label}] rootfs: /dev/vda detectado (Modo bloque estándar)"
     mount -t ext4 -o rw /dev/vda /newroot
@@ -616,6 +645,53 @@ done
 cat /newroot/etc/hosts > /newroot/tmp/hosts 2>/dev/null || echo "127.0.0.1 localhost" > /newroot/tmp/hosts
 mount -o bind /newroot/tmp/hosts /newroot/etc/hosts
 
+# DNS para que el guest pueda resolver dominios externos (partner-autocomplete,
+# IAP, mail outbound vía SMTP por hostname, OAuth, etc.). El rootfs es RO, así
+# que escribimos a tmpfs y bind-mount sobre /etc/resolv.conf.
+# Usamos resolvers públicos por defecto (Cloudflare + Google) — sobrescribibles
+# vía kernel cmdline `nkr.dns=<ip>[,<ip2>]`.
+NKR_DNS_LIST="1.1.1.1 8.8.8.8"
+for param in $(cat /proc/cmdline); do
+    case "$param" in
+        nkr.dns=*) NKR_DNS_LIST="$(echo ${{param#nkr.dns=}} | tr ',' ' ')" ;;
+    esac
+done
+{{
+    for ns in $NKR_DNS_LIST; do echo "nameserver $ns"; done
+    echo "options timeout:2 attempts:2"
+}} > /newroot/tmp/resolv.conf
+# Si /etc/resolv.conf en el rootfs es symlink (común en imágenes Debian/Ubuntu
+# que tenían systemd-resolved al builder), `mount -o bind` falla porque el
+# kernel resuelve el symlink y trata de montar sobre el target inexistente.
+# Fix: borrar el symlink en el espacio del rootfs ANTES del mount no es
+# posible (rootfs RO). Lo que sí podemos: si es symlink, bind-mount al
+# target real (creándolo en tmpfs primero).
+if [ -L /newroot/etc/resolv.conf ]; then
+    _link=$(readlink /newroot/etc/resolv.conf)
+    case "$_link" in
+        /*) _abs="/newroot$_link" ;;
+        *)  _abs="/newroot/etc/$_link" ;;
+    esac
+    /bin/busybox mkdir -p "$(/bin/busybox dirname "$_abs")" 2>/dev/null
+    : > "$_abs" 2>/dev/null
+    mount -o bind /newroot/tmp/resolv.conf "$_abs" 2>/dev/null
+    echo "[NKR-{label}] DNS: /etc/resolv.conf era symlink → $_link, montado en $_abs"
+else
+    mount -o bind /newroot/tmp/resolv.conf /newroot/etc/resolv.conf 2>/dev/null
+    echo "[NKR-{label}] DNS: /etc/resolv.conf bind-mount directo"
+fi
+# Debug en /var/log/odoo (virtio-fs share, visible desde host) — tolerante si
+# el dir no existe todavía.
+/bin/busybox mkdir -p /newroot/var/log/odoo 2>/dev/null
+{{
+    echo "=== NKR DNS DEBUG ==="
+    echo "DNS_LIST=$NKR_DNS_LIST"
+    echo "ls /etc/resolv.conf:"; ls -la /newroot/etc/resolv.conf 2>&1
+    echo "cat /etc/resolv.conf:"; /bin/busybox cat /newroot/etc/resolv.conf 2>&1
+    echo "mounts(resolv|hosts):"; /bin/busybox grep -E "resolv|hosts" /proc/mounts 2>&1
+}} > /newroot/var/log/odoo/nkr-dns-debug.log 2>&1 || true
+echo "[NKR-{label}] DNS configurado: $NKR_DNS_LIST"
+
 # Clean-shutdown watcher — runs in the init context (has /bin/busybox)
 ( echo "[NKR-{label}-WATCHER] esperando /dev/hvc0..."
   _wct=0
@@ -626,10 +702,61 @@ mount -o bind /newroot/tmp/hosts /newroot/etc/hosts
   fi
   echo "[NKR-{label}-WATCHER] /dev/hvc0 listo (tras ${{_wct}}*100ms) — bloqueado leyendo..."
   _nkr_cmd=""
-  read -r _nkr_cmd < /dev/hvc0 || true
-  echo "[NKR-{label}] Comando '$_nkr_cmd' en hvc0 — apagado limpio..."
-  _HANDLED=0
-  # PostgreSQL: prefer coordinated shutdown via postmaster.pid
+  # Loop hvc0 con dispatch: el watcher era single-shot (un read → SHUTDOWN
+  # → poweroff). Ahora soporta múltiples comandos:
+  #   SHUTDOWN  → apagado limpio + poweroff (terminal, rompe el loop)
+  #   REL_OD    → recarga Odoo con código fresh del disco según el modo:
+  #               workers>0 (prefork)  → SIGHUP al master (respawnea workers)
+  #               workers=0 (threaded) → SIGTERM al proceso (supervisor loop
+  #               de nkr-start.sh lo relanza). NO termina el loop, sigue
+  #               escuchando hvc0 para próximos comandos.
+  # NKR daemon (host) inyecta REL_OD vía SIGUSR1 al proceso de la VM tras
+  # un addons/git exitoso o cuando el panel llama POST /reload.
+  while true; do
+    _nkr_cmd=""
+    read -r _nkr_cmd < /dev/hvc0 || break
+    [ -z "$_nkr_cmd" ] && continue
+    echo "[NKR-{label}] hvc0 cmd='$_nkr_cmd'"
+
+    # ─── REL_OD: reload de workers Odoo (sin matar la VM) ──────────────
+    if [ "$_nkr_cmd" = "REL_OD" ]; then
+      # Diferenciación por modo Odoo (workers=0 vs workers>0):
+      #   - workers=0 (threaded): UN solo proceso Odoo werkzeug. SIGHUP no
+      #     respawnea por sí solo. Solución: SIGTERM al proceso → muere →
+      #     el supervisor loop de nkr-start.sh lo relanza inmediatamente
+      #     con código fresh del disco.
+      #   - workers>0 (prefork): master + N workers. SIGHUP al master →
+      #     handler interno kill_workers + respawn con código fresh.
+      #     Master sobrevive, supervisor loop no se entera.
+      # Detección: leer 'workers = N' del odoo.conf bind-mounted bajo
+      # /newroot/etc/odoo/odoo.conf. Si no existe o N==0 → threaded.
+      _NKR_W=$(/bin/busybox grep -E '^[[:space:]]*workers[[:space:]]*=' \
+               /newroot/etc/odoo/odoo.conf 2>/dev/null \
+               | /bin/busybox awk -F= '{{gsub(/[[:space:]]/, "", $2); print $2}}' \
+               | /bin/busybox head -n1)
+      if [ -z "$_NKR_W" ] || [ "$_NKR_W" = "0" ]; then
+        # Threaded: kill + supervisor respawn
+        if /bin/busybox pkill -TERM -f '/usr/bin/odoo' 2>/dev/null; then
+          echo "[NKR-{label}] REL_OD (workers=0/threaded): SIGTERM → supervisor loop respawn"
+        else
+          echo "[NKR-{label}] REL_OD: proceso Odoo no encontrado (skip)"
+        fi
+      else
+        # Prefork: SIGHUP master → handler respawnea workers
+        if /bin/busybox pkill -HUP -f '/usr/bin/odoo' 2>/dev/null; then
+          echo "[NKR-{label}] REL_OD (workers=$_NKR_W/prefork): SIGHUP master → workers respawneando"
+        else
+          echo "[NKR-{label}] REL_OD: master Odoo no encontrado (skip)"
+        fi
+      fi
+      continue
+    fi
+
+    # ─── Cualquier otro cmd o cmd vacío: tratar como SHUTDOWN ──────────
+    # (back-compat con SHUTDOWN explícito y comandos legacy)
+    echo "[NKR-{label}] Apagado limpio…"
+    _HANDLED=0
+    # PostgreSQL: prefer coordinated shutdown via postmaster.pid
   for _pgdata in /newroot/var/lib/postgresql/data /newroot/var/lib/postgresql/16/data /newroot/var/lib/postgresql/15/data; do
     if [ -f "$_pgdata/postmaster.pid" ]; then
       _PG_PID=$(/bin/busybox head -n1 "$_pgdata/postmaster.pid" 2>/dev/null)
@@ -689,6 +816,8 @@ mount -o bind /newroot/tmp/hosts /newroot/etc/hosts
   /bin/busybox sync
   echo "[NKR-{label}] Filesystems sincronizados, apagando."
   /bin/busybox reboot -f
+  break  # nunca llega — reboot -f es terminal, pero defensivo
+  done  # while true del dispatcher hvc0
 ) &
 
 # Write nkr-start.sh to tmpfs (not on RO rootfs)
@@ -913,7 +1042,32 @@ echo "[NKR-{label}] Ejecutando comando final: $COMMAND"
 # values (DB_HOST, DB_PASSWORD, etc. are inherited via `su -p` from the
 # already-exported env, not embedded in the command string). COMMAND is a
 # fixed template with binary paths + symbolic references.
-eval "exec $COMMAND"
+#
+# Supervisor loop (CLAUDE.md v2.2 — solo Odoo):
+#   workers=0 (threaded): REL_OD = SIGTERM al proceso → muere → loop
+#     respawnea con código fresh del disco. ~2s end-to-end.
+#   workers>0 (prefork):  REL_OD = SIGHUP al master → master respawnea
+#     workers internamente. El proceso master NO muere → loop nunca
+#     itera (good — el master mantiene estado en memoria).
+#   SHUTDOWN: el watcher hvc0 hace killall5 → mata el supervisor loop
+#     también → poweroff → loop nunca respawnea (kernel halt).
+#
+# Resiliencia bonus: si Odoo crashea por OOM o panic Python, el loop
+# lo respawnea automáticamente (igual que un systemd restart=always).
+#
+# Sólo aplicamos el loop a Odoo (cuando _ODOO_CMD está set). PG/pgbouncer
+# tienen su propia mecánica (single exec, WAL replay en boot).
+if [ -n "$_ODOO_CMD" ]; then
+    while true; do
+        echo "[NKR-{label}] Lanzando Odoo (supervisor): $COMMAND"
+        eval "$COMMAND"
+        _RC=$?
+        echo "[NKR-{label}] Odoo salió rc=$_RC — respawn en 1s"
+        sleep 1
+    done
+else
+    eval "exec $COMMAND"
+fi
 NKREOF
 
 chmod +x /newroot/tmp/nkr-start.sh

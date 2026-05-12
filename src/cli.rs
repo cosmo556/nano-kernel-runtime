@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "nkr",
-    version = "1.6.1",
-    about = "NKR — Nano-Kernel Runtime v1.6.1: tier system + edge dual + faster restart",
+    version = "1.6.3",
+    about = "NKR — Nano-Kernel Runtime v1.6.3: auto_start flag + auto-seal web.base.url + snapshot_at en nkr_status",
     long_about = "NKR reemplaza Docker usando micro-VMs con KVM.\nCada contenedor corre en su propia VM con aislamiento total y acceso directo al hardware."
 )]
 pub struct Cli {
@@ -91,8 +91,27 @@ pub enum Command {
         /// Inflate the VirtIO-Balloon by MB: the guest returns that RAM to the host.
         /// Useful to reclaim memory from idle instances without restarting them.
         /// Example: --balloon-mb 300 reclaims 300 MB from a 700 MB VM.
+        ///
+        /// Bajo ballooning IDLE/ACTIVE (CLAUDE.md v2.2) este es el target ACTIVE
+        /// (valor de BOOT — la VM nace con este balloon). Para DEV=0, STAG=256,
+        /// PROD=0. Debe ser bajo para evitar OOM en bootstrap de Odoo.
         #[arg(long, default_value_t = 0)]
         balloon_mb: u32,
+
+        /// Target IDLE del balloon (MB inflados cuando la VM lleva
+        /// `balloon-decay-secs` sin actividad). 0 (default) = balloon estático:
+        /// la VM se queda en `balloon_mb` siempre, sin transición dinámica.
+        /// Con valor != balloon_mb, vmm transiciona a este target tras el
+        /// decay y vuelve a ACTIVE en cada SIGUSR2 (POST /balloon).
+        #[arg(long, default_value_t = 0)]
+        balloon_idle_mb: u32,
+
+        /// Segundos sin renovación SIGUSR2 antes de transicionar a IDLE.
+        /// Sólo aplica si balloon-idle-mb != balloon-mb. Default 600s (10 min).
+        /// El reloj arranca al boot — pero la VM nace ACTIVE (balloon=balloon_mb)
+        /// y la primera transición a IDLE recién ocurre tras decay_secs sin SIGUSR2.
+        #[arg(long, default_value_t = 600)]
+        balloon_decay_secs: u32,
 
         /// Enable CPU burst (Smart default v1.3: true).
         /// Allows using idle CPU cycles in short bursts (kernel >= 5.15, cpu.max.burst).
@@ -320,8 +339,15 @@ pub struct VmConfig {
     pub rootfs: Option<String>,
     /// Enable VirtIO-PMEM + DAX for the main disk
     pub use_pmem: bool,
-    /// MB to inflate in the VirtIO-Balloon (0 = balloon disabled)
+    /// MB to inflate in the VirtIO-Balloon (0 = balloon disabled).
+    /// Bajo ballooning dinámico, este es el target ACTIVE (valor de BOOT).
     pub balloon_mb: u32,
+    /// Target IDLE del balloon (MB inflados sin tráfico, post-decay). Si
+    /// == `balloon_mb`, la VM se queda estática (sin transición dinámica).
+    /// Default 0.
+    pub balloon_idle_mb: u32,
+    /// Segundos sin renovación antes de transicionar de ACTIVE a IDLE. Default 600s.
+    pub balloon_decay_secs: u32,
     /// Enable CPU burst: allows using other VMs' idle cycles in short bursts.
     /// Smart default v1.3: true. Only disable on VMs requiring predictable latency.
     pub burst: bool,

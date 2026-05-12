@@ -24,8 +24,16 @@ RestartSec=2s
 StartLimitBurst=5
 StartLimitIntervalSec=60s
 
-# Kill signal handling: the daemon is a loop — plain SIGTERM is fine.
-KillMode=mixed
+# Kill signal handling: KillMode=process porque las VMs guest spawneadas vía
+# API quedan en el cgroup del daemon. Con KillMode=mixed, si el daemon tarda
+# >TimeoutStopSec en exit gracefully, systemd manda SIGKILL al cgroup ENTERO
+# y mata las VMs (incidentes confirmados 2026-05-10). KillMode=process solo
+# signal'a al main proc del daemon — las VMs hijas siguen vivas (mismo
+# comportamiento que las VMs spawneadas via `compose up -d` que ya quedan
+# huérfanas de init y sobreviven). Trade-off: si el daemon crashea, las VMs
+# siguen corriendo huérfanas (las limpia el janitor del daemon nuevo o
+# requiere intervención manual).
+KillMode=process
 TimeoutStopSec=20s
 
 # Logs to journalctl -u nkr

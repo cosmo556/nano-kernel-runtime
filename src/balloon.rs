@@ -47,6 +47,32 @@ const MAX_BYTES_PER_DESC: u32 = 64 * 1024;
 const VIRTIO_BALLOON_F_MUST_TELL_HOST: u64 = 1 << 0;
 const VIRTIO_BALLOON_F_STATS_VQ: u64       = 1 << 1;
 
+// virtio_balloon_stat tags (statsq). Each entry on the wire is `le16 tag;
+// le64 val;` packed = 10 bytes. We only consume the ones we expose.
+const VIRTIO_BALLOON_S_SWAP_IN:  u16 = 0; // bytes
+const VIRTIO_BALLOON_S_SWAP_OUT: u16 = 1; // bytes
+const VIRTIO_BALLOON_S_MAJFLT:   u16 = 2; // count
+const VIRTIO_BALLOON_S_MINFLT:   u16 = 3; // count
+const VIRTIO_BALLOON_S_MEMFREE:  u16 = 4; // bytes
+const VIRTIO_BALLOON_S_MEMTOT:   u16 = 5; // bytes
+const VIRTIO_BALLOON_S_AVAIL:    u16 = 6; // bytes
+const VIRTIO_BALLOON_S_CACHES:   u16 = 7; // bytes
+const VIRTIO_BALLOON_STAT_SIZE: u64 = 10; // 2-byte tag + 8-byte val, packed
+
+/// Guest-internal memory snapshot parsed from the stats virtqueue (bytes /
+/// counts). 0 means "not reported by the guest yet".
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GuestStats {
+    pub mem_total_bytes: u64,
+    pub mem_free_bytes: u64,
+    pub mem_available_bytes: u64,
+    pub mem_cached_bytes: u64,
+    pub swap_in_bytes: u64,
+    pub swap_out_bytes: u64,
+    pub major_faults: u64,
+    pub minor_faults: u64,
+}
+
 pub struct VirtioBalloonDevice {
     /// Number of 4 KB pages the hypervisor wants to reclaim
     pub target_pages: u32,
@@ -60,16 +86,25 @@ pub struct VirtioBalloonDevice {
     pub driver_features_sel: u32,
     pub driver_features: u64,
     pub queue_sel: u32,
-    pub queue_num:   [u32; 2],
-    pub queue_ready: [bool; 2],
-    pub desc_low:  [u32; 2], pub desc_high:  [u32; 2],
-    pub avail_low: [u32; 2], pub avail_high: [u32; 2],
-    pub used_low:  [u32; 2], pub used_high:  [u32; 2],
+    pub queue_num:   [u32; 3],
+    pub queue_ready: [bool; 3],
+    pub desc_low:  [u32; 3], pub desc_high:  [u32; 3],
+    pub avail_low: [u32; 3], pub avail_high: [u32; 3],
+    pub used_low:  [u32; 3], pub used_high:  [u32; 3],
 
     /// inflateq (queue 0): guest donates PFNs → host marks them MADV_DONTNEED
     pub inflateq: Queue,
     /// deflateq (queue 1): guest reclaims PFNs → host removes them from the list
     pub deflateq: Queue,
+    /// statsq (queue 2, VIRTIO_BALLOON_F_STATS_VQ): the guest submits one
+    /// device-readable buffer of `virtio_balloon_stat` entries at probe; the
+    /// device consumes it (reads stats, marks used) when it wants a refresh —
+    /// the guest then refills with fresh stats and re-submits. We consume it
+    /// at most every ~30s from the vmm balloon timer.
+    pub statsq: Queue,
+    /// Last guest-memory snapshot read off the statsq (0s until the guest
+    /// reports). The vmm persists this to the VM state file.
+    pub last_stats: GuestStats,
 
     pub ioeventfd: EventFd,
     pub irqfd: EventFd,
@@ -117,13 +152,15 @@ impl VirtioBalloonDevice {
             driver_features_sel: 0,
             driver_features: 0,
             queue_sel: 0,
-            queue_num:   [256, 256],
-            queue_ready: [false, false],
-            desc_low:  [0; 2], desc_high:  [0; 2],
-            avail_low: [0; 2], avail_high: [0; 2],
-            used_low:  [0; 2], used_high:  [0; 2],
+            queue_num:   [256, 256, 256],
+            queue_ready: [false, false, false],
+            desc_low:  [0; 3], desc_high:  [0; 3],
+            avail_low: [0; 3], avail_high: [0; 3],
+            used_low:  [0; 3], used_high:  [0; 3],
             inflateq: Queue::new(256).unwrap(),
             deflateq: Queue::new(256).unwrap(),
+            statsq:   Queue::new(256).unwrap(),
+            last_stats: GuestStats::default(),
             ioeventfd,
             irqfd,
             mem,
@@ -143,6 +180,21 @@ impl VirtioBalloonDevice {
         self.target_pages = mb * 256; // 256 pages × 4 KB = 1 MB
         eprintln!("[NKR-BALLOON] Objetivo: {} MB ({} páginas de 4 KB)",
             mb, self.target_pages);
+    }
+
+    /// Notifies the guest of a config-space change (target_pages updated)
+    /// so its balloon driver re-reads offset 0x100 and starts inflate or
+    /// deflate to reach the new target.
+    ///
+    /// virtio v1.x ISR semantics: bit 1 = vring used, bit 2 = config change.
+    /// Guests check ISR and dispatch accordingly. Without this notification
+    /// the driver would only see the new target on its own slow polling
+    /// (typical kernel: never until restart), so dynamic balloon transitions
+    /// (IDLE↔ACTIVE) require this irqfd write to be effective in seconds
+    /// rather than at the next reboot.
+    pub fn raise_config_change(&mut self) {
+        self.interrupt_status |= 2;
+        let _ = self.irqfd.write(1);
     }
 
     /// MB currently inflated (reclaimed from the guest and returned to the host OS).
@@ -171,16 +223,20 @@ impl VirtioBalloonDevice {
     // ─────────────────────────────────────────────────────────────────────────
 
     pub fn activate_queue(&mut self, qi: usize) {
-        if qi >= 2 { return; }
-        let q = if qi == 0 { &mut self.inflateq } else { &mut self.deflateq };
-        q.set_size(self.queue_num[qi].max(256) as u16);
-        q.set_desc_table_address(Some(self.desc_low[qi]), Some(self.desc_high[qi]));
-        q.set_avail_ring_address(Some(self.avail_low[qi]), Some(self.avail_high[qi]));
-        q.set_used_ring_address(Some(self.used_low[qi]), Some(self.used_high[qi]));
+        if qi >= 3 { return; }
+        let size = self.queue_num[qi].max(256) as u16;
+        let (dl, dh) = (self.desc_low[qi], self.desc_high[qi]);
+        let (al, ah) = (self.avail_low[qi], self.avail_high[qi]);
+        let (ul, uh) = (self.used_low[qi], self.used_high[qi]);
+        let q = match qi { 0 => &mut self.inflateq, 1 => &mut self.deflateq, _ => &mut self.statsq };
+        q.set_size(size);
+        q.set_desc_table_address(Some(dl), Some(dh));
+        q.set_avail_ring_address(Some(al), Some(ah));
+        q.set_used_ring_address(Some(ul), Some(uh));
         q.set_ready(true);
         self.queue_ready[qi] = true;
         eprintln!("[NKR-BALLOON] Cola '{}' activada",
-            if qi == 0 { "inflateq" } else { "deflateq" });
+            match qi { 0 => "inflateq", 1 => "deflateq", _ => "statsq" });
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -313,6 +369,60 @@ impl VirtioBalloonDevice {
 
         eprintln!("[NKR-BALLOON] Desinflado: {} páginas restantes ({} MB en balloon)",
             self.actual_pages, self.inflated_mb());
+    }
+
+    /// Consumes one buffer off the statsq if the guest has submitted one:
+    /// reads the `virtio_balloon_stat` entries, updates `last_stats`, and marks
+    /// the buffer used (which makes the guest refill it with fresh stats and
+    /// re-submit). Returns `true` if it consumed a buffer (→ caller should
+    /// persist `last_stats`). Idempotent and cheap when there's nothing queued.
+    /// Call at most every ~30s — calling on every guest kick would ping-pong
+    /// (consume → guest refills+kicks → consume → …) and waste CPU.
+    pub fn process_stats(&mut self) -> bool {
+        if !self.queue_ready[2] { return false; }
+        let mem = self.mem.as_ref();
+        let mut consumed: Option<(u16, u32)> = None;
+        let mut stats = self.last_stats; // start from last so missing tags keep their value
+        {
+            let mut iter = match self.statsq.iter(mem) { Ok(it) => it, Err(_) => return false };
+            if let Some(mut chain) = iter.next() {
+                let head = chain.head_index();
+                let mut total = 0u32;
+                while let Some(desc) = chain.next() {
+                    total += desc.len();
+                    // A stats buffer is ~140 bytes; anything > 64 KB is bogus.
+                    let safe_len = desc.len().min(MAX_BYTES_PER_DESC) as u64;
+                    let mut off = 0u64;
+                    while off + VIRTIO_BALLOON_STAT_SIZE <= safe_len {
+                        let tag = mem.read_obj::<u16>(desc.addr().unchecked_add(off)).unwrap_or(0xFFFF);
+                        let val = mem.read_obj::<u64>(desc.addr().unchecked_add(off + 2)).unwrap_or(0);
+                        match tag {
+                            VIRTIO_BALLOON_S_MEMFREE  => stats.mem_free_bytes = val,
+                            VIRTIO_BALLOON_S_MEMTOT   => stats.mem_total_bytes = val,
+                            VIRTIO_BALLOON_S_AVAIL    => stats.mem_available_bytes = val,
+                            VIRTIO_BALLOON_S_CACHES   => stats.mem_cached_bytes = val,
+                            VIRTIO_BALLOON_S_SWAP_IN  => stats.swap_in_bytes = val,
+                            VIRTIO_BALLOON_S_SWAP_OUT => stats.swap_out_bytes = val,
+                            VIRTIO_BALLOON_S_MAJFLT   => stats.major_faults = val,
+                            VIRTIO_BALLOON_S_MINFLT   => stats.minor_faults = val,
+                            _ => {}
+                        }
+                        off += VIRTIO_BALLOON_STAT_SIZE;
+                    }
+                }
+                consumed = Some((head, total));
+            }
+        }
+        match consumed {
+            Some((head, len)) => {
+                self.last_stats = stats;
+                let _ = self.statsq.add_used(mem, head, len);
+                self.interrupt_status |= 1;
+                let _ = self.irqfd.write(1);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn features_for_sel(&self, sel: u32) -> u32 {

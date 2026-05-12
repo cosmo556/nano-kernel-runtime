@@ -83,6 +83,16 @@ pub fn run() -> std::io::Result<()> {
         .spawn(crate::janitor::run_loop)
         .ok();
 
+    // Watchdog: cada 15s sondea TCP :8069 de cada tenant Odoo running.
+    // Si lleva 60s consecutivos sin responder, auto-dispara restart. Cubre
+    // el sintomático del bug "Odoo cuelga en D-state y REL_OD no destraba"
+    // sin necesidad de operador (panel) ejecutando restart manual cada vez.
+    // Bypass via env var NKR_WATCHDOG_DISABLED=1.
+    std::thread::Builder::new()
+        .name("nkr-watchdog".into())
+        .spawn(crate::watchdog::run_loop)
+        .ok();
+
     let inflight = Arc::new(AtomicU32::new(0));
 
     for stream in listener.incoming() {
@@ -200,6 +210,16 @@ fn dispatch(req: IpcRequest) -> IpcResponse {
             let body = crate::metrics::render_prometheus_metrics();
             IpcResponse::text(200, "text/plain; version=0.0.4; charset=utf-8", body)
         }
+        IpcRequest::MetricsForVm { nkr_name } => {
+            if !crate::api_http::is_safe_identifier(&nkr_name) {
+                return IpcResponse::error(400, "invalid_nkr_name", None);
+            }
+            match crate::metrics::vm_metrics_json(&nkr_name) {
+                Some(v) => IpcResponse::json(200, v),
+                None => IpcResponse::error(404, "vm_not_found",
+                    Some("no running VM nor known tenant with that name")),
+            }
+        }
         IpcRequest::CreateInstance { cell_hint, body_json } => {
             api::handle_create(cell_hint.as_deref(), &body_json)
         }
@@ -233,6 +253,11 @@ fn dispatch(req: IpcRequest) -> IpcResponse {
             api::handle_psql(&nkr_name, &query, max_rows)
         }
         IpcRequest::PurgeCache => api::handle_purge_cache(),
+        IpcRequest::ReloadWorkers { nkr_name } => api::handle_reload_workers(&nkr_name),
+        IpcRequest::BalloonActive { nkr_name } => api::handle_balloon_active(&nkr_name),
+        IpcRequest::Diag { nkr_name } => api::handle_diag(&nkr_name),
+        IpcRequest::Sso { nkr_name, user } => api::handle_sso(&nkr_name, &user),
         IpcRequest::GetEnterpriseStatus { cell } => api::handle_enterprise_status(&cell),
+        IpcRequest::GetCreateStatus { cell, nkr_name } => api::handle_create_status(&cell, &nkr_name),
     }
 }

@@ -46,6 +46,18 @@ pub struct VmState {
     /// Cell ID (0 = legacy, 1-254 = cell with isolated bridge)
     #[serde(default)]
     pub cell_id: u8,
+    /// Guest-internal memory stats (bytes), from the virtio-balloon stats
+    /// virtqueue. 0 = the guest hasn't reported yet (driver not up, or no
+    /// VIRTIO_BALLOON_F_STATS_VQ). The vmm refreshes these every ~30s and
+    /// rewrites the state file (same pattern as `balloon_mb`).
+    #[serde(default)]
+    pub guest_mem_total_bytes: u64,
+    #[serde(default)]
+    pub guest_mem_free_bytes: u64,
+    #[serde(default)]
+    pub guest_mem_available_bytes: u64,
+    #[serde(default)]
+    pub guest_mem_cached_bytes: u64,
 }
 
 /// Registers an active VM by writing its state to disk.
@@ -58,6 +70,43 @@ pub fn register_vm(state: &VmState) -> Result<(), Box<dyn std::error::Error>> {
     file.write_all(json.as_bytes())?;
     eprintln!("[NKR] VM {}/{} registrada en {}", state.cell_id, state.vm_id, path.display());
     Ok(())
+}
+
+/// Actualiza `balloon_mb` en el state file de una VM (cell_id/vm_id) sin
+/// tocar el resto. Lo llama el vmm al transicionar ACTIVE↔IDLE en el
+/// ballooning dinámico, para que `nkr ps` / `/metrics` reflejen el target
+/// actual (no el de boot). Best-effort: si el file no existe o no parsea,
+/// no hace nada (la VM puede estar en teardown). Race con otras escrituras
+/// del state es benigna — el peor caso es un balloon_mb stale por un instante.
+pub fn update_balloon_mb(cell_id: u8, vm_id: u8, balloon_mb: u32) {
+    let path = state_path_scoped(cell_id, vm_id);
+    let Ok(content) = fs::read_to_string(&path) else { return };
+    let Ok(mut state) = serde_json::from_str::<VmState>(&content) else { return };
+    if state.balloon_mb == balloon_mb { return; }
+    state.balloon_mb = balloon_mb;
+    if let Ok(json) = serde_json::to_string_pretty(&state) {
+        let _ = fs::write(&path, json);
+    }
+}
+
+/// Updates the guest-memory stats in a VM's state file (same best-effort
+/// pattern as `update_balloon_mb`). Called by the vmm when it consumes a
+/// fresh buffer off the virtio-balloon stats virtqueue (~every 30s).
+pub fn update_guest_mem(cell_id: u8, vm_id: u8, total: u64, free: u64, avail: u64, cached: u64) {
+    let path = state_path_scoped(cell_id, vm_id);
+    let Ok(content) = fs::read_to_string(&path) else { return };
+    let Ok(mut state) = serde_json::from_str::<VmState>(&content) else { return };
+    if state.guest_mem_total_bytes == total
+        && state.guest_mem_free_bytes == free
+        && state.guest_mem_available_bytes == avail
+        && state.guest_mem_cached_bytes == cached { return; }
+    state.guest_mem_total_bytes = total;
+    state.guest_mem_free_bytes = free;
+    state.guest_mem_available_bytes = avail;
+    state.guest_mem_cached_bytes = cached;
+    if let Ok(json) = serde_json::to_string_pretty(&state) {
+        let _ = fs::write(&path, json);
+    }
 }
 
 /// Removes a VM's registration. Accepts vm_id alone (legacy) and scans the

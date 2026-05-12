@@ -1,7 +1,7 @@
 ---
 title: "Nano-Kernel Runtime (NKR): A Bare-Metal Micro-VM Hypervisor for Multi-Tenant SaaS Workloads"
-subtitle: "White Paper — Version 1.6"
-date: "April 2026"
+subtitle: "White Paper — Version 1.6.4"
+date: "May 2026"
 lang: en
 geometry: "margin=2.5cm"
 fontsize: 11pt
@@ -21,7 +21,7 @@ header-includes:
   - \pagestyle{fancy}
   - \fancyhf{}
   - \fancyhead[L]{\small Nano-Kernel Runtime (NKR) — White Paper}
-  - \fancyhead[R]{\small April 2026}
+  - \fancyhead[R]{\small May 2026}
   - \fancyfoot[C]{\thepage}
   - \usepackage{booktabs}
   - \usepackage{longtable}
@@ -33,7 +33,7 @@ header-includes:
 
 \newpage
 
-> **Abstract.** The *Nano-Kernel Runtime* (NKR) is an open-source bare-metal hypervisor written in Rust that replaces container runtimes like Docker with hardware-isolated micro-VMs, running directly on Linux KVM. NKR is designed for operators managing dense multi-tenant SaaS deployments —especially Odoo ERP— on a single server with limited resources (16–32 GB RAM). By eliminating the overhead of QEMU, libvirt, and container-level sharing, NKR achieves full hardware isolation with a binary of just 2–4 MB, sub-second VM boot, exclusive CPU scheduling (the "chrs" model), and a Docker-compatible workflow for building disk images. Version 1.1 added six key capabilities: live filesystem sharing via VirtIO-FS, controlled CPU bursting via cgroupv2, L2 network isolation with ebtables, per-tenant database limits, a native Prometheus metrics exporter, and automatic multi-tenant compose file generation. Version 1.2 introduced four further optimizations targeting 100+ Odoo instances on 32 GB RAM: VirtIO-PMEM + DAX (eliminating ~150–200 MB of duplicated page cache per instance), async I/O via io_uring (reducing syscall overhead ~70% under high concurrency), uncompressed ELF vmlinux loading (~20 ms faster boot), and a Seccomp BPF jailer. Version 1.3 made a leap in performance, density and operability with: the **Cell System** (multi-VM stacks with per-cell L2/L3 isolation), VirtIO-FS with DAX (replacing VirtIO-9P, 3–5× faster file I/O), VirtIO-Balloon (idle RAM reclamation), a VirtIO-Console channel (hvc0) for coordinated shutdown in ~2s, and instance cloning (`nkr cell clone`). Version 1.4 stabilizes multi-tenant operation: VirtIO-PMEM active by *default*, *skip warmup* on clones, *filestore rename* inside the guest (no host-side loop-mounts), serialization of netlink operations (`flock` + `iptables -w`), and validation *hardening* across all API edges. Version 1.5 introduces **privilege separation**: the `nkr` daemon runs as root over a UDS socket (`/var/run/nkr.sock`) and the entire HTTP frontend lives in `nkr-api-server`, an *unprivileged* process (user `nkr-api`, no capabilities) whose only job is to translate HTTP↔IPC. An RCE in the HTTP parser does not compromise KVM/cgroups/iptables. Version 1.6 closes the multi-tenant loop with a complete external-panel-driven HTTP API: cloning Odoo tenants from a canonical *template seed* (created via `/web/database/create`, with Latin American Spanish pre-loaded), `edition` opt-in per-instance to enable/disable the enterprise share, *admin user password* applied via JSON-RPC at tenant boot (closing the inherited `admin/admin` window), automatic explosion of multi-module OCA repos to `addons/<module>/`, *server-side static caching in nginx* (`/web/static/*` 24h, `/web/assets/<hash>/*` 30d) with a `POST /admin/cache/purge` endpoint for explicit invalidation, *rate limit* on `/web/login`, and `444` (TCP close) over CMS/legacy paths. All of this lives in a single binary with no accessory daemons and is configurable via four documented REST endpoints (`/instances`, `/dns`, `/addons/git`, `/config`). This document presents the full architecture, implementation, and production deployment model of NKR v1.6.
+> **Abstract.** The *Nano-Kernel Runtime* (NKR) is an open-source bare-metal hypervisor written in Rust that replaces container runtimes like Docker with hardware-isolated micro-VMs, running directly on Linux KVM. NKR is designed for operators managing dense multi-tenant SaaS deployments —especially Odoo ERP— on a single server with limited resources (16–32 GB RAM). By eliminating the overhead of QEMU, libvirt, and container-level sharing, NKR achieves full hardware isolation with a binary of just 2–4 MB, sub-second VM boot, exclusive CPU scheduling (the "chrs" model), and a Docker-compatible workflow for building disk images. Version 1.1 added six key capabilities: live filesystem sharing via VirtIO-FS, controlled CPU bursting via cgroupv2, L2 network isolation with ebtables, per-tenant database limits, a native Prometheus metrics exporter, and automatic multi-tenant compose file generation. Version 1.2 introduced four further optimizations targeting 100+ Odoo instances on 32 GB RAM: VirtIO-PMEM + DAX (eliminating ~150–200 MB of duplicated page cache per instance), async I/O via io_uring (reducing syscall overhead ~70% under high concurrency), uncompressed ELF vmlinux loading (~20 ms faster boot), and a Seccomp BPF jailer. Version 1.3 made a leap in performance, density and operability with: the **Cell System** (multi-VM stacks with per-cell L2/L3 isolation), VirtIO-FS with DAX (replacing VirtIO-9P, 3–5× faster file I/O), VirtIO-Balloon (idle RAM reclamation), a VirtIO-Console channel (hvc0) for coordinated shutdown in ~2s, and instance cloning (`nkr cell clone`). Version 1.4 stabilizes multi-tenant operation: VirtIO-PMEM active by *default*, *skip warmup* on clones, *filestore rename* inside the guest (no host-side loop-mounts), serialization of netlink operations (`flock` + `iptables -w`), and validation *hardening* across all API edges. Version 1.5 introduces **privilege separation**: the `nkr` daemon runs as root over a UDS socket (`/var/run/nkr.sock`) and the entire HTTP frontend lives in `nkr-api-server`, an *unprivileged* process (user `nkr-api`, no capabilities) whose only job is to translate HTTP↔IPC. An RCE in the HTTP parser does not compromise KVM/cgroups/iptables. Version 1.6 closes the multi-tenant loop with a complete external-panel-driven HTTP API: cloning Odoo tenants from a canonical *template seed* (created via `/web/database/create`, with Latin American Spanish pre-loaded), `edition` opt-in per-instance to enable/disable the enterprise share, *admin user password* applied via JSON-RPC at tenant boot (closing the inherited `admin/admin` window), automatic explosion of multi-module OCA repos to `addons/<module>/`, *server-side static caching in nginx* (`/web/static/*` 24h, `/web/assets/<hash>/*` 30d) with a `POST /admin/cache/purge` endpoint for explicit invalidation, *rate limit* on `/web/login`, and `444` (TCP close) over CMS/legacy paths. All of this lives in a single binary with no accessory daemons and is configurable via four documented REST endpoints (`/instances`, `/dns`, `/addons/git`, `/config`). Version 1.6.1 introduces the **tier system** (`production` / `staging` / `dev`), an HVC0 *REL_OD* control channel that reloads Odoo workers in ~3s without restarting the VM (resolving the virtio-fs + inotify limitation), and an *edge dual* nginx mode (Cloudflare proxied + DNS-only transparently coexisting via `set_real_ip_from`). Version 1.6.2 closes the density doctrine on 32 GB hosts with three pieces: **dynamic IDLE/ACTIVE ballooning** with automatic decay (the VM boots in maximum-squeeze state and deflates in ~2s on the first SIGUSR2 from the panel), **Double Hygiene** on `POST /addons/git` (`git clean -ffdx` recursive + full wipe of `addons/` before re-populating — the tenant becomes a deterministic mirror of the meta-repo) with **strict 422 validation** of submodules, and the **`chattr +i` cycle** on master rootfs (`nkr build` applies `-i → build → +i` automatically), eliminating an entire class of failures from accidental mutation of the *immutable master*. Version 1.6.3 adds a **watchdog** (TCP probe of `:8069` per running tenant; auto-restart after 60s unresponsive — currently shipped *disabled* by env var while the panel pushes changes actively), corrects the tier doctrine by **emptying `dev_mode`** in DEV/STAGING (`reload` exhausts the guest's `inotify` watches under virtio-fs → ENOSPC → respawn loop; `qweb,xml` triggers Odoo's internal template-recompile on every request → CPU spikes → hangs; the canonical reload path is `REL_OD` over HVC0, not `dev_mode`), and raises the DEV profile to 1300 MB (soft/hard 800/1000) after observing `Server memory limit reached` cycling with Odoo 19 + ~31 custom modules in threaded mode. Version 1.6.4 closes a security/operability sprint: **HMAC-signed SSO** (`/nkr-sso?u=…&exp=…&sig=…` — the panel mints a 30s-TTL URL signed with a per-tenant 256-bit key in `odoo.conf` `[nkr_sso] secret`; an Odoo module verifies it constant-time and creates a sudo session without ever exposing the user's password to the host), **`systemouts-addons`** (a cell-level read-only addons directory mounted ahead of the tenant's `addons/` in `addons_path` — internal modules like `nkr_sso` live there, invisible to the client and untouched by `POST /addons/git`, distributed once per cell and inherited by clones via the template DB), **async `POST /instances`** (validates synchronously, dispatches the clone in the background, returns `202` + a `create-status` polling endpoint — eliminates the false `504` on slow PROD prefork boots), an **initramfs `/mnt` tmpfs** (any new virtio-fs share under `/mnt/*` "just works" without rebuilding the master rootfs), the **`POST /reload` fix for `workers=0`** (the HVC0 watcher detects threaded vs prefork from `odoo.conf` → `pkill -TERM` + supervisor respawn vs `pkill -HUP` master), the **dynamic-balloon fix for `tier=dev`** (the balloon MMIO device is advertised to the guest even when `balloon_mb=0` at boot, so IDLE-decay inflation actually happens; `nkr_balloon_mb` now reflects the runtime target), a **per-instance boot console log**, and a **kernel cmdline truncation fix** (omit redundant rootfs `nkr.fs0/fsm0/fsr0` params when many virtio-fs shares are declared). This document presents the full architecture, implementation, and production deployment model of NKR v1.6.4.
 
 ---
 
@@ -248,12 +248,12 @@ NKR implements the VirtIO-MMIO (*Memory-Mapped I/O*) transport, not PCI, for max
 | `0xD000_1000` | VirtIO-Block disk 0 (rootfs) | 6 | v1.0 |
 | `0xD000_2000` | VirtIO-Block disk 1 | 7 | v1.0 |
 | `0xD000_3000+` | Additional disks (+0x1000 each) | 8+ | v1.0 |
-| `0xD001_0000+` | VirtIO-FS shares (+0x1000 each, DAX) | 8+ | **v1.3** |
-| `0xD002_0000` | VirtIO-PMEM (persistent memory, DAX) | 16 | v1.2 |
-| `0xD003_0000` | VirtIO-Balloon | 17 | **v1.3** |
-| `0xD004_0000` | VirtIO-Console (hvc0) | 18 | **v1.3** |
+| `0xD001_0000+` | VirtIO-FS shares (+0x1000 each, DAX) | 8, 9, 10, … | **v1.3** |
+| `0xD002_0000` | VirtIO-PMEM (persistent memory, DAX) | 7 | v1.2 |
+| `0xD004_0000` | VirtIO-Balloon | 10 | **v1.3** |
+| `0xD005_0000` | VirtIO-Console (hvc0) | 11 | **v1.3** |
 
-The `0xD001_0000+` range guarantees no collision with the block zone (which grows up to `0xD000_9000` with 9 disks). PMEM, Balloon, and Console are statically reserved.
+The `0xD001_0000+` range guarantees no collision with the block zone (which grows up to `0xD000_9000` with 9 disks). PMEM, Balloon, and Console are statically reserved. The guest is PIC-only (16 legacy IRQs, no APIC), so IRQs above the first few are *shared* across virtio-mmio devices — virtio-mmio's per-device interrupt-status register disambiguates which device fired, so sharing is safe (verified: all devices register `DRIVER_OK` regardless of IRQ sharing).
 
 ## VirtIO Block Device
 
@@ -848,7 +848,7 @@ NKR compose resolves resources intelligently, following a priority chain:
 
 ---
 
-# Privilege Separation and HTTP API — **New in v1.5/v1.6**
+# Privilege Separation and HTTP API — **New in v1.5/v1.6 (extended through v1.6.4)**
 
 Starting in v1.5, NKR operates as two cooperating processes with separate responsibilities. The goal is to **move every network-exposed attack surface out of the root process**: a fault in the HTTP parser, in JSON deserialization, or in input validation must not escalate into control over KVM, cgroups, or iptables.
 
@@ -935,9 +935,9 @@ All endpoints (except `/metrics` and `/api/v1/health`) require `Authorization: B
 
 ---
 
-# Multi-Tenant Operation: The Full Flow — **New in v1.6**
+# Multi-Tenant Operation: The Full Flow — **New in v1.6 (extended through v1.6.4)**
 
-NKR v1.6 closes the loop between the external panel and the daemon: provisioning a new Odoo customer (with their DNS, cloned DB, admin user with a real password, rate limit, OCA addons, and correct edition) is a sequence of 4 REST calls. This section describes each piece and the invariants NKR guarantees.
+NKR v1.6 closes the loop between the external panel and the daemon: provisioning a new Odoo customer (with their DNS, cloned DB, admin user with a real password, rate limit, OCA addons, and correct edition) is a sequence of 4 REST calls. v1.6.1 adds the **tier** as a first-class citizen (`tier=production|staging|dev`) with locked profiles for non-prod tiers, and `POST /reload` to refresh Odoo workers without restarting the VM. v1.6.2 adds `POST /balloon` (renews the ACTIVE state of dynamic ballooning) and refines `POST /addons/git` with Double Hygiene + strict 422 (deterministic mirror of the meta-repo). v1.6.3 empties `dev_mode` in DEV/STAGING (the `REL_OD`/HVC0 reload replaces it) and adds the watchdog. v1.6.4 adds HMAC-signed SSO + the `systemouts-addons` internal addons path, async `POST /instances` (`202` + `create-status` polling), `POST /diag` (host-side forensics), and the `/mnt` tmpfs in the initramfs. This section describes each piece and the invariants NKR guarantees.
 
 ## The Canonical Template DB Seed
 
@@ -1008,6 +1008,12 @@ NKR resolves this on the server side:
 4. `POST /actions {action:"restart"}` (panel responsibility) reloads manifests and the new `ir.module.module` rows show up to install from the UI.
 
 This pattern unifies `addons_path` to a single path (`/mnt/extra-addons`) regardless of the source layout.
+
+## HMAC SSO and `systemouts-addons` — **New in v1.6.4**
+
+The panel can drop a logged-in operator into any tenant's Odoo backend without ever handling the user's password. `POST /cells/{cell}/instances/{name}/sso {user}` returns a URL `https://<dns>/nkr-sso?u=<login>&exp=<unix_ts>&sig=<hmac_sha256(secret, "u|exp")>` with a 30-second TTL. NKR writes a fresh per-tenant 256-bit HMAC key into `odoo.conf` under section `[nkr_sso]` key `secret` at clone time (`cell.rs::rewrite_odoo_conf_full` — kept out of `[options]` to avoid Odoo's benign `unknown option` warning; the legacy `nkr_sso_secret` in `[options]` is still honored as a fallback). An Odoo HTTP controller (`auth="none"`) verifies the signature constant-time (`hmac.compare_digest`), checks expiry, looks up the active user, and creates a sudo session — `request.session.session_token = user._compute_session_token(request.session.sid)` — then redirects to `/odoo`. The user's password never leaves the host; compromising the secret means arbitrary login to that one tenant, so rotation = edit `[nkr_sso] secret` + `POST /actions {restart}`. Optional defense-in-depth: a `nkr_sso_allowed_referer` filter in `odoo.conf`.
+
+The module that does this — `nkr_sso` — lives in **`systemouts-addons`**, a cell-level directory (`cells/<cell>/systemouts-addons/`) mounted **read-only** in every instance as `/mnt/systemouts-addons` and inserted in `addons_path` *before* `/mnt/extra-addons` (the tenant's own `addons/`). Consequences: (1) a client module with the same name as an internal one cannot shadow it (first match wins, and the internal path comes first); (2) `POST /addons/git` never touches `systemouts-addons` → the client cannot see, edit, or overwrite it; (3) one copy per cell, RO — no per-tenant work. `nkr_sso` is pre-installed in each `<cell>-odoo-template` (code in `systemouts-addons/nkr_sso/` + `state=installed` in the template DB) so clones inherit both the code (via the cell-level RO share) and the installed state (via `CREATE DATABASE … TEMPLATE`); only the secret is regenerated fresh per tenant. The `/mnt/systemouts-addons` mountpoint is baked into the master rootfs (and, since v1.6.4, the initramfs mounts a tmpfs over `/mnt` so any *future* `/mnt/*` share works without a master rebuild — see §Initramfs).
 
 ## Edge nginx Hardening — Rate Limit and `444`
 
@@ -1194,13 +1200,15 @@ Server (16–32 GB RAM), 5 cells × (1 PG + 1 PgBouncer + 20 Odoos)
 
 # Observability and Metrics
 
-NKR ships a low-level telemetry system implemented in the hypervisor itself that measures and exposes resources used in real time by every micro-VM, with no need to deploy agents inside the *guests*.
+NKR ships a low-level telemetry system implemented in the hypervisor itself that measures and exposes resources used in real time by every micro-VM, with no need to deploy agents inside the *guests*. Today these metrics are **host-side** — what each VM costs the host (VMM process RSS, VMM CPU time, TAP bytes, VMM block I/O). Guest-internal metrics (RAM/CPU/disk *as seen inside* the tenant — useful for showing the client "your Odoo uses X of Y RAM") are designed but not yet implemented; see *Roadmap*.
 
 The metrics engine extracts information via lightweight probes from `procfs` and the host network subsystem:
 
-- **CPU%**: 200 ms synchronous sampling window over `/proc/{pid}/stat`. The interval is shared globally if multiple VMs are checked simultaneously.
-- **RAM (VmRSS)**: Physical RSS from `/proc/{pid}/status`. Shows real host memory used vs. RAM pre-allocated to the VM.
-- **Disk (I/O)**: Cumulative read and write bytes (`/proc/{pid}/io`).
+- **CPU%**: ~50 ms synchronous sampling window over `/proc/{pid}/stat` (200 ms for the `nkr stats` CLI). Jittery by nature of the short window — average it in Grafana for dashboards, or derive a counter (`nkr_guest_cpu_seconds_total`, planned).
+- **RAM (VmRSS)**: Physical RSS from `/proc/{pid}/status`. The key density metric — real host memory the VM costs *now*, vs. RAM pre-allocated to the VM.
+- **Balloon**: MB currently inflated in the VirtIO-Balloon (= returned to the host). Reflects the **runtime** state — 0 when ACTIVE, e.g. 256 when a DEV tenant has decayed to IDLE. Updated on every ACTIVE↔IDLE transition (v1.6.4).
+- **DAX savings**: estimated RAM not duplicated as guest page cache (`max(0, ram_allocated − rss − balloon − 50 MB overhead)`) for VMs with a DAX path (virtio-fs/pmem rootfs).
+- **Disk (I/O)**: Cumulative read/write bytes from `/proc/{pid}/io`. *Caveat*: for Odoo tenants the rootfs is virtio-fs served by a separate `virtiofsd` process → those reads are not seen by the VMM; this counter only covers the block device (`/var/lib/odoo`), so it's usually low or 0.
 - **Network (TAP)**: TX/RX volumetric throughput on the TAP interface using `/proc/net/dev`.
 - **KSM status**: read from `/sys/kernel/mm/ksm/` for operational visibility. In v1.4+ this metric reports `0 MB` by design: the `memfd+MAP_SHARED` layout required by vhost-user is incompatible with `MADV_MERGEABLE` and the kernel rejects the merge. The reading is preserved to detect re-activation if a hybrid memory layout is ever introduced.
 
@@ -1211,24 +1219,29 @@ sudo nkr stats nazcatex-odoo-01       # filtered by name/hash/id
 
 ## Native Prometheus Exporter — **New in v1.1**
 
-```bash
-sudo nkr serve --port 9090
-# Exposes: http://host:9090/metrics
-```
+`GET /metrics` on `:9090` (served by `nkr-api-server`, **no auth** — meant for direct Prometheus scrape; put it behind a private network or an IP allowlist), `text/plain; version=0.0.4` exposition. Each scrape takes a ~50 ms CPU window. Implemented with `std::net::TcpListener` + a string builder, no extra crates.
 
-Implemented with just `std::net::TcpListener` (~30 lines). No additional crates.
-
-**Exposed metrics:**
+**Exposed metrics** (all per-VM ones carry `vm="<nkr_name>"`):
 
 | Metric | Type | Description |
 |---|---|---|
-| `nkr_cpu_pct{vm="..."}` | Gauge | CPU percentage consumed (50 ms window) |
-| `nkr_rss_mb{vm="..."}` | Gauge | Real physical RAM (RSS) in MB |
-| `nkr_io_read_bytes{vm="..."}` | Counter | Bytes read from disk (cumulative) |
-| `nkr_io_write_bytes{vm="..."}` | Counter | Bytes written to disk (cumulative) |
-| `nkr_net_rx_bytes{vm="..."}` | Counter | Bytes received via TAP (cumulative) |
-| `nkr_net_tx_bytes{vm="..."}` | Counter | Bytes sent via TAP (cumulative) |
+| `nkr_cpu_pct{vm}` | Gauge | CPU percentage of the VMM process (~50 ms window) — jittery; average in Grafana |
+| `nkr_rss_mb{vm}` | Gauge | Real physical RAM (RSS) of the VMM process, in MB |
+| `nkr_ram_allocated_mb{vm}` | Gauge | RAM assigned to the VM at boot (`compose.ram`) |
+| `nkr_balloon_mb{vm}` | Gauge | RAM inflated in the VirtIO-Balloon — runtime value (0 ACTIVE / e.g. 256 IDLE) |
+| `nkr_dax_savings_mb{vm}` | Gauge | Estimated RAM saved by DAX/virtio-pmem (no page-cache duplication) |
+| `nkr_total_savings_mb{vm}` | Gauge | `balloon_mb + dax_savings_mb` |
+| `nkr_io_read_bytes{vm}` / `nkr_io_write_bytes{vm}` | Counter | Block-device bytes read/written by the VMM (cumulative) — see virtio-fs caveat above |
+| `nkr_net_rx_bytes{vm}` / `nkr_net_tx_bytes{vm}` | Counter | TAP bytes received/sent (cumulative) |
 | `nkr_ksm_savings_mb` | Gauge | MB saved globally by KSM (in v1.4+ always 0; see §VirtIO-Balloon) |
+
+**Added in v1.6.4:** `nkr_cpu_seconds_total{vm}` / `nkr_cpu_throttled_seconds_total{vm}` (counters from the VM's cgroup `cpu.stat` — supersede the jittery `nkr_cpu_pct`), `nkr_cgroup_memory_bytes{vm}` (from `memory.current`), `nkr_up{vm,cell,tier}` (1/0, includes stopped tenants — an info metric: `metric * on(vm) group_left(cell,tier) nkr_up`), `nkr_build_info{version}`, and cluster totals (`nkr_vm_count`, `nkr_total_{rss,balloon,dax_savings}_mb`).
+
+**Per-instance JSON endpoint (v1.6.4):** `GET /api/v1/cells/{cell}/instances/{name}/metrics` returns a JSON snapshot for *one* VM (cgroup CPU/mem, balloon, DAX savings, RSS, net, IO, a `disk` array via host-side `du`/`stat`, cell/tier, uptime, chrs, `as_of`/`stale`). The daemon caches each VM's result ~30s (the disk `du` ~5 min) so a panel polling every 30–60s while a "Metrics" tab is open costs essentially nothing — the cache *is* the rate limit (no 429s). This is what the SaaS panel uses for the per-tenant metrics view; `/metrics` (Prometheus) stays for a future Grafana. Per-VM disk is deliberately *not* in `/metrics` (a `du` per scrape × 100+ VMs would be O(seconds)).
+
+**Also added in v1.6.4 — guest-internal RAM:** `nkr_guest_mem_total/available/free/cached_bytes{vm}` (and `guest_mem` in the per-instance JSON) — RAM *as the guest sees it* (`MemTotal/MemAvailable/MemFree/Cached`), via the virtio-balloon stats virtqueue (the device's 3rd queue, `VIRTIO_BALLOON_F_STATS_VQ`; the vmm drains it ~every 30s and persists the snapshot to the VM state file). This is what the panel shows the client as "your Odoo uses X of Y RAM".
+
+*Not yet exposed* (ops-only, future): host-level metrics (`/proc/meminfo`, `/proc/stat`, `statvfs` → "how much RAM is left on the box").
 
 ---
 
@@ -1409,8 +1422,47 @@ Before entering the vCPU run loop, NKR installs a `SECCOMP_MODE_FILTER` program 
 - Edge nginx hardening (444 over `.php/.git/.zip` + CMS paths, rate limit on `/web/login`) ✓
 - `sitecustomize.py` for real client IP in werkzeug + gevent.pywsgi log ✓
 - `chown odoo:odoo /var/log/odoo` in initramfs before privilege drop ✓
-- Resource formula derived from `workers`: `ram=1024N MB`, `soft=400N MB`, `hard=750N MB` ✓
 - PgBouncer ram raised to 128 MB (was 64 MB, left little headroom) ✓
+
+**Implemented in v1.6.1:**
+- **Tier system** (`production` / `staging` / `dev`) with locked profiles for non-prod tiers ✓ — *note: the original `dev_mode=reload,qweb,xml` for DEV/STAGING was removed in v1.6.3 (see below); `dev_mode` is now empty in all tiers* ✓
+- Canonical sizing (source of truth: `api.rs::derive_resources_for_tier`): STAGING (1024 MB, workers=0, soft=600/hard=700, balloon boot/ACTIVE=256, IDLE=768), PROD (`max(1024, 512 + 768·W)` MB, soft=`640·W`/hard=`768·W`, balloon=0). DEV started at 768/400/512 and was raised to **1300 MB, soft=800/hard=1000** in v1.6.2 (see below) ✓
+- HVC0 `REL_OD` channel — SIGUSR1 to the VM PID → vmm injects `REL_OD\n` over hvc0 → guest dispatch (SIGTERM+supervisor for threaded, SIGHUP master for prefork). ~3s without restarting the VM ✓
+- Supervisor loop in `nkr-start.sh` (`while true; do exec odoo; sleep 1; done`) for threaded mode ✓
+- `POST /reload` endpoint and default auto-reload after `POST /addons/git` ✓
+- Cloudflare edge dual (proxied + DNS-only transparently coexisting, `set_real_ip_from` over CF ranges + `real_ip_header CF-Connecting-IP`) ✓
+- Initramfs SIGTERM grace 25s → 5s (Odoo tenants drop from ~70s to ~25s on restart) ✓
+- Async DELETE (closes the panel's HTTP timeout window) ✓
+- Defensive guest DNS: bind-mount `/etc/resolv.conf` with 1.1.1.1 + 8.8.8.8, default route derived from `GUEST_IP` ✓
+- `iptables -I FORWARD 1` so NKR rules sit above UFW ✓
+- `KillMode=process` in the systemd unit (VMs survive `systemctl restart nkr`) ✓
+
+**Implemented in v1.6.2:**
+- **Dynamic IDLE/ACTIVE ballooning** per tier: the VM boots in IDLE state (max squeeze, balloon=ram-256), the panel marks ACTIVE via `POST /balloon` → vmm applies `set_target_mb(active) + IRQ config_change` (~2s deflate). After 600s without renewal, automatic decay back to IDLE. PROD stays static (balloon=0 always) to avoid deflate latency on traffic spikes ✓
+- **SIGUSR2 safety check**: the daemon validates `/proc/<pid>/cmdline` before sending the signal (VMs launched with a pre-1.6.2 binary lack the handler and would be terminated — returns `202 applied=false` instead) ✓
+- **Double Hygiene** on `POST /addons/git`: recursive `git clean -ffdx` (parent + each submodule) + full wipe of `addons/` before re-populating. `addons/` becomes a deterministic mirror of the meta-repo. New `removed` field in the response (modules that were there before and are no longer in the current cycle) ✓
+- **Strict 422 validation** of submodules: every `path = X` declared in `.gitmodules` must be either an Odoo module (manifest at root) or a grouper (with its own `.gitmodules`). Submodules without manifest nor grouper → `422 submodule_no_manifest`. Doctrine: "the meta-repo is not a dumping ground for scripts" ✓
+- **`chattr +i` cycle** on the master ext4: `nkr build` unlocks (`-i`) before writing and re-locks (`+i`) at the end. Covers any path under `/mnt/nkr/images/`. Reflinks (`cp --reflink=auto`) keep working against the immutable master ✓
+- Canonical PROD RAM formula: `VM_RAM ≥ 256 (OS) + 256 (master) + 768 × workers`, with API-side validation (`400 ram_insufficient_for_workers`) ✓
+- Faucet Rule: workers > 4 → balloon=0 forced in compose ✓
+- Workers=0 (threaded) **mandatory** in DEV/STAGING (no override allowed); workers configurable 1..16 only in PROD ✓
+
+**Implemented in v1.6.3:**
+- **`dev_mode` emptied in all tiers** — `reload` exhausts the guest's `fs.inotify.max_user_watches` (default 8192) recursing over `/usr/lib/python3/.../odoo/addons` → `OSError [Errno 28]` → Odoo dies rc=1 → supervisor respawn loop → `:8069` never comes up (postmortem in `BUG_inotify_dev_mode.md`). `qweb,xml` activates Odoo's internal `watchdog` that recompiles QWeb/XML templates on *every* request (including nginx keepalives every 30s) → CPU/GC pressure correlating with host-side `nkr` hangs. The canonical hot-reload is `REL_OD` over HVC0; `dev_mode=` is now empty for production *and* dev/staging ✓
+- **DEV profile bumped to 1300 MB** (soft/hard 800/1000) after `Server memory limit reached` cycling with Odoo 19 + ~31 custom modules in threaded mode (the 400 MB soft was unreachable under normal DEV load) ✓
+- **Watchdog** (`watchdog.rs`) — daemon thread, TCP probe of `:8069` per running tenant every 15s; after `HUNG_THRESHOLD_SECS=60` consecutive misses, auto-`restart` via `api::handle_action`. Bypass via `NKR_WATCHDOG_DISABLED=1`. **Currently shipped disabled** by request (auto-restarts interfered with the panel pushing changes actively) ✓
+- Faster restart: per-module diff in `POST /addons/git` + reduced timer drain ✓
+
+**Implemented in v1.6.4 (security/operability sprint):**
+- **HMAC-signed SSO** — `POST /cells/{cell}/instances/{name}/sso {user}` mints `https://<dns>/nkr-sso?u=<login>&exp=<ts>&sig=<hmac_sha256>` (30s TTL), signed with a per-tenant 256-bit key written by `cell.rs::rewrite_odoo_conf_full` into `odoo.conf` `[nkr_sso] secret` (not `[options]` — avoids Odoo's `unknown option` warning; legacy `nkr_sso_secret` in `[options]` still honored as fallback). The Odoo module `nkr_sso` verifies the HMAC constant-time + checks expiry + creates a sudo session (`request.session.session_token = user._compute_session_token(sid)`) — **the user's password never leaves the host**. Rotate = edit `[nkr_sso] secret` + `POST /actions {restart}` ✓
+- **`systemouts-addons`** — `cells/<cell>/systemouts-addons/` mounted RO in every instance as `/mnt/systemouts-addons`, inserted in `addons_path` *before* `/mnt/extra-addons` (the tenant's own `addons/`) → a client module with the same name can't shadow an internal one. `POST /addons/git` never touches it → the client can't see or overwrite it. One copy per cell, RO. Holds `nkr_sso/` today; pre-installed in each `<cell>-odoo-template` (code + `state=installed` in the template DB) → clones inherit both via `CREATE DATABASE … TEMPLATE` + the cell-level RO share. The secret is regenerated fresh per tenant ✓
+- **Async `POST /instances`** — validates synchronously (all 4xx immediately), dispatches the clone in a background thread, returns `202 {nkr_name, poll}`. The panel polls `GET /cells/{cell}/instances/{name}/create-status` until `status=ready|failed`; status file at `/mnt/nkr/cells/{cell}/.nkr-creates/{name}.json` (cell-level, survives the clone's rollback). Eliminates the false `504` when PROD prefork boots ~140s — past the panel's/Cloudflare's HTTP timeout ✓
+- **`POST /diag`** — captures host-side stacks/wchan/cpu of the tenant's `nkr` process threads (text/plain, ~50ms, idempotent) — pre-restart forensics ✓
+- **Initramfs `/mnt` tmpfs** — after mounting the RO master rootfs, the initramfs mounts a tmpfs over `/newroot/mnt` → any new virtio-fs share with a fresh guest path under `/mnt/*` (`mount -t virtiofs … /mnt/foo`) does `mkdir -p` over the tmpfs and "just works" **without rebuilding the master rootfs** (which is RO in the guest) ✓
+- **`POST /reload` fix for `workers=0`** — the HVC0 watcher reads `workers = N` from the guest's `odoo.conf`: empty/`0` → `pkill -TERM /usr/bin/odoo` (the `nkr-start.sh` supervisor loop respawns it with fresh code); `>0` → `pkill -HUP` master (prefork). No VM downtime in either case. Obsoletes the workaround "use `POST /actions {restart}` for workers=0" ✓
+- **Dynamic-balloon fix for `tier=dev`** — `vmm.rs::configure_linux_boot` now advertises the balloon `virtio_mmio.device` to the guest when dynamic ballooning is configured (`balloon_idle_mb ≠ balloon_mb`), not only when `balloon_mb > 0`. Before, DEV (which boots ACTIVE with `balloon_mb=0`) never got the device on the cmdline → the guest never attached the driver → the IDLE-decay `set_target_mb(256)` was a no-op. Now it actually inflates. `state::update_balloon_mb` writes the runtime target to the VM state file on each ACTIVE↔IDLE transition → `nkr_balloon_mb` / `nkr ps` reflect the current target, not the boot value ✓
+- **Per-instance boot console log** — each VM writes guest serial console (initramfs echos + `dmesg`) + VMM stderr to `<instance>/.<config>-vm-boot.log` (truncated each boot) — diagnoses virtio-fs mounts, guest panics, cmdline truncation ✓
+- **Kernel cmdline truncation fix** — `COMMAND_LINE_SIZE` is small (~1024 B); with many virtio-fs shares the cmdline truncated (lost `init=` / `nkr.ip=` at the end). Fix: omit the redundant rootfs `nkr.fs0/fsm0/fsr0` params (the initramfs mounts the rootfs via `nkr.rootfs=`, not `nkr.fs0=`) and emit `nkr.fsr{i}=` only when `ro` (absence ⇒ `rw`). ~60 B of headroom ✓
 
 **High priority:**
 - End-to-end validation with 5 cells × 20 Odoos on a single host
@@ -1424,6 +1476,8 @@ Before entering the vCPU run loop, NKR installs a `SECCOMP_MODE_FILTER` program 
 - Multi-vCPU support
 - Automated PostgreSQL backup per tenant
 - Build-time QWeb pre-compile in the template (eliminate the 5s of first boot)
+- **Ops-only global/host view** — host-level metrics (`/proc/meminfo`, `/proc/stat`, `statvfs` → "how much RAM/CPU/disk is left on the box") + a dashboard joining that with the per-VM aggregate. (All *tenant* metrics — host-side per-VM, `nkr_up{vm,cell,tier}`, build info, cluster totals, plus the per-instance JSON endpoint with cgroup CPU/mem, disk via `du`, and guest-internal RAM via the virtio-balloon stats virtqueue — shipped in v1.6.4.)
+- v17 cell parity: pre-install `nkr_sso` into the `odoo-v17` template (the `/mnt/systemouts-addons` mountpoint is already in the v17 master rootfs)
 
 **Low priority:**
 - Live migration between servers
@@ -1434,9 +1488,9 @@ Before entering the vCPU run loop, NKR installs a `SECCOMP_MODE_FILTER` program 
 
 # Conclusion
 
-NKR demonstrates that it is possible to achieve **container-level density and operational simplicity** with **VM-level isolation and resource guarantees**, in roughly 16,000 lines of Rust, compiling to two binaries (~1.9 MB the daemon, ~580 KB the proxy) with no runtime dependencies.
+NKR demonstrates that it is possible to achieve **container-level density and operational simplicity** with **VM-level isolation and resource guarantees**, in roughly 21,700 lines of Rust, compiling to two binaries (~2.4 MB the daemon, ~660 KB the proxy) with no runtime dependencies.
 
-Version 1.3 raised the density ceiling to 103+ Odoo instances on a 32 GB server via VirtIO-FS + DAX, VirtIO-Balloon, VirtIO-Console hvc0, the Cell System, and `nkr cell clone`. Versions 1.4–1.6 transform NKR from a manually operated *runtime* into an **API-driven SaaS platform**: the root daemon exclusively exposes an internal UDS and the entire HTTP frontend lives in an *unprivileged* process with no capabilities, with 16 REST endpoints covered by double validation (proxy + daemon), per-IP rate limiting, server-side nginx static cache, scanner *hardening* (444 over CMS/legacy paths), and a tenant provisioning pipeline that handles DB, DNS, certificates, admin user password, and OCA addons in a 4-call sequence.
+Version 1.3 raised the density ceiling to 103+ Odoo instances on a 32 GB server via VirtIO-FS + DAX, VirtIO-Balloon, VirtIO-Console hvc0, the Cell System, and `nkr cell clone`. Versions 1.4–1.6 transform NKR from a manually operated *runtime* into an **API-driven SaaS platform**: the root daemon exclusively exposes an internal UDS and the entire HTTP frontend lives in an *unprivileged* process with no capabilities, with REST endpoints covered by double validation (proxy + daemon), per-IP rate limiting, server-side nginx static cache, scanner *hardening* (444 over CMS/legacy paths), and a tenant provisioning pipeline that handles DB, DNS, certificates, admin user password, and OCA addons in a 4-call sequence. Versions 1.6.1–1.6.4 close the operational doctrine: the **tier system** decouples iteration profiles (DEV/STAGING with threaded `workers=0`, supervisor loop, **empty `dev_mode`** — the `REL_OD`/HVC0 reload replaces `dev_mode=reload`, which is incompatible with virtio-fs and exhausts guest `inotify`) from production operation (PROD with prefork multi-worker, no auto-reload); the **HVC0 `REL_OD` channel** resolves the virtio-fs+inotify limitation by reloading workers in ~3s without restarting the VM (threaded → `pkill -TERM` + supervisor respawn; prefork → `pkill -HUP` master); **dynamic IDLE/ACTIVE ballooning** with automatic decay maximizes density under realistic load (32 GB host → ~110 idle DEV instances, deflated on demand); **Double Hygiene + strict 422** turn `addons/` into a deterministic mirror of the meta-repo, eliminating drift between `git push` and the tenant filesystem; the **`chattr +i` cycle** on the master ext4 closes an entire class of failures from accidental mutation of the shared rootfs; **HMAC-signed SSO** + the **`systemouts-addons`** cell-level read-only addons path let the panel auto-login users into any tenant (30s-TTL signed URL, password never leaves the host) using an internal Odoo module the client cannot see or override; **async `POST /instances`** + `create-status` polling remove the false `504` on slow PROD boots; and an **initramfs `/mnt` tmpfs** makes new virtio-fs shares "just work" without rebuilding the immutable master.
 
 For operators managing dozens of SaaS tenants on a single server, NKR delivers a fundamentally different balance from Docker, traditional VMs, or a hosted PaaS:
 
@@ -1470,29 +1524,34 @@ NKR is software with a purpose. Rather than trying to be a general-purpose hyper
 
 # Appendix B: Source Code Metrics
 
+(Approximate, as of v1.6.4 — `~21,700` lines of Rust total across `src/`.)
+
 | Module | File | Lines | Responsibility |
 |---|---|---|---|
-| API handlers | `api.rs` | ~2,640 | IPC dispatch, instance lifecycle, DNS, init-db, modules, psql sandbox, cache purge |
-| VMM engine | `vmm.rs` | ~2,630 | KVM init, PIT2, ELF/bzImage loader, MMIO, cgroups, ebtables, PMEM slot, seccomp, hvc0 shutdown |
-| Cell system | `cell.rs` | ~1,950 | Cell registry, bridge management, instance directories, `clone_instance`, edition opt-in |
-| Compose | `compose.rs` | ~1,630 | YAML, orchestration, health checks, daemon mode, Nitro/warmup flow |
-| HTTP proxy | `bin/nkr_api_server.rs` | ~1,300 | HTTP→IPC translation, validation, body limits, thread pool, auth |
-| Initramfs | `initramfs.rs` | ~920 | Boot environments, FS/PMEM/virtiofs module loading, sitecustomize.py injection |
+| API handlers | `api.rs` | ~3,930 | IPC dispatch, instance lifecycle (sync validation + async clone), DNS, init-db, modules, psql sandbox, cache purge, `handle_sso`/`handle_diag`/`handle_create_status`, `derive_resources_for_tier` |
+| VMM engine | `vmm.rs` | ~2,860 | KVM init, PIT2, ELF/bzImage loader, MMIO, cgroups, ebtables, PMEM slot, seccomp, hvc0 shutdown + `REL_OD`, dynamic balloon state machine, cmdline assembly |
+| Cell system | `cell.rs` | ~2,740 | Cell registry, bridge management, instance directories, `clone_instance`, edition opt-in, `rewrite_odoo_conf_full` (HMAC secret, `systemouts-addons` share + addons_path, `dev_mode` empty) |
+| HTTP proxy | `bin/nkr_api_server.rs` | ~2,600 | HTTP→IPC translation, validation, body limits, thread pool, auth, `/metrics`, pylibs PUT |
+| Compose | `compose.rs` | ~1,670 | YAML, orchestration, health checks, daemon mode, Nitro/warmup flow, per-instance boot-console log |
+| Initramfs | `initramfs.rs` | ~1,080 | Boot environments (per-instance template), `/mnt` tmpfs, FS/PMEM/virtiofs module loading, hvc0 watcher (`REL_OD` mode detection), sitecustomize.py injection |
 | VirtIO-FS | `virtio_fs.rs` | ~685 | VirtIO-FS (DAX, vhost-user) replacing 9P |
 | Metrics | `metrics.rs` | ~630 | /proc telemetry, KSM, Prometheus exporter |
-| Main | `main.rs` | ~505 | Entry point, full dispatch including Cell/Clone |
-| Block | `block.rs` | ~375 | VirtIO-block, io_uring async I/O + sync fallback |
-| State | `state.rs` | ~380 | VM registry, lifecycle tracking, zombie detection, `nkr ps` |
+| Main | `main.rs` | ~510 | Entry point, full dispatch including Cell/Clone |
+| State | `state.rs` | ~450 | VM registry, lifecycle tracking, zombie detection, `nkr ps`, `update_balloon_mb` |
+| Balloon | `balloon.rs` | ~400 | VirtIO-Balloon, MADV_DONTNEED idle page eviction |
+| Block | `block.rs` | ~390 | VirtIO-block, io_uring async I/O + sync fallback |
 | Network | `net.rs` | ~365 | VirtIO-net, TAP backend, RX/TX threads, io_uring TX |
+| CLI | `cli.rs` | ~360 | Full CLI: run/ps/stop/restart/nitro/compose/pull/build/stats/ksm/serve/cell |
+| API HTTP helpers | `api_http.rs` | ~350 | Validation regexes, route helpers |
 | Janitor | `janitor.rs` | ~350 | Internal cron, orphan cleanup |
-| CLI | `cli.rs` | ~335 | Full CLI: run/ps/stop/restart/nitro/compose/pull/build/stats/ksm/serve/cell |
 | Fsutil | `fsutil.rs` | ~300 | ext4 creation with `chattr +C`, integrity checks |
-| API HTTP helpers | `api_http.rs` | ~290 | Validation regexes, route helpers |
-| Balloon | `balloon.rs` | ~290 | VirtIO-Balloon, MADV_DONTNEED idle page eviction |
+| IPC | `ipc.rs` | ~285 | Length-prefixed JSON wire over UDS (incl. `Sso`/`Diag`/`GetCreateStatus`) |
 | PMEM | `pmem.rs` | ~280 | VirtIO-PMEM + DAX, mmap(MAP_SHARED), FLUSH handler |
-| IPC | `ipc.rs` | ~250 | Length-prefixed JSON wire over UDS |
-| **Daemon total** | | **~16,000** | |
-| HTTP proxy alone | | ~1,300 | (separate binary, unprivileged) |
+| IPC server | `ipc_server.rs` | ~250 | UDS request loop, dispatch to `api::*` |
+| Console | `console.rs` | ~165 | VirtIO-Console (hvc0) device |
+| Watchdog | `watchdog.rs` | ~155 | TCP `:8069` probe per tenant, auto-restart at 60s (disabled by default) |
+| Seccomp | `seccomp.rs` | ~135 | BPF jailer (~120-syscall allowlist) |
+| **Total** | | **~21,700** | (~19,100 in the daemon `nkr` binary + ~2,600 in the unprivileged `nkr-api-server`) |
 
 # Appendix C: Quick Start
 
@@ -1585,7 +1644,7 @@ sudo systemctl enable --now nkr-api-server.service   # HTTP proxy localhost:9090
 
 # Health (no auth):
 curl http://nkr-host:9090/api/v1/health
-# → {"ok":true,"version":"1.6.0"}
+# → {"ok":true,"version":"1.6.4"}
 
 # Create production tenant (with admin password applied at boot):
 curl -X POST http://nkr-host:9090/api/v1/instances \

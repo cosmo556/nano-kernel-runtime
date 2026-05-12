@@ -45,12 +45,13 @@ mod api_http;
 mod ipc;
 mod ipc_server;
 mod janitor;
+mod watchdog;
 
 fn main() {
     let args = cli::parse();
 
     match args.command {
-        cli::Command::Run { hash, name, ram, chrs, id, disk, kernel, initramfs, port, volume, env, tap, share, rootfs, pmem, balloon_mb, burst, cell_id } => {
+        cli::Command::Run { hash, name, ram, chrs, id, disk, kernel, initramfs, port, volume, env, tap, share, rootfs, pmem, balloon_mb, balloon_idle_mb, balloon_decay_secs, burst, cell_id } => {
             let vm_hash = hash.unwrap_or_else(|| {
                 let nanos = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -104,6 +105,8 @@ fn main() {
                 rootfs,
                 use_pmem: pmem,
                 balloon_mb,
+                balloon_idle_mb,
+                balloon_decay_secs,
                 burst,
                 cell_id,
             };

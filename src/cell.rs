@@ -149,6 +149,10 @@ pub fn create_cell(name: &str, odoo_version: Option<&str>) -> Result<CellConfig,
     // Create directory structure
     let cell_dir = cells_dir().join(&key);
     fs::create_dir_all(cell_dir.join("addons"))?;
+    // Addons internos de NKR (nkr_sso, etc.) — RO, cell-level, NO visible al
+    // cliente vía POST /addons/git. Se monta en cada instancia como
+    // /mnt/systemouts-addons (ver append_compose_block + rewrite_odoo_conf_full).
+    fs::create_dir_all(cell_dir.join("systemouts-addons"))?;
     fs::create_dir_all(cell_dir.join("files"))?;
     fs::create_dir_all(cell_dir.join("config"))?;
     fs::create_dir_all(cell_dir.join("logs"))?;
@@ -454,14 +458,19 @@ pub fn ensure_cell_bridge(cell_id: u8) -> Result<(), Box<dyn std::error::Error>>
         &["-t", "nat", "-A", "POSTROUTING", "-s", &subnet_cidr, "-j", "MASQUERADE"],
     );
 
-    // FORWARD rules
+    // FORWARD rules — INSERT al TOP (posición 1) en vez de APPEND.
+    // Si hay UFW activo (común en Ubuntu/Debian server), su `ufw-reject-forward`
+    // está en medio del chain y DROPea todo antes de que las reglas NKR appended
+    // al final puedan matchear. Confirmado en producción 2026-05-10: counters
+    // de NKR ACCEPT eran 0 packets, todo el tráfico guest→internet rechazado
+    // por UFW. Insertando al top de FORWARD nos aseguramos prioridad sobre UFW.
     iptables_ensure(
         &["-C", "FORWARD", "-i", &bridge, "-j", "ACCEPT"],
-        &["-A", "FORWARD", "-i", &bridge, "-j", "ACCEPT"],
+        &["-I", "FORWARD", "1", "-i", &bridge, "-j", "ACCEPT"],
     );
     iptables_ensure(
         &["-C", "FORWARD", "-o", &bridge, "-j", "ACCEPT"],
-        &["-A", "FORWARD", "-o", &bridge, "-j", "ACCEPT"],
+        &["-I", "FORWARD", "1", "-o", &bridge, "-j", "ACCEPT"],
     );
 
     eprintln!("[NKR-CELL] Bridge {} creado ({}, NAT habilitado)", bridge, subnet_cidr);
@@ -677,6 +686,8 @@ fn append_compose_block(
     ram_mb_override: Option<u32>,
     chrs_override: Option<u32>,
     balloon_mb_override: Option<u32>,
+    balloon_idle_mb_override: Option<u32>,
+    balloon_decay_secs_override: Option<u32>,
     include_enterprise: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compose_path = cell_compose_path(&cell.name);
@@ -893,6 +904,30 @@ fn append_compose_block(
         new_block.insert(insert_at, format!("    balloon_mb: {}", value));
         eprintln!("[NKR-CLONE] balloon_mb missing on '{}' — injected={} MB", src_nkr, value);
     }
+    // Ballooning ACTIVE/IDLE (CLAUDE.md v2.2). Sólo se inyecta si el panel
+    // pasó override de idle_mb distinto al balloon_mb (= ballooning dinámico).
+    // Para tier=production (idle==balloon_mb==0), el override es Some(0) y se
+    // skipea silenciosamente porque == balloon_mb (no aporta).
+    //
+    // balloon_mb es el target ACTIVE (boot value), balloon_idle_mb es el
+    // target post-decay. La VM nace ACTIVE para evitar OOM en bootstrap;
+    // tras `balloon_decay_secs` sin SIGUSR2 transiciona a IDLE.
+    if !new_block.is_empty() {
+        if let Some(idle_mb) = balloon_idle_mb_override {
+            let active_mb = balloon_mb_override.unwrap_or(0);
+            if idle_mb != active_mb {
+                let insert_at = 2.min(new_block.len());
+                new_block.insert(insert_at,
+                    format!("    balloon_idle_mb: {}", idle_mb));
+                if let Some(decay) = balloon_decay_secs_override {
+                    new_block.insert(insert_at + 1,
+                        format!("    balloon_decay_secs: {}", decay));
+                }
+                eprintln!("[NKR-CLONE] balloon dinámico '{}' → active(boot)={} idle(post-decay)={} decay={:?}",
+                    src_nkr, active_mb, idle_mb, balloon_decay_secs_override);
+            }
+        }
+    }
     // If the src didn't have `environment:` and the caller passed extras, add them at the end.
     if !has_env_section && !extra_env.is_empty() {
         new_block.push("    environment:".to_string());
@@ -921,6 +956,36 @@ fn append_compose_block(
             new_block_with_share.push(line);
         }
         new_block = new_block_with_share;
+    }
+
+    // Inyectar la share read-only de los addons internos de NKR (cell-level).
+    // `/mnt/nkr/cells/<cell>/systemouts-addons/` → `/mnt/systemouts-addons:ro`
+    // en el guest. Contiene módulos internos (nkr_sso, etc.) que NO viven en el
+    // `addons/` del tenant: no son visibles para el cliente vía POST /addons/git,
+    // no son sobrescribibles por un push del cliente, y se actualizan una sola
+    // vez por cell (RO, compartido). Ver CLAUDE.md §systemouts-addons.
+    {
+        let systemouts_dir = cells_dir().join(&cell.name).join("systemouts-addons");
+        // Crear el dir si no existe (vacío está OK — Odoo no warnea por dir vacío
+        // que SÍ existe). Sin esto virtiofsd fallaría al montar y la VM no arranca.
+        let _ = fs::create_dir_all(&systemouts_dir);
+        let share_line = format!("      - \"{}:/mnt/systemouts-addons:ro\"", systemouts_dir.display());
+        if !new_block.iter().any(|l| l.contains(":/mnt/systemouts-addons:")) {
+            let mut injected = false;
+            let mut nb = Vec::with_capacity(new_block.len() + 1);
+            for nl in &new_block {
+                nb.push(nl.clone());
+                if !injected && nl.trim() == "shares:" {
+                    nb.push(share_line.clone());
+                    injected = true;
+                }
+            }
+            if !injected {
+                nb.push("    shares:".to_string());
+                nb.push(share_line);
+            }
+            new_block = nb;
+        }
     }
 
     // 4. Rewrite the file: original content + new block at the end
@@ -1247,7 +1312,9 @@ pub fn clone_instance_with_opts(
         // = community (sin extra-enterprise share ni en addons_path).
         let include_enterprise = matches!(opts.edition, Some(Edition::Enterprise));
         append_compose_block(&cell, src_nkr, dst_nkr, dst_vm_id, &extra_env,
-            opts.ram_mb, opts.chrs, opts.balloon_mb, include_enterprise)?;
+            opts.ram_mb, opts.chrs, opts.balloon_mb,
+            opts.balloon_idle_mb, opts.balloon_decay_secs,
+            include_enterprise)?;
     } else {
         eprintln!("[NKR-CLONE] no_compose=true: añade el bloque al nkr-compose.yml manualmente.");
     }
@@ -1314,14 +1381,18 @@ pub enum Edition {
 ///   restartear explícitamente para que cambios de código Python tomen efecto.
 ///   Para staging-style "copia con cambios", usar tier=staging.
 ///
-/// - **Staging**: workers=1 (para que upgrade refleje código en TODOS los
-///   workers), ram=2GB, dev_mode=reload+qweb+xml en odoo.conf (hot-reload via
-///   inotify), log_level=debug, sin rate-limit en login, sin cache nginx.
-///   REQUIERE `source` (clona DB de un tenant production existente). Útil para
-///   probar cambios de código contra datos reales sin tocar prod.
+/// - **Staging**: workers=0 (threaded — un solo proceso, el reload vía REL_OD
+///   refleja código fresh sin master que respawnear), ram=1280MB, **`dev_mode`
+///   vacío** (NO `reload` — incompat virtio-fs+inotify, ENOSPC en el guest; NO
+///   `qweb,xml` — activa el watchdog interno de Odoo que recompila templates en
+///   cada request → CPU spike + cuelgues, lección 2026-05-11; el hot-reload
+///   real es `POST /reload`/REL_OD vía HVC0). log_level=debug, sin rate-limit
+///   en login, sin cache nginx. REQUIERE `source` (clona DB de un tenant
+///   production existente). Útil para probar cambios de código contra datos
+///   reales sin tocar prod.
 ///
-/// - **Dev**: idéntico a staging en runtime (workers=1, dev_mode, sin
-///   rate-limit, sin cache), pero **NO clona DB** — arranca con DB vacía via
+/// - **Dev**: idéntico a staging en runtime (workers=0, `dev_mode` vacío, sin
+///   rate-limit, sin cache; ram=1024MB), pero **NO clona DB** — arranca con DB vacía via
 ///   /web/database/create. NO acepta `source` (se ignora con warning si se
 ///   pasa). Útil para desarrollar módulos nuevos desde cero. **Las instancias
 ///   dev no son clonables** (no se pueden usar como `source` de otro tenant).
@@ -1338,8 +1409,8 @@ impl Default for Tier {
 }
 
 impl Tier {
-    /// Si el tier requiere comportamiento "dev-like" (workers=1 + dev_mode +
-    /// sin cache/rate-limit). Cubre staging y dev.
+    /// Si el tier requiere comportamiento "dev-like" (workers=0 threaded +
+    /// `dev_mode` vacío + log debug + sin cache/rate-limit). Cubre staging y dev.
     pub fn is_dev_like(self) -> bool {
         matches!(self, Tier::Staging | Tier::Dev)
     }
@@ -1376,10 +1447,17 @@ pub struct CloneOptions {
     /// CPU quota para la cgroup de la VM, en unidades de 20% de un core
     /// (1 chr = 20%). Si None, se hereda del compose del template.
     pub chrs: Option<u32>,
-    /// Override for the template's `balloon_mb`. If None, the value is
-    /// inherited from the template. If the template didn't carry balloon,
-    /// `append_compose_block` injects the 128 MB default.
+    /// Override for the template's `balloon_mb` (target ACTIVE / boot).
+    /// La VM nace con este valor — debe ser bajo (0 para DEV, 256 para STAG)
+    /// para que Odoo arranque sin OOM. Si None, hereda del template.
     pub balloon_mb: Option<u32>,
+    /// Target IDLE del balloon dinámico (CLAUDE.md v2.2): valor al que la
+    /// VM transiciona tras `balloon_decay_secs` sin renovación SIGUSR2.
+    /// Si None ó == `balloon_mb`, la VM tiene balloon estático
+    /// (sin transición ACTIVE→IDLE).
+    pub balloon_idle_mb: Option<u32>,
+    /// Segundos de decay antes de transicionar de ACTIVE a IDLE. Default 600s.
+    pub balloon_decay_secs: Option<u32>,
     /// Skip del paso de clonar la DB. Sólo para uso avanzado (CLI / restore
     /// desde backup externo). El API HTTP nunca lo setea — siempre clona DB
     /// (mode=production usa el template de la cell, mode=dev usa el source
@@ -1476,6 +1554,17 @@ pub struct NkrStatus {
     /// "running" | "success" | "failed". None si nunca se llamó `POST /init-db`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_db: Option<serde_json::Value>,
+}
+
+/// Genera un secret de 256 bits (64 hex chars) para HMAC del SSO.
+/// Lee 32 bytes de /dev/urandom — el RNG del kernel es CSPRNG.
+fn generate_sso_secret() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 32];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    }
+    buf.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn now_unix_secs() -> u64 {
@@ -1710,8 +1799,64 @@ fn rewrite_odoo_conf_full(
             }
         }
     }
+    // Asegurar que `/mnt/systemouts-addons` esté en `addons_path` — es el dir
+    // RO cell-level con los módulos internos de NKR (nkr_sso, etc.). Se inserta
+    // DESPUÉS del core de Odoo y ANTES de `/mnt/extra-addons` (= el `addons/`
+    // del tenant): así un módulo del cliente con el mismo nombre que uno interno
+    // NO puede shadowearlo (Odoo resuelve por primer match). Idempotente.
+    if let Some(idx) = lines.iter().position(|l| l.trim_start().starts_with("addons_path")) {
+        let line = lines[idx].clone();
+        if let Some(eq) = line.find('=') {
+            let prefix = line[..eq + 1].to_string();
+            let value = &line[eq + 1..];
+            let mut parts: Vec<String> = value.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+            if !parts.iter().any(|p| p == "/mnt/systemouts-addons") {
+                // 2º lugar (tras el core de Odoo) si hay ≥1 entrada, si no al frente.
+                let pos = if parts.is_empty() { 0 } else { 1.min(parts.len()) };
+                parts.insert(pos, "/mnt/systemouts-addons".to_string());
+            }
+            lines[idx] = format!("{} {}", prefix.trim_end(), parts.join(","));
+        }
+    }
     if let Some(ref ap) = opts.admin_passwd {
         upsert_key(&mut lines, "admin_passwd", ap);
+    }
+    // SSO secret: HMAC key compartido entre NKR y el módulo `nkr_sso` del tenant.
+    // Random 64 hex chars (256 bits). Único por instancia. Sólo persiste en
+    // odoo.conf del tenant (filesystem del host, no en git, no en panel).
+    // Vive en la sección `[nkr_sso]` clave `secret` — NO en `[options]`, porque
+    // Odoo emite un WARNING ("unknown option") por cualquier key desconocida de
+    // `[options]`, mientras que las keys de otras secciones van a `config.misc`
+    // sin warning. Legacy: clave `nkr_sso_secret` en `[options]` (de v1.6.3) —
+    // se migra a `[nkr_sso]` preservando el valor (no se rota). Idempotente.
+    {
+        // ¿Ya hay un `secret = <nonempty>` (la línea de la sección [nkr_sso])?
+        let has_section_secret = lines.iter().any(|l| {
+            match l.find('=') { Some(eq) => l[..eq].trim() == "secret" && !l[eq + 1..].trim().is_empty(), None => false }
+        });
+        let has_section_header = lines.iter().any(|l| l.trim() == "[nkr_sso]");
+        // Extraer el valor legacy de `[options]` (si existe) y removerlo.
+        let mut legacy_val: Option<String> = None;
+        lines.retain(|l| {
+            if l.trim_start().starts_with("nkr_sso_secret") {
+                if let Some(eq) = l.find('=') {
+                    let v = l[eq + 1..].trim().to_string();
+                    if !v.is_empty() { legacy_val = Some(v); }
+                }
+                false // drop la línea legacy
+            } else { true }
+        });
+        if !(has_section_header && has_section_secret) {
+            let secret = legacy_val.unwrap_or_else(generate_sso_secret);
+            if !has_section_header {
+                lines.push(String::new());
+                lines.push("[nkr_sso]".to_string());
+            }
+            lines.push(format!("secret = {}", secret));
+        }
     }
     // db_name is forced by dbfilter; we also leave it explicit in case the conf had it.
     upsert_key(&mut lines, "db_name", &db_name);
@@ -1721,8 +1866,21 @@ fn rewrite_odoo_conf_full(
     upsert_key(&mut lines, "logfile", "/var/log/odoo/odoo.log");
 
     // Tier-aware overrides para staging/dev:
-    //   - dev_mode = reload,qweb,xml → inotify watcher restart workers en
-    //     cambios de .py + hot-reload de QWeb templates + XML views sin upgrade
+    //   - dev_mode: **NO se setea (vacío)** (v1.6.3 fix 2026-05-11).
+    //     Historial: v1.6.2 puso `qweb,xml` (sin `reload` que rompía
+    //     inotify). Pero `qweb,xml` activa watchdog interno de Odoo que
+    //     RECOMPILA templates desde XML en CADA request, generando ~9
+    //     warnings/req sobre `t-esc` deprecated del core de Odoo 19, CPU
+    //     spike por parseo, y memory churn. Observado en intech-devp:
+    //     cuelgue cada ~5 min del proceso nkr en host-side (32% CPU
+    //     busy loop, 2 threads visibles vs 3 esperados, TCP send queue
+    //     al guest 14 bytes pendientes). El reload via HVC0 (REL_OD) NO
+    //     destraba esos cuelgues porque el proceso nkr host-side está en
+    //     el loop, no Odoo guest. Watchdog NKR-side cubre el síntoma
+    //     (restart auto ~2 min). Para el path de iteración rápida en DEV,
+    //     usar `POST /addons/git` (auto_reload=true) que respawnea Odoo
+    //     con código fresh via supervisor loop — mismo efecto que
+    //     `dev_mode=qweb,xml` pero sin el bug.
     //   - limit_time_cpu/real más amplios → permite debugger / breakpoints
     //   - list_db = True → /web/database/manager accesible (override del
     //     False forzado arriba para tier production)
@@ -1732,7 +1890,8 @@ fn rewrite_odoo_conf_full(
     // Si el dev necesita traces de algo específico, edita odoo.conf manualmente
     // con log_handler granular (ej. `log_handler = odoo.addons.mi_modulo:DEBUG`).
     if opts.tier.is_dev_like() {
-        upsert_key(&mut lines, "dev_mode", "reload,qweb,xml");
+        // dev_mode vacío explícito (override del template legacy si tenía qweb,xml)
+        upsert_key(&mut lines, "dev_mode", "");
         upsert_key(&mut lines, "limit_time_cpu", "600");
         upsert_key(&mut lines, "limit_time_real", "1200");
         upsert_key(&mut lines, "list_db", "True");
@@ -1744,7 +1903,7 @@ fn rewrite_odoo_conf_full(
         proxy_mode_on,
         if opts.admin_passwd.is_some() { "set" } else { "preserved" },
         opts.tier,
-        if opts.tier.is_dev_like() { ", dev_mode=reload,qweb,xml log_level=debug" } else { "" });
+        if opts.tier.is_dev_like() { ", dev_mode=qweb,xml (sin `reload` por incompat virtio-fs+inotify; usar POST /reload)" } else { "" });
     Ok(())
 }
 

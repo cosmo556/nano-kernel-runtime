@@ -214,6 +214,21 @@ fn route(
             }))
         }
 
+        ("GET", ["api", "v1", "cells", cell, "instances", name, "create-status"]) => {
+            // Estado de un create asíncrono (POST /instances → 202). El panel
+            // pollea esto hasta status ∈ {ready, failed}. Ver NKR_API.md §4.4.1.
+            if !is_safe_identifier(cell) {
+                return HttpResponse::error(400, "invalid_cell", None);
+            }
+            if !is_safe_identifier(name) {
+                return HttpResponse::error(400, "invalid_nkr_name", None);
+            }
+            ipc_to_http(ipc_call(&IpcRequest::GetCreateStatus {
+                cell: (*cell).to_string(),
+                nkr_name: (*name).to_string(),
+            }))
+        }
+
         ("DELETE", ["api", "v1", "cells", _cell, "instances", name]) => {
             if !is_safe_identifier(name) {
                 return HttpResponse::error(400, "invalid_nkr_name", None);
@@ -222,6 +237,109 @@ fn route(
             ipc_to_http(ipc_call(&IpcRequest::DeleteInstance {
                 nkr_name: (*name).to_string(),
                 drop_db,
+            }))
+        }
+
+        ("GET", ["api", "v1", "cells", _cell, "instances", name, "metrics"]) => {
+            // Snapshot de métricas de UNA instancia (JSON) — para la pestaña
+            // "Métricas" del panel. El daemon cachea ~30s por VM (el `du` de
+            // disco más, ~5min), así que pollear seguido es gratis: la caché es
+            // el rate-limit, no devuelve 429. Recomendado: el panel pollea cada
+            // 30-60s mientras la pestaña esté abierta. Ver NKR_API.md §4.1.2.
+            if !is_safe_identifier(name) {
+                return HttpResponse::error(400, "invalid_nkr_name", None);
+            }
+            ipc_to_http(ipc_call(&IpcRequest::MetricsForVm {
+                nkr_name: (*name).to_string(),
+            }))
+        }
+
+        ("POST", ["api", "v1", "cells", _cell, "instances", name, "reload"]) => {
+            // Reload de workers Odoo SIN reiniciar la VM. ~3s, sin downtime
+            // del master ni VM. Auto-disparado por addons/git tras clone OK
+            // (back-compat: el panel puede llamarlo explícitamente con esto).
+            // Idempotente. Más rápido que /actions {restart} (~13-25s) y más
+            // confiable que /modules/upgrade en multi-worker (que solo refresca
+            // el worker que procesa el request). Ver NKR_API.md §4.18.
+            if !is_safe_identifier(name) {
+                return HttpResponse::error(400, "invalid_nkr_name", None);
+            }
+            ipc_to_http(ipc_call(&IpcRequest::ReloadWorkers {
+                nkr_name: (*name).to_string(),
+            }))
+        }
+
+        ("POST", ["api", "v1", "cells", _cell, "instances", name, "sso"]) => {
+            // SSO one-shot: pre-auth admin via JSON-RPC interno y devuelve
+            // URL firmada HMAC. El admin_passwd jamás sale del host (sólo
+            // el session_id viaja, opaco). Body opcional `{"user":"admin"}`.
+            // TTL 30s. Ver NKR_API.md §4.20 y nkr_sso.md (módulo Odoo).
+            if !is_safe_identifier(name) {
+                return HttpResponse::error(400, "invalid_nkr_name", None);
+            }
+            let mut user = "admin".to_string();
+            if !body.is_empty() {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+                    if let Some(u) = v.get("user").and_then(|x| x.as_str()) {
+                        user = u.to_string();
+                    }
+                }
+            }
+            ipc_to_http(ipc_call(&IpcRequest::Sso {
+                nkr_name: (*name).to_string(),
+                user,
+            }))
+        }
+
+        ("GET", ["api", "v1", "cells", _cell, "instances", name, "diag"]) |
+        ("POST", ["api", "v1", "cells", _cell, "instances", name, "diag"]) => {
+            // Diagnóstico HOST-side: dump de stacks/wchan/cpu de los threads
+            // del proceso `nkr` del tenant. Útil durante un cuelgue para
+            // capturar evidencia antes que el watchdog dispare restart auto.
+            // Acepta GET (idempotente, sólo lectura de /proc) y POST (por
+            // consistencia con los otros endpoints de actions).
+            // Output: text/plain. Ver §X.X de NKR_API.md.
+            if !is_safe_identifier(name) {
+                return HttpResponse::error(400, "invalid_nkr_name", None);
+            }
+            ipc_to_http(ipc_call(&IpcRequest::Diag {
+                nkr_name: (*name).to_string(),
+            }))
+        }
+
+        ("POST", ["api", "v1", "cells", _cell, "instances", name, "balloon"]) => {
+            // Marca la VM como ACTIVE en el ballooning dinámico. Idempotente:
+            // múltiples calls renuevan el TS sin re-aplicar config_change.
+            // Body opcional `{"state": "active"}` (default). IDLE no se setea
+            // explícitamente — viene por decay tras `balloon_decay_secs` sin
+            // renovación. Si la VM tiene balloon estático (PROD por tier),
+            // la señal se entrega pero el state machine la ignora — devolvemos
+            // 202 igual para que el panel no necesite saber el tier.
+            // Ver NKR_API.md §4.18 (ballooning IDLE/ACTIVE).
+            if !is_safe_identifier(name) {
+                return HttpResponse::error(400, "invalid_nkr_name", None);
+            }
+            // Validar state si vino en el body (opcional, default "active").
+            // No-op para "idle" — IDLE es decay automático, no se fuerza
+            // desde el panel para no romper el contrato del decay timer.
+            if !body.is_empty() {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+                    if let Some(s) = v.get("state").and_then(|x| x.as_str()) {
+                        if s == "idle" {
+                            return HttpResponse::json(400, serde_json::json!({
+                                "error": "explicit_idle_not_supported",
+                                "message": "IDLE se aplica automáticamente tras balloon_decay_secs sin renovación. No es seteable desde el panel.",
+                            }));
+                        }
+                        if s != "active" {
+                            return HttpResponse::error(400, "invalid_state",
+                                Some("state debe ser \"active\" (o body vacío)"));
+                        }
+                    }
+                }
+            }
+            ipc_to_http(ipc_call(&IpcRequest::BalloonActive {
+                nkr_name: (*name).to_string(),
             }))
         }
 
@@ -598,59 +716,107 @@ fn handle_addons_git(cell: &str, instance: &str, body: &[u8]) -> HttpResponse {
         return HttpResponse::error(400, "invalid_subdir", None);
     }
 
-    // Layout flat: todo módulo termina en addons/<module>/. Para repos
-    // multi-módulo (OCA-style: repo/<module>/__manifest__.py) explotamos al
-    // nivel de addons/. Para single-module (repo/__manifest__.py) lo dejamos
-    // bajo el nombre del subdir solicitado por el panel.
+    // Layout flat: todo módulo termina en addons/<module>/.
     //
-    // Estrategia: clone siempre a un tmp dir efímero y luego mover módulos a
-    // su posición final. Eso evita que git deje un dir intermedio y mantiene
-    // addons_path simple (`/mnt/extra-addons` cubre todo).
+    // Flujo Plan B (v1.6.3 — atomic swap, post bug del race con Odoo en vuelo):
+    //   1. Staging dir hermano de addons/: `.nkr-addons-new/`.
+    //   2. git clone → staging/.nkr-clone-tmp/
+    //   3. explode_modules: valida, scanea, computa hashes, mueve módulos
+    //      desde .nkr-clone-tmp/ → staging_dir/<m>/ (intra-staging, fast)
+    //   4. `renameat2(addons, staging, RENAME_EXCHANGE)` — swap atómico de
+    //      directorios en un solo syscall. Cualquier observador (Odoo guest
+    //      vía virtio-fs) ve siempre un addons/ coherente: el viejo o el
+    //      nuevo, nunca a medias.
+    //   5. rm -rf del staging (contiene los viejos módulos, a borrar lazy).
     //
-    // Cualquier action (clone|pull|sync) se materializa como re-clone fresco
-    // del tmp — no hay git pull post-explote porque el .git está suelto. La
-    // idempotencia se preserva via tracker `.nkr-source` por módulo.
-    let tmp_target = format!("{}/.nkr-tmp-{}", addons_dir, subdir);
-    let _ = std::fs::remove_dir_all(&tmp_target);
+    // Por qué no wipe + populate in-place (flujo legacy v1.6.2):
+    //   El wipe destruye archivos que Odoo tiene abiertos. virtio-fs no
+    //   resuelve los reads sobre fds dangling y Odoo queda en D-state
+    //   (uninterruptible sleep) — ni SIGTERM lo libera. Resultado: zombie
+    //   loop, supervisor no puede respawnear, sólo restart full de la VM
+    //   recupera. Reproducido 2026-05-10 con tenant intech-devp.
+    let staging_dir = format!("{}/.nkr-addons-new", instance_dir);
+    let clone_tmp = format!("{}/.nkr-clone-tmp", staging_dir);
+    // Cleanup de staging stale (crash de deploy anterior).
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    if let Err(e) = std::fs::create_dir_all(&staging_dir) {
+        return HttpResponse::error(500, "staging_mkdir_failed",
+            Some(&format!("crear {}: {}", staging_dir, e)));
+    }
 
-    // Forzar clone (ignorar req.action) — el tmp siempre está vacío, así que
-    // el código de run_git_sync ejecuta git clone fresh.
+    // Forzar clone (ignorar req.action) — clone_tmp está vacío.
     let mut clone_req = req.clone();
     clone_req.action = "clone".to_string();
 
-    let clone_resp = run_git_sync(&clone_req, &tmp_target);
+    let clone_resp = run_git_sync(&clone_req, &clone_tmp);
     if clone_resp.status >= 400 {
-        let _ = std::fs::remove_dir_all(&tmp_target);
+        let _ = std::fs::remove_dir_all(&staging_dir);
         return clone_resp;
     }
 
-    let sha = git_head_sha(&tmp_target).unwrap_or_else(|| "unknown".to_string());
+    let sha = git_head_sha(&clone_tmp).unwrap_or_else(|| "unknown".to_string());
 
-    // Detectar layout y explotear. Devuelve además el diff per-módulo
-    // (added/updated/unchanged) basado en tree-hash git per-módulo.
+    // Detectar layout, validar, computar hashes y construir staging.
+    // El swap atómico ocurre dentro de explode_modules (paso final).
     let explode_result = explode_modules(
-        &tmp_target,
+        &clone_tmp,
         &addons_dir,
+        &staging_dir,
         &subdir,
         &req.repo_url,
         req.reference.as_deref(),
         &sha,
     );
 
-    // Cleanup del tmp (siempre, exitoso o no).
-    let _ = std::fs::remove_dir_all(&tmp_target);
+    // Cleanup del staging — tras el swap exitoso contiene los módulos VIEJOS
+    // (a borrar). Si explode_modules falló antes del swap, contiene parcial.
+    // En ambos casos: borrarlo es seguro.
+    let _ = std::fs::remove_dir_all(&staging_dir);
 
     match explode_result {
-        Ok(deploy) => HttpResponse::json(200, serde_json::json!({
-            "repo_url": req.repo_url,
-            "ref": req.reference,
-            "sha": sha,
-            "module_count": deploy.modules.len(),
-            "modules": deploy.modules,
-            "added": deploy.added,
-            "updated": deploy.updated,
-            "unchanged": deploy.unchanged,
-        })),
+        Ok(deploy) => {
+            // Auto-reload: SIGUSR1 al PID de la VM → vmm.rs inyecta REL_OD
+            // por hvc0 → init guest hace pkill -HUP odoo → master kill workers
+            // → respawnean con código fresh. Fire-and-forget: si la VM está
+            // apagada o el reload falla, no bloqueamos la response del clone
+            // (el panel ya tiene los archivos en disco; el reload es bonus).
+            // Ignoramos errores intencionalmente — el panel puede llamar
+            // POST /reload manual si quiere certeza, o leer reloaded en la
+            // response.
+            let mut reloaded = false;
+            let mut reload_skipped_reason: Option<&'static str> = None;
+            if req.auto_reload {
+                match ipc_call(&IpcRequest::ReloadWorkers {
+                    nkr_name: instance.to_string(),
+                }) {
+                    Ok(r) if r.status == 202 => { reloaded = true; }
+                    Ok(r) => {
+                        eprintln!("[NKR-API-SERVER] auto-reload({}) status={} (clone OK pero workers no recargaron)",
+                            instance, r.status);
+                        reload_skipped_reason = Some("instance_not_running_or_unknown_pid");
+                    }
+                    Err(e) => {
+                        eprintln!("[NKR-API-SERVER] auto-reload({}) IPC failed: {}", instance, e);
+                        reload_skipped_reason = Some("ipc_error");
+                    }
+                }
+            } else {
+                reload_skipped_reason = Some("auto_reload=false");
+            }
+            HttpResponse::json(200, serde_json::json!({
+                "repo_url": req.repo_url,
+                "ref": req.reference,
+                "sha": sha,
+                "module_count": deploy.modules.len(),
+                "modules": deploy.modules,
+                "added": deploy.added,
+                "updated": deploy.updated,
+                "unchanged": deploy.unchanged,
+                "removed": deploy.removed,
+                "reloaded": reloaded,
+                "reload_skipped_reason": reload_skipped_reason,
+            }))
+        }
         Err(err_resp) => err_resp,
     }
 }
@@ -658,11 +824,17 @@ fn handle_addons_git(cell: &str, instance: &str, body: &[u8]) -> HttpResponse {
 /// Resultado de `explode_modules`: lista plana de módulos publicados +
 /// clasificación por diff vs el estado previo del addons/ (basado en
 /// tree-hash git per-módulo guardado en `.nkr-source`).
+///
+/// Bajo Higiene Doble (CLAUDE.md v2.2) addons/ se vacía completamente cada
+/// ciclo y se repuebla desde el meta-repo. `removed` lista los módulos que
+/// estaban antes y NO vinieron en el ciclo actual — útil para el panel:
+/// avisa cuándo un addon dejó de estar en el repo y desapareció del tenant.
 struct ExplodeResult {
     modules: Vec<String>,    // back-compat: nombres en orden de descubrimiento
     added: Vec<String>,      // no existían antes en addons/
     updated: Vec<String>,    // existían y el tree-hash cambió
     unchanged: Vec<String>,  // existían y el tree-hash es idéntico
+    removed: Vec<String>,    // existían y ya no están en el meta-repo
 }
 
 /// Encuentra el directorio git "más cercano" subiendo desde `start` hasta
@@ -799,26 +971,48 @@ fn detect_name_collisions(
         .collect()
 }
 
-/// Reads `.gitmodules` files recursively (the parent's plus each
-/// submodule's nested `.gitmodules` if present). For each declared submodule
-/// `path = X`, checks the destination directory has at least one entry.
-/// Returns the list of empty paths (relative to root) so the caller can
-/// build a 422 response listing every submodule that failed to clone.
-fn validate_submodules_populated(tmp_dir: &str) -> Result<(), Vec<String>> {
-    let root = std::path::Path::new(tmp_dir);
-    let mut empty_paths: Vec<String> = Vec::new();
-    walk_gitmodules(root, root, &mut empty_paths);
-    if empty_paths.is_empty() {
-        Ok(())
-    } else {
-        Err(empty_paths)
+/// Resultado de la validación estricta de submódulos. Bajo CLAUDE.md v2.2:
+/// cada `path = X` declarado en cualquier `.gitmodules` (recursivo) debe
+/// ser uno de:
+///   (a) un módulo Odoo: `__manifest__.py` en su raíz, o
+///   (b) un agrupador: tiene su propio `.gitmodules` (validado recursivamente).
+/// Si no es ninguno → `no_manifest` (rechaza basureros de scripts/docs).
+/// Si está vacío post-clone → `empty` (clone parcial por PAT scope).
+struct SubmoduleValidation {
+    /// Submódulo declarado pero el dir está vacío. Causa típica: PAT sin
+    /// scope sobre el repo del submódulo, o repo del submódulo borrado.
+    empty: Vec<String>,
+    /// Submódulo declarado pero ni es módulo (sin `__manifest__.py` en raíz)
+    /// ni es agrupador (sin `.gitmodules` propio). Doctrine: el meta-repo
+    /// no es un basurero de scripts; cada submódulo debe ser modulo Odoo
+    /// o un nivel intermedio de la matrioshka.
+    no_manifest: Vec<String>,
+}
+
+impl SubmoduleValidation {
+    fn is_clean(&self) -> bool {
+        self.empty.is_empty() && self.no_manifest.is_empty()
     }
 }
 
-fn walk_gitmodules(
+/// Validación estricta CLAUDE.md v2.2 (matrioshka): walk recursivo de
+/// `.gitmodules`, falla rápido con detalle por submódulo malformado. Se
+/// llama ANTES del wipe target — si el árbol está sucio, NO se toca el
+/// `addons/` del tenant.
+fn validate_submodules_strict(tmp_dir: &str) -> SubmoduleValidation {
+    let root = std::path::Path::new(tmp_dir);
+    let mut v = SubmoduleValidation {
+        empty: Vec::new(),
+        no_manifest: Vec::new(),
+    };
+    walk_gitmodules_strict(root, root, &mut v);
+    v
+}
+
+fn walk_gitmodules_strict(
     root: &std::path::Path,
     current: &std::path::Path,
-    empty: &mut Vec<String>,
+    v: &mut SubmoduleValidation,
 ) {
     let gm = current.join(".gitmodules");
     if !gm.is_file() {
@@ -841,22 +1035,169 @@ fn walk_gitmodules(
                 continue;
             }
             let sub_path = current.join(val);
+            let rel = sub_path
+                .strip_prefix(root)
+                .unwrap_or(&sub_path)
+                .to_string_lossy()
+                .into_owned();
             let count = std::fs::read_dir(&sub_path)
                 .map(|rd| rd.flatten().count())
                 .unwrap_or(0);
             if count == 0 {
-                let rel = sub_path
-                    .strip_prefix(root)
-                    .unwrap_or(&sub_path)
-                    .to_string_lossy()
-                    .into_owned();
-                empty.push(rel);
-            } else {
-                // Recurse into the submodule's own .gitmodules, if any.
-                walk_gitmodules(root, &sub_path, empty);
+                v.empty.push(rel);
+                continue;
+            }
+            let has_manifest = sub_path.join("__manifest__.py").is_file();
+            let has_gitmodules = sub_path.join(".gitmodules").is_file();
+            if !has_manifest && !has_gitmodules {
+                // Doctrine: submódulo declarado pero no es módulo Odoo ni
+                // agrupador. Probable basura: docs, scripts, README-only repo.
+                v.no_manifest.push(rel);
+                continue;
+            }
+            if has_gitmodules {
+                // Agrupador: descender para validar la siguiente capa de
+                // la matrioshka. Si además tiene manifest (raro pero posible:
+                // un módulo "padre" que orquesta hijos vía submódulos),
+                // ambos son válidos — el padre se publica, los hijos también.
+                walk_gitmodules_strict(root, &sub_path, v);
             }
         }
     }
+}
+
+/// Higiene de Origen (CLAUDE.md v2.2): `git clean -ffdx` sobre la escalera
+/// + `git submodule foreach --recursive git clean -ffdx`. Limpia archivos
+/// untracked, ignored y modificados en el árbol entero ANTES de validar y
+/// publicar. En clone fresco es idempotente; sólo aporta cuando el tmp
+/// sobrevive entre llamadas (futuro source ladder persistente) o el clone
+/// dejó residuos por hooks/post-clone scripts del operador.
+fn git_clean_ladder(tmp_dir: &str) {
+    let safe = format!("safe.directory={}", tmp_dir);
+    let _ = std::process::Command::new("git")
+        .args([
+            "-c", &safe,
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "protocol.allow=user",
+            "-C", tmp_dir,
+            "clean", "-ffdx",
+        ])
+        .output();
+    let _ = std::process::Command::new("git")
+        .args([
+            "-c", &safe,
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "protocol.allow=user",
+            "-C", tmp_dir,
+            "submodule", "foreach", "--recursive",
+            "git clean -ffdx",
+        ])
+        .output();
+}
+
+/// Lee el estado previo de `addons/` para diff: para cada subdir top-level
+/// (no dotfiles) lee `<dir>/.nkr-source` y extrae el `content_hash`. El
+/// HashMap resultante se compara post-populate para clasificar
+/// added/updated/unchanged/removed. Se llama ANTES del wipe.
+///
+/// Si un módulo existía en addons/ sin `.nkr-source` (creación manual, o
+/// flujo legacy pre-tracker), entra al map con hash vacío — al comparar
+/// con el nuevo hash queda como `updated` (decisión conservadora: lo
+/// reportamos como cambio para que el panel lo note).
+fn read_addons_state(addons_dir: &str) -> std::collections::HashMap<String, String> {
+    let mut state = std::collections::HashMap::new();
+    let entries = match std::fs::read_dir(addons_dir) {
+        Ok(e) => e,
+        Err(_) => return state,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if name.starts_with('.') {
+            // Skip hidden state dirs (.nkr-tmp-*, etc.)
+            continue;
+        }
+        let hash = read_prev_content_hash(&path.to_string_lossy()).unwrap_or_default();
+        state.insert(name, hash);
+    }
+    state
+}
+
+/// Swap atómico de dos directorios (Plan B — CLAUDE.md v2.2 + bug fix
+/// 2026-05-10 race con Odoo en vuelo).
+///
+/// Path principal: `renameat2(RENAME_EXCHANGE)` — un solo syscall que
+/// intercambia los dos paths atómicamente. Cualquier observador (Odoo guest
+/// vía virtio-fs) jamás ve `addons/` inexistente ni a medias. Disponible en
+/// Linux ≥ 3.15 sobre ext4/btrfs/xfs/virtiofs (todos los que usa NKR).
+///
+/// Fallback en ENOSYS (FS exótico, kernel viejo de CI): 2-step rename con
+/// rollback en caso de falla intermedia. Hay una ventana <1ms donde el
+/// path `a` no existe — aceptable para deploys, no aceptable para tenants
+/// con tráfico activo (es exactamente el bug que esto resuelve), pero un
+/// kernel sin renameat2 es un escenario tan raro que el fallback es sólo
+/// defense-in-depth, no el path normal.
+fn atomic_swap_dirs(a: &str, b: &str) -> std::io::Result<()> {
+    match renameat2_exchange(a, b) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+            eprintln!("[NKR-ADDONS] renameat2 RENAME_EXCHANGE no soportado por \
+                       el FS/kernel ({}); fallback a 2-step rename. Esto NO es \
+                       atómico — riesgo de race si hay un guest sirviendo \
+                       tráfico durante el deploy.", e);
+            atomic_swap_dirs_fallback(a, b)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Llamada raw a renameat2 con RENAME_EXCHANGE. Errores POSIX se propagan
+/// como `std::io::Error` (ENOSYS = no soportado, EINVAL = paths mal, etc.).
+fn renameat2_exchange(a: &str, b: &str) -> std::io::Result<()> {
+    let a_c = std::ffi::CString::new(a.as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let b_c = std::ffi::CString::new(b.as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            a_c.as_ptr(),
+            libc::AT_FDCWD,
+            b_c.as_ptr(),
+            libc::RENAME_EXCHANGE as libc::c_uint,
+        )
+    };
+    if r != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Fallback 2-step rename con rollback si el segundo paso falla. NO atómico.
+fn atomic_swap_dirs_fallback(a: &str, b: &str) -> std::io::Result<()> {
+    let parking = format!("{}.nkr-swap-tmp-{}", a, std::process::id());
+    // Cleanup previo por las dudas
+    let _ = std::fs::remove_dir_all(&parking);
+    std::fs::rename(a, &parking)?;
+    if let Err(e) = std::fs::rename(b, a) {
+        // Rollback best-effort: restaurar a
+        let _ = std::fs::rename(&parking, a);
+        return Err(e);
+    }
+    // Final: parking ahora contiene los viejos. El caller lo borra después
+    // como parte del cleanup del staging. Pero como acá el "staging" es `b`
+    // y `b` ya no existe (lo movimos a `a`), tenemos que renombrar parking
+    // a b para que el caller pueda hacer su rm -rf staging_dir uniforme.
+    std::fs::rename(&parking, b)?;
+    Ok(())
 }
 
 /// Detecta si el repo recién clonado es single-module (manifest en raíz),
@@ -864,71 +1205,92 @@ fn walk_gitmodules(
 /// (`.gitmodules` presente, profundidad arbitraria), y mueve los módulos a
 /// su posición final bajo `addons/<module>/`.
 ///
-/// Single-module: `tmp/__manifest__.py` → `addons/<subdir>/`.
-/// Multi-módulo:  `tmp/<m>/__manifest__.py` → `addons/<m>/` para cada `m`.
-/// Submódulos:    walk recursivo del árbol entero, todo dir con manifest
-///                a `addons/<m>/`. Falla con 409 si dos módulos colisionan
-///                en nombre, o 422 si algún submódulo declarado en
-///                `.gitmodules` quedó vacío.
+/// Flujo Plan B (v1.6.3 — atomic swap; bug fix race con Odoo en vuelo):
+///   1. `git clean -ffdx` recursivo sobre la escalera (defensivo).
+///   2. Validación 422 estricta de submódulos.
+///   3. Scan de módulos en la escalera (clone_tmp dentro del staging).
+///   4. Snapshot del estado previo del `addons/` actual (para diff).
+///   5. Compute tree-hashes de cada módulo (en clone_tmp).
+///   6. Populate staging: rename cada módulo de `clone_tmp/<rel>` →
+///      `staging_dir/<m>/`, escribir `.nkr-source` con tracker.
+///   7. Cleanup intra-staging: borrar `clone_tmp/` (sobra el `.git` etc.).
+///   8. **Atomic swap**: `renameat2(addons, staging, RENAME_EXCHANGE)`.
+///   9. Clasificación added/updated/unchanged/removed contra el snapshot.
 ///
-/// Tracker `.nkr-source` por módulo: archivo INI con `repo_url=`, `ref=`,
-/// `sha=`. Permite re-clone idempotente sobre módulos del mismo repo y
-/// detectar conflictos genuinos (módulo con mismo nombre desde otro repo).
+/// Tras el swap, `addons/` contiene los módulos nuevos y `staging_dir/`
+/// contiene los viejos. El caller borra `staging_dir/` después.
+///
+/// Por qué este flujo evita el race:
+///   El swap es 1 syscall atómico — el guest jamás ve `addons/` sin existir
+///   ni con estado parcial. Odoo en vuelo termina sus reads sobre fds
+///   abiertos del addons viejo (semántica POSIX: los inodes viven hasta que
+///   se cierren los fds), pero el próximo `os.listdir()` / `open()` ya cae
+///   sobre el addons nuevo. Cero tiempo de bloqueo en D-state.
 fn explode_modules(
-    tmp_dir: &str,
+    clone_tmp: &str,
     addons_dir: &str,
+    staging_dir: &str,
     subdir_hint: &str,
     repo_url: &str,
     reference: Option<&str>,
     sha: &str,
 ) -> Result<ExplodeResult, HttpResponse> {
-    let tmp = std::path::Path::new(tmp_dir);
-    let manifest_at_root = tmp.join("__manifest__.py").exists();
-    let has_submodules = tmp.join(".gitmodules").is_file();
+    let clone_path = std::path::Path::new(clone_tmp);
+    let manifest_at_root = clone_path.join("__manifest__.py").exists();
+    let has_submodules = clone_path.join(".gitmodules").is_file();
 
-    // Pre-scan: recolectar (src_path, name) de cada módulo detectado.
-    // Para single-module y multi-módulo legacy, src_path corresponde a la
-    // posición canónica que se usará al hacer rename. Para submódulos
-    // (jerarquía profunda), los src_paths vienen del walk recursivo.
+    // ─── STEP 1: Higiene de Origen ─────────────────────────────────────────
+    git_clean_ladder(clone_tmp);
+
+    // ─── STEP 2: Validación 422 estricta ───────────────────────────────────
+    // Sólo aplica si hay `.gitmodules`. Falla antes de tocar `addons/`.
+    if has_submodules {
+        let v = validate_submodules_strict(clone_tmp);
+        if !v.is_clean() {
+            if !v.empty.is_empty() {
+                return Err(HttpResponse::json(422, serde_json::json!({
+                    "error": "submodule_clone_partial",
+                    "message": format!(
+                        "{} submódulo(s) no se clonaron — verificar scope del PAT \
+                         y que cada repo declarado en .gitmodules sea accesible.",
+                        v.empty.len()
+                    ),
+                    "failed_submodules": v.empty,
+                    "remediation": "Confirmar que el PAT tiene Contents:Read sobre \
+                                    todos los repos del árbol y reintentar el POST.",
+                })));
+            }
+            return Err(HttpResponse::json(422, serde_json::json!({
+                "error": "submodule_no_manifest",
+                "message": format!(
+                    "{} submódulo(s) declarado(s) en .gitmodules no son módulos \
+                     Odoo válidos (no tienen __manifest__.py al raíz ni \
+                     .gitmodules anidado).",
+                    v.no_manifest.len()
+                ),
+                "invalid_submodules": v.no_manifest,
+                "remediation": "Cada submódulo del meta-repo debe ser un módulo \
+                                Odoo (con __manifest__.py al raíz) o un \
+                                agrupador con su propio .gitmodules apuntando \
+                                a módulos. Eliminar los submódulos inválidos \
+                                del .gitmodules y commit + push.",
+            })));
+        }
+    }
+
+    // ─── STEP 3: Scan de módulos ───────────────────────────────────────────
     let mut modules: Vec<(std::path::PathBuf, String)> = Vec::new();
 
     if has_submodules {
-        // Submódulos: validar que ningún submódulo del árbol haya quedado
-        // vacío post-clone (auth recursiva fallida, SHA inexistente, etc.).
-        // Esto se chequea ANTES del scan de manifests para que el panel
-        // reciba un error específico (`submodule_clone_partial`) en vez de
-        // un misleading `no_modules_found` cuando el problema fue de auth.
-        if let Err(empty) = validate_submodules_populated(tmp_dir) {
-            return Err(HttpResponse::json(422, serde_json::json!({
-                "error": "submodule_clone_partial",
-                "message": format!(
-                    "{} submódulo(s) no se clonaron — verificar scope del PAT \
-                     y que cada repo declarado en .gitmodules sea accesible.",
-                    empty.len()
-                ),
-                "failed_submodules": empty,
-                "remediation": "Confirmar que el PAT tiene Contents:Read sobre \
-                                todos los repos del árbol y reintentar el POST.",
-            })));
-        }
-
-        // Recursive scan: encontrar todo dir con __manifest__.py a profundidad
-        // arbitraria. Salta dotfile dirs (.git, .github) y no desciende dentro
-        // de un módulo (data/, models/, etc. no son módulos).
-        match scan_modules_recursive(tmp_dir) {
+        match scan_modules_recursive(clone_tmp) {
             Ok(found) => modules = found,
-            Err(e) => return Err(HttpResponse::error(500, "scan_failed",
-                Some(&e))),
+            Err(e) => return Err(HttpResponse::error(500, "scan_failed", Some(&e))),
         }
-
         if modules.is_empty() {
             return Err(HttpResponse::error(422, "no_modules_found",
                 Some("el árbol clonado (incluyendo submódulos) no contiene \
                       ningún __manifest__.py")));
         }
-
-        // Validar que cada nombre de módulo es seguro (mismo charset que
-        // is_safe_identifier para evitar path-injection vía rename).
         for (path, name) in &modules {
             if !is_safe_identifier(name) {
                 return Err(HttpResponse::error(400, "invalid_module_name",
@@ -936,11 +1298,7 @@ fn explode_modules(
                         name, path.display()))));
             }
         }
-
-        // Detectar colisión de nombres dentro del mismo deploy: dos módulos
-        // con el mismo dirname encontrados en distintas ramas del árbol Git.
-        // NKR no elige un ganador — aborta para que el cliente lo resuelva
-        // explícitamente. Ver §4.10.2 de NKR_API.md.
+        // Detectar colisión de nombres dentro del mismo deploy.
         let collisions = detect_name_collisions(&modules);
         if !collisions.is_empty() {
             let conflicts_json: Vec<serde_json::Value> = collisions
@@ -949,7 +1307,7 @@ fn explode_modules(
                     let rels: Vec<String> = paths
                         .iter()
                         .map(|p| {
-                            p.strip_prefix(tmp)
+                            p.strip_prefix(clone_path)
                                 .unwrap_or(p)
                                 .to_string_lossy()
                                 .into_owned()
@@ -976,13 +1334,12 @@ fn explode_modules(
             })));
         }
     } else if manifest_at_root {
-        // Single-module legacy: nombre = subdir_hint (panel decidió cómo
-        // llamarlo). El src_path es el tmp dir entero, que se renombra
-        // como bloque.
-        modules.push((tmp.to_path_buf(), subdir_hint.to_string()));
+        // Single-module: el módulo ES el clone_tmp entero. Lo movemos como
+        // bloque a `staging_dir/<subdir_hint>/`.
+        modules.push((clone_path.to_path_buf(), subdir_hint.to_string()));
     } else {
-        // Multi-módulo legacy: cada subdir directo de tmp con __manifest__.py.
-        let entries = match std::fs::read_dir(tmp) {
+        // Multi-módulo legacy: subdirs directos con __manifest__.py.
+        let entries = match std::fs::read_dir(clone_path) {
             Ok(e) => e,
             Err(e) => return Err(HttpResponse::error(500, "scan_failed",
                 Some(&e.to_string()))),
@@ -1008,58 +1365,18 @@ fn explode_modules(
         }
     }
 
-    // Pre-check de conflictos vs módulos preexistentes en addons/: cada
-    // módulo destino debe (a) no existir, o (b) ser de este mismo repo
-    // (según `.nkr-source`). Si es de otro repo → 409 module_conflict
-    // sin modificar nada. Distinto del module_name_collision (que es
-    // dentro del mismo deploy).
-    let mut conflicts: Vec<serde_json::Value> = Vec::new();
-    for (_, m) in &modules {
-        let dst = format!("{}/{}", addons_dir, m);
-        let dst_path = std::path::Path::new(&dst);
-        if !dst_path.exists() { continue; }
-        // Existe — leer .nkr-source si está.
-        let src_file = format!("{}/.nkr-source", dst);
-        let prev_repo = std::fs::read_to_string(&src_file)
-            .ok()
-            .and_then(|s| s.lines()
-                .find(|l| l.starts_with("repo_url="))
-                .map(|l| l.trim_start_matches("repo_url=").to_string()));
-        match prev_repo {
-            Some(p) if p == repo_url => {} // overwrite legítimo (re-clone del mismo repo)
-            _ => conflicts.push(serde_json::json!({
-                "module": m,
-                "existing_repo": prev_repo.unwrap_or_else(|| "unknown".to_string()),
-                "attempted_repo": repo_url,
-            })),
-        }
-    }
-    if !conflicts.is_empty() {
-        return Err(HttpResponse::json(409, serde_json::json!({
-            "error": "module_conflict",
-            "message": "uno o más módulos ya existen y vienen de otro repo. Borrar manualmente antes de re-clonar.",
-            "conflicts": conflicts,
-        })));
-    }
+    // ─── STEP 4: Snapshot del estado previo de `addons/` ───────────────────
+    let prev_state = read_addons_state(addons_dir);
 
-    // Pre-compute per-module content hash ANTES del rename. Para cada módulo
-    // buscamos el `.git` más cercano arriba (puede ser el del repo padre o
-    // el de un submódulo) y corremos `git rev-parse HEAD:<rel>`. El tree-hash
-    // de un dir cambia ⟺ cambió cualquier archivo dentro recursivamente.
-    //
-    // Side-effect: leemos también el hash previo guardado en
-    // `addons/<m>/.nkr-source` (si existe) para clasificar added/updated/
-    // unchanged. El hash previo se lee ANTES del remove_dir_all del rename.
-    let tmp_path = std::path::Path::new(tmp_dir);
+    // ─── STEP 5: Compute new tree-hashes ───────────────────────────────────
+    // Per-módulo via `git rev-parse HEAD:<rel>` contra el `.git` más
+    // cercano. Se hace en clone_tmp mientras los src_paths son válidos.
     let mut new_hashes: Vec<Option<String>> = Vec::with_capacity(modules.len());
-    let mut prev_hashes: Vec<Option<String>> = Vec::with_capacity(modules.len());
-    for (src_path, m) in &modules {
+    for (src_path, _) in &modules {
         let new_hash = if !has_submodules && manifest_at_root {
-            // Single-module: el módulo ES el repo. Tree-hash de HEAD.
-            git_tree_hash(tmp_path, "")
+            git_tree_hash(clone_path, "")
         } else {
-            // Walk up para encontrar el .git más cercano (parent o submódulo).
-            match nearest_git_root(src_path, tmp_path) {
+            match nearest_git_root(src_path, clone_path) {
                 Some(git_root) => {
                     let rel = src_path.strip_prefix(&git_root)
                         .ok()
@@ -1071,52 +1388,30 @@ fn explode_modules(
             }
         };
         new_hashes.push(new_hash);
-
-        let dst = format!("{}/{}", addons_dir, m);
-        prev_hashes.push(read_prev_content_hash(&dst));
     }
 
-    // Mover cada módulo a su posición final. fs::rename es atómico en el
-    // mismo filesystem, por módulo. La iteración multi-módulo no es
-    // atómica en agregado — si el daemon muere a la mitad del loop, queda
-    // mezcla. Deuda preexistente (no introducida por submódulos), ver
-    // AUDIT_GH.md §4.6 sobre renameat2 para resolverlo.
+    // ─── STEP 6: Populate staging (rename intra-staging) ──────────────────
+    // Mover cada módulo desde `clone_tmp/<rel>` → `staging_dir/<m>/`. Como
+    // clone_tmp es hijo de staging_dir (mismo FS), los renames son atómicos
+    // por inode-move. El `addons/` del tenant queda intacto.
     let mut module_names: Vec<String> = Vec::with_capacity(modules.len());
-    let mut added: Vec<String> = Vec::new();
-    let mut updated: Vec<String> = Vec::new();
-    let mut unchanged: Vec<String> = Vec::new();
-
-    let classify = |m: &str, prev: &Option<String>, new: &Option<String>,
-                    added: &mut Vec<String>, updated: &mut Vec<String>,
-                    unchanged: &mut Vec<String>| {
-        match (prev, new) {
-            (None, _) => added.push(m.to_string()),
-            (Some(p), Some(n)) if p == n => unchanged.push(m.to_string()),
-            (Some(_), _) => updated.push(m.to_string()),
-        }
-    };
 
     if !has_submodules && manifest_at_root {
-        // Single-module legacy: rename del tmp entero como bloque.
+        // Single-module: el clone_tmp completo se renombra a staging/<m>/.
+        // Pero clone_tmp es hijo de staging_dir, así que: clone_tmp ya está
+        // ahí, sólo le cambiamos el basename de `.nkr-clone-tmp` a `<m>`.
         let m = &modules[0].1;
-        let dst = format!("{}/{}", addons_dir, m);
-        let _ = std::fs::remove_dir_all(&dst);
-        if let Err(e) = std::fs::rename(tmp_dir, &dst) {
+        let dst = format!("{}/{}", staging_dir, m);
+        if let Err(e) = std::fs::rename(clone_tmp, &dst) {
             return Err(HttpResponse::error(500, "move_failed",
-                Some(&format!("rename {} → {}: {}", tmp_dir, dst, e))));
+                Some(&format!("rename {} → {}: {}", clone_tmp, dst, e))));
         }
         let new_hash = new_hashes[0].clone().unwrap_or_default();
         write_nkr_source(&dst, repo_url, reference, sha, &new_hash);
-        classify(m, &prev_hashes[0], &new_hashes[0],
-                 &mut added, &mut updated, &mut unchanged);
         module_names.push(m.clone());
     } else {
-        // Multi-módulo o submódulos jerárquicos: rename por módulo desde
-        // su src_path (que en el caso de submódulos puede estar a
-        // profundidad arbitraria del tmp).
         for (idx, (src_path, m)) in modules.iter().enumerate() {
-            let dst = format!("{}/{}", addons_dir, m);
-            let _ = std::fs::remove_dir_all(&dst);
+            let dst = format!("{}/{}", staging_dir, m);
             if let Err(e) = std::fs::rename(src_path, &dst) {
                 return Err(HttpResponse::error(500, "move_failed",
                     Some(&format!("rename {} → {}: {}",
@@ -1124,17 +1419,147 @@ fn explode_modules(
             }
             let new_hash = new_hashes[idx].clone().unwrap_or_default();
             write_nkr_source(&dst, repo_url, reference, sha, &new_hash);
-            classify(m, &prev_hashes[idx], &new_hashes[idx],
-                     &mut added, &mut updated, &mut unchanged);
             module_names.push(m.clone());
         }
     }
+
+    // ─── STEP 7: Cleanup intra-staging ─────────────────────────────────────
+    // clone_tmp puede ya no existir (single-module lo renombró). Si queda,
+    // contiene .git + archivos sueltos del repo. Borrar.
+    let _ = std::fs::remove_dir_all(clone_tmp);
+
+    // ─── STEP 8: Rename per-módulo INTRA-`addons/` (Plan C — fix 2026-05-11) ─
+    //
+    // **Por qué NO usamos atomic swap del dir top-level** (lo que hacía v1.6.3
+    // inicial con renameat2(RENAME_EXCHANGE)):
+    //   El swap intercambia el INODE del dir `addons/` entre el viejo y el
+    //   nuevo. Pero virtio-fs **NO propaga la invalidación de inode al
+    //   guest** — el guest mantiene su dentry/inode cache apuntando al viejo
+    //   inode. Cuando el caller hace cleanup del `staging` (= el viejo dir
+    //   ahora), virtio-fs en el guest empieza a ver archivos que "existen"
+    //   en el listdir pero `open()` retorna ENOENT. Resultado: Odoo carga
+    //   la DB del tenant pero los addons del filesystem son fantasmas —
+    //   "Some modules are not loaded" + "Missing model queue.job".
+    //   Reproducido en intech-devp 2026-05-11 ~02:16 UTC.
+    //
+    // **Solución**: mantener el inode top-level de `addons/` (= virtio-fs no
+    // se confunde), reemplazar cada MÓDULO individualmente con `rename`
+    // intra-`addons/`. El guest hace re-stat por entry, no cachea entries
+    // viejos cuando el dir raíz no cambia de inode.
+    //
+    // Algoritmo:
+    //   Para cada módulo en staging:
+    //     1. Si addons/<m> existe → rename a addons/.nkr-trash-<m>-<unix_ts>
+    //        (los fds abiertos por Odoo siguen apuntando al inode viejo
+    //        que sigue accesible — semántica POSIX).
+    //     2. rename(staging/<m>, addons/<m>) — el nuevo módulo aparece.
+    //   Después del REL_OD (Odoo muere → fds cerrados):
+    //     3. rm -rf addons/.nkr-trash-* (lazy cleanup en background thread).
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // El trash vive FUERA de `addons/` — Odoo 19 escanea TODOS los dirs
+    // de addons_path (incluso dotfiles) y trata de cargar cualquier subdir
+    // con __manifest__.py como módulo. Resultado:
+    // `FileNotFoundError: Invalid module name: .nkr-trash-...` cada vez
+    // que `update_list()` corre (UI Update Apps List, cron de queue_job,
+    // button_immediate_upgrade, etc.).
+    //
+    // Solución: trash en `<instance_dir>/.nkr-trash/` (sibling de addons/,
+    // fuera de addons_path). El rename atómico cross-dir funciona en el
+    // mismo FS (btrfs del host). Los fds abiertos por Odoo al inode viejo
+    // siguen vivos (semántica POSIX) hasta que se cierran post-REL_OD.
+    //
+    // Reproducido 2026-05-11: el bug previo nombraba el trash con dot
+    // INTERIOR (`<m>.nkr-trash-`) lo cual Odoo trataba como módulo con
+    // nombre raro y crasheaba `update_list`. El "fix" con dot PREFIX
+    // (`.nkr-trash-<ts>-<m>`) tampoco funcionó porque Odoo escanea
+    // dotfiles también. La solución definitiva es sacarlo del addons_path.
+    // El instance_dir se deriva del staging (que es `<instance>/.nkr-addons-new`).
+    // El trash queda en `<instance>/.nkr-trash/` — sibling de `addons/`, fuera
+    // del addons_path → Odoo no lo escanea jamás.
+    let instance_dir = std::path::Path::new(staging_dir)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| staging_dir.to_string());
+    let trash_dir = format!("{}/.nkr-trash", instance_dir);
+    let _ = std::fs::create_dir_all(&trash_dir);
+    for m in &module_names {
+        let dst = format!("{}/{}", addons_dir, m);
+        let src = format!("{}/{}", staging_dir, m);
+        if std::path::Path::new(&dst).exists() {
+            let trash = format!("{}/{}-{}", trash_dir, now_secs, m);
+            if let Err(e) = std::fs::rename(&dst, &trash) {
+                return Err(HttpResponse::error(500, "module_trash_failed",
+                    Some(&format!("rename {} → {}: {}", dst, trash, e))));
+            }
+        }
+        if let Err(e) = std::fs::rename(&src, &dst) {
+            return Err(HttpResponse::error(500, "module_install_failed",
+                Some(&format!("rename {} → {}: {}", src, dst, e))));
+        }
+    }
+    // Removidos: módulos que estaban en `addons/` y NO vinieron en este ciclo.
+    for m in prev_state.keys() {
+        if module_names.contains(m) { continue; }
+        let old = format!("{}/{}", addons_dir, m);
+        if std::path::Path::new(&old).exists() {
+            let trash = format!("{}/{}-{}", trash_dir, now_secs, m);
+            let _ = std::fs::rename(&old, &trash);
+        }
+    }
+    // Lazy cleanup en background — wait 60s para que Odoo cierre sus fd
+    // post-REL_OD antes de borrar físicamente. Barrido oportunista de todo
+    // lo que haya en .nkr-trash/ (defense in depth contra huérfanos).
+    {
+        let trash_dir_owned = trash_dir.clone();
+        std::thread::Builder::new()
+            .name("nkr-addons-trash-cleanup".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                if let Ok(entries) = std::fs::read_dir(&trash_dir_owned) {
+                    for e in entries.flatten() {
+                        let _ = std::fs::remove_dir_all(e.path());
+                    }
+                }
+            })
+            .ok();
+    }
+
+    // ─── STEP 9: Clasificación contra el snapshot previo ───────────────────
+    let mut added: Vec<String> = Vec::new();
+    let mut updated: Vec<String> = Vec::new();
+    let mut unchanged: Vec<String> = Vec::new();
+
+    let new_state: std::collections::HashMap<&str, String> = module_names
+        .iter()
+        .zip(new_hashes.iter())
+        .map(|(m, h)| (m.as_str(), h.clone().unwrap_or_default()))
+        .collect();
+
+    for m in &module_names {
+        let new = new_state.get(m.as_str()).cloned().unwrap_or_default();
+        match prev_state.get(m) {
+            None => added.push(m.clone()),
+            Some(prev) if !prev.is_empty() && !new.is_empty() && prev == &new => {
+                unchanged.push(m.clone());
+            }
+            Some(_) => updated.push(m.clone()),
+        }
+    }
+    let removed: Vec<String> = prev_state
+        .keys()
+        .filter(|k| !new_state.contains_key(k.as_str()))
+        .cloned()
+        .collect();
 
     Ok(ExplodeResult {
         modules: module_names,
         added,
         updated,
         unchanged,
+        removed,
     })
 }
 
@@ -1218,6 +1643,16 @@ fn handle_pylibs_put(cell: &str, instance: &str, body: &[u8]) -> HttpResponse {
         "--upgrade",
         "--disable-pip-version-check",
     ]);
+    // The systemd unit sets UMask=0077 → pip would write files 0600 / dirs 0700.
+    // The guest Odoo runs as uid 101 and virtio-fs does no UID remapping, so
+    // those imports would fail with PermissionError. Set umask 022 in the child
+    // (after fork, before exec — single-threaded, safe) so pip writes 0644/0755
+    // directly. No post-hoc `chmod -R` (which used to log "Operation not
+    // permitted" against the root-owned `pylibs/lib/` created at clone time).
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| { libc::umask(0o022); Ok(()) });
+    }
     let (status, stdout, stderr) = match run_with_timeout(cmd, PIP_TIMEOUT_S) {
         Ok(t) => t,
         Err(e) => return HttpResponse::error(500, "pip_spawn_failed", Some(&e)),
@@ -1229,13 +1664,6 @@ fn handle_pylibs_put(cell: &str, instance: &str, body: &[u8]) -> HttpResponse {
             "log_tail": tail,
         }));
     }
-    // pip install heredó UMask=0077 del systemd unit → files 0600, dirs 0700.
-    // El guest Odoo corre como uid 101 (odoo user en la imagen) y virtio-fs no
-    // hace UID remapping, así que sin world-readable los imports fallan con
-    // PermissionError. Fix: chmod -R go+rX al árbol instalado.
-    let _ = std::process::Command::new("chmod")
-        .args(["-R", "go+rX", &lib_dir])
-        .status();
     HttpResponse::json(200, serde_json::json!({
         "installed": true,
         "lib_dir": lib_dir,
@@ -1253,6 +1681,7 @@ struct GitReq {
     action: String,              // "sync" | "clone" | "pull"
     deploy_key_b64: Option<String>,
     github_token: Option<String>, // PAT HTTPS alternative to deploy_key
+    auto_reload: bool,           // post-clone: SIGUSR1 → REL_OD → pkill -HUP odoo (default true)
 }
 
 fn parse_git_body(body: &[u8]) -> Result<GitReq, HttpResponse> {
@@ -1293,7 +1722,14 @@ fn parse_git_body(body: &[u8]) -> Result<GitReq, HttpResponse> {
                 Some("PAT auth only works with https://github.com/... URLs; use deploy_key_b64 for SSH (git@...)")));
         }
     }
-    Ok(GitReq { repo_url, subdir, reference, action, deploy_key_b64, github_token })
+    // auto_reload: tras clone OK, dispara reload de workers Odoo via SIGUSR1
+    // (SIN reiniciar la VM). Default true — Odoo necesita ver el código nuevo
+    // y inotify NO funciona vía virtio-fs. Si el panel quiere control manual
+    // (no reload), pasar false explícito.
+    let auto_reload = v.get("auto_reload")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(true);
+    Ok(GitReq { repo_url, subdir, reference, action, deploy_key_b64, github_token, auto_reload })
 }
 
 fn run_git_sync(req: &GitReq, target: &str) -> HttpResponse {
@@ -1977,7 +2413,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_submodules_detects_empty_dir() {
+    fn validate_submodules_strict_detects_empty_dir() {
         let tmp = tempdir("val-empty");
         fs::write(tmp.join(".gitmodules"), r#"
 [submodule "module-a"]
@@ -1991,17 +2427,17 @@ mod tests {
         // module-b dir created but left empty (clone of that submodule failed)
         fs::create_dir_all(tmp.join("module-b")).unwrap();
 
-        let res = validate_submodules_populated(&tmp.to_string_lossy());
-        assert!(res.is_err());
-        let empty = res.unwrap_err();
-        assert!(empty.iter().any(|p| p.contains("module-b")),
-            "got empty list: {:?}", empty);
+        let v = validate_submodules_strict(&tmp.to_string_lossy());
+        assert!(!v.is_clean());
+        assert!(v.empty.iter().any(|p| p.contains("module-b")),
+            "got empty list: {:?}", v.empty);
+        assert!(v.no_manifest.is_empty());
 
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn validate_submodules_recurses_into_nested_gitmodules() {
+    fn validate_submodules_strict_recurses_into_nested_gitmodules() {
         let tmp = tempdir("val-nested");
         fs::write(tmp.join(".gitmodules"), r#"
 [submodule "group-frontend"]
@@ -2017,17 +2453,16 @@ mod tests {
         // nested-module dir created but empty (auth failed for the nested repo)
         fs::create_dir_all(tmp.join("group-frontend/nested-module")).unwrap();
 
-        let res = validate_submodules_populated(&tmp.to_string_lossy());
-        assert!(res.is_err());
-        let empty = res.unwrap_err();
-        assert!(empty.iter().any(|p| p.contains("nested-module")),
-            "got empty list: {:?}", empty);
+        let v = validate_submodules_strict(&tmp.to_string_lossy());
+        assert!(!v.is_clean());
+        assert!(v.empty.iter().any(|p| p.contains("nested-module")),
+            "got empty list: {:?}", v.empty);
 
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn validate_submodules_passes_when_all_populated() {
+    fn validate_submodules_strict_passes_when_all_populated() {
         let tmp = tempdir("val-ok");
         fs::write(tmp.join(".gitmodules"), r#"
 [submodule "module-a"]
@@ -2036,21 +2471,151 @@ mod tests {
 "#).unwrap();
         write_manifest(&tmp.join("module-a"));
 
-        let res = validate_submodules_populated(&tmp.to_string_lossy());
-        assert!(res.is_ok());
+        let v = validate_submodules_strict(&tmp.to_string_lossy());
+        assert!(v.is_clean(), "expected clean, got empty={:?} no_manifest={:?}",
+            v.empty, v.no_manifest);
 
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn validate_submodules_returns_ok_when_no_gitmodules() {
+    fn validate_submodules_strict_returns_clean_when_no_gitmodules() {
         // Plain repo without submodules — validation should be a no-op.
         let tmp = tempdir("val-no-gm");
         write_manifest(&tmp.join("module-a"));
 
-        let res = validate_submodules_populated(&tmp.to_string_lossy());
-        assert!(res.is_ok());
+        let v = validate_submodules_strict(&tmp.to_string_lossy());
+        assert!(v.is_clean());
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn validate_submodules_strict_rejects_submodule_without_manifest() {
+        // CLAUDE.md v2.2 doctrine: cada submódulo debe ser módulo o agrupador.
+        // Un submódulo con archivos pero sin __manifest__.py ni .gitmodules
+        // (e.g. repo de docs/scripts) → 422 submodule_no_manifest.
+        let tmp = tempdir("val-no-manifest");
+        fs::write(tmp.join(".gitmodules"), r#"
+[submodule "docs"]
+    path = docs
+    url = https://github.com/acme/docs.git
+[submodule "real-module"]
+    path = real-module
+    url = https://github.com/acme/real-module.git
+"#).unwrap();
+        // docs/ has files but is NOT a module (no __manifest__.py, no
+        // nested .gitmodules) — basurero de scripts.
+        fs::create_dir_all(tmp.join("docs")).unwrap();
+        fs::write(tmp.join("docs/README.md"), "# docs\n").unwrap();
+        fs::write(tmp.join("docs/setup.sh"), "#!/bin/bash\n").unwrap();
+        // real-module/ is a valid module
+        write_manifest(&tmp.join("real-module"));
+
+        let v = validate_submodules_strict(&tmp.to_string_lossy());
+        assert!(!v.is_clean());
+        assert!(v.empty.is_empty());
+        assert!(v.no_manifest.iter().any(|p| p.contains("docs")),
+            "expected 'docs' in no_manifest, got: {:?}", v.no_manifest);
+        assert!(!v.no_manifest.iter().any(|p| p.contains("real-module")));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn validate_submodules_strict_accepts_grouper_with_nested_modules() {
+        // Padre > Hijo > Nieto: un nivel intermedio sin manifest pero con
+        // .gitmodules apuntando a módulos válidos NO se rechaza.
+        let tmp = tempdir("val-grouper");
+        fs::write(tmp.join(".gitmodules"), r#"
+[submodule "group"]
+    path = group
+    url = https://github.com/acme/group.git
+"#).unwrap();
+        fs::create_dir_all(tmp.join("group")).unwrap();
+        fs::write(tmp.join("group/.gitmodules"), r#"
+[submodule "child-mod"]
+    path = child-mod
+    url = https://github.com/acme/child-mod.git
+"#).unwrap();
+        write_manifest(&tmp.join("group/child-mod"));
+
+        let v = validate_submodules_strict(&tmp.to_string_lossy());
+        assert!(v.is_clean(),
+            "grouper-with-nested-module should be clean, got empty={:?} no_manifest={:?}",
+            v.empty, v.no_manifest);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_addons_state_skips_dotfile_dirs_and_empty_modules() {
+        let tmp = tempdir("addons-state");
+        // Module with .nkr-source containing content_hash
+        let m1 = tmp.join("mod_a");
+        fs::create_dir_all(&m1).unwrap();
+        fs::write(m1.join(".nkr-source"),
+            "repo_url=https://x\nref=main\nsha=abc\n\
+             content_hash=1234567890abcdef1234567890abcdef12345678\n").unwrap();
+        // Module without .nkr-source
+        let m2 = tmp.join("mod_b");
+        fs::create_dir_all(&m2).unwrap();
+        // Hidden dir (should be skipped)
+        let hidden = tmp.join(".nkr-tmp-foo");
+        fs::create_dir_all(&hidden).unwrap();
+        // Plain file at top level (should be skipped)
+        fs::write(tmp.join("README.md"), "x").unwrap();
+
+        let state = read_addons_state(&tmp.to_string_lossy());
+        assert_eq!(state.len(), 2);
+        assert_eq!(state.get("mod_a"),
+            Some(&"1234567890abcdef1234567890abcdef12345678".to_string()));
+        assert_eq!(state.get("mod_b"), Some(&"".to_string()));
+        assert!(!state.contains_key(".nkr-tmp-foo"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn atomic_swap_dirs_exchanges_contents() {
+        // El path principal usa renameat2(RENAME_EXCHANGE). Test sobre
+        // el FS de /tmp (típicamente tmpfs o ext4 sobre Linux 3.15+).
+        // Si en el sandbox del test el FS no lo soporta (ENOSYS), el
+        // fallback se activa automáticamente — el test sigue pasando.
+        let root = tempdir("swap");
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("marker_a.txt"), "from-a").unwrap();
+        fs::write(b.join("marker_b.txt"), "from-b").unwrap();
+
+        atomic_swap_dirs(&a.to_string_lossy(), &b.to_string_lossy()).unwrap();
+
+        // Post-swap: a contiene lo que era b, y viceversa.
+        assert!(a.join("marker_b.txt").exists(),
+            "tras swap, dir 'a' debería tener marker_b");
+        assert!(b.join("marker_a.txt").exists(),
+            "tras swap, dir 'b' debería tener marker_a");
+        assert!(!a.join("marker_a.txt").exists());
+        assert!(!b.join("marker_b.txt").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn renameat2_exchange_fails_when_one_missing() {
+        // Si uno de los paths no existe, renameat2 debe fallar (no debe
+        // crear el path missing). El caller maneja esto creando ambos dirs
+        // antes de llamar atomic_swap_dirs.
+        let root = tempdir("swap-missing");
+        let a = root.join("a");
+        let b = root.join("b");  // no existe
+        fs::create_dir_all(&a).unwrap();
+
+        let res = renameat2_exchange(&a.to_string_lossy(), &b.to_string_lossy());
+        assert!(res.is_err(), "swap con path missing debe fallar");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
