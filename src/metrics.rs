@@ -31,10 +31,14 @@ const DU_TTL: Duration = Duration::from_secs(300);
 // ── Per-VM metrics-JSON cache (the per-instance API endpoint) ──────────────
 // The panel polls `GET .../instances/{name}/metrics` while the Metrics tab is
 // open. We compute a VM's full snapshot at most once per VM_METRICS_TTL and
-// serve the cached JSON in between — so even 20 tabs polling every 5s cost ~2
-// recomputes/min/VM, not 240. This *is* the rate limit (no 429s for the panel).
+// serve the cached JSON in between. A recompute is ~1ms (a handful of procfs +
+// cgroup file reads); the only heavy bit, the disk `du`, is independently
+// cached for DU_TTL (5 min) so it's untouched by a fast poll. TTL kept just
+// below a 5s poll so the panel always gets a fresh sample — and it still
+// coalesces burst/duplicate requests. (`guest_mem` only refreshes every
+// BALLOON_STATS_INTERVAL_SECS — that one number lags the rest.)
 static VM_METRICS_CACHE: Mutex<Option<HashMap<String, (Instant, serde_json::Value)>>> = Mutex::new(None);
-const VM_METRICS_TTL: Duration = Duration::from_secs(30);
+const VM_METRICS_TTL: Duration = Duration::from_secs(4);
 
 // =============================================================================
 // Data structures

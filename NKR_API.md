@@ -152,7 +152,7 @@ Formato `text/plain; version=0.0.4` (Prometheus exposition). Sin auth — pensad
 
 #### 4.1.2 `GET /api/v1/cells/{cell}/instances/{nkr_name}/metrics` — snapshot JSON de UNA instancia
 
-**Esto es lo que el panel usa para la pestaña "Métricas" de cada instancia.** Devuelve un snapshot JSON del momento (no historial — si querés un gráfico en el tiempo, el panel acumula las muestras del lado cliente). Auth bearer (a diferencia de `/metrics`). El daemon **cachea el resultado ~30s por VM** (y el `du` de disco ~5 min aparte) → el panel puede pollear seguido sin sobrecargar a NKR: la caché *es* el rate-limit, no devuelve 429. **Recomendado: el panel pollea cada 30–60s mientras la pestaña esté abierta**, y para de pollear al cerrarla. El campo `as_of` (unix ts) + `stale` (bool) indican la frescura del dato.
+**Esto es lo que el panel usa para la pestaña "Métricas" de cada instancia.** Devuelve un snapshot JSON del momento (no historial — si querés un gráfico en el tiempo, el panel acumula las muestras del lado cliente). Auth bearer (a diferencia de `/metrics`). El daemon **cachea el resultado ~4s por VM** (y el `du` de disco ~5 min aparte) → un poll cada 5s siempre recibe una muestra fresca, y los bursts/duplicados se coalescen; recomputar es ~1ms (un puñado de lecturas de procfs/cgroup), lo único caro (`du`) queda cacheado 5 min aparte, así que pollear rápido no sobrecarga a NKR (la caché *es* el rate-limit, no devuelve 429). **Recomendado: el panel pollea cada ~5s mientras la pestaña esté abierta** (más lento se ve el gráfico choppy), y para de pollear al cerrarla. El campo `as_of` (unix ts) + `stale` (bool) indican la frescura. Nota: `guest_mem` (RAM interna del guest) sólo se refresca cada ~15s — ese número va más lento que el resto.
 
 **Respuesta 200 (VM corriendo):**
 ```json
@@ -2502,7 +2502,7 @@ Environment=NKR_WATCHDOG_DISABLED=1
 | Endpoint | Duración típica | Timeout mínimo recomendado | Notas |
 |---|---|---|---|
 | `GET /metrics` | <100 ms | 5 s | Prometheus, todas las VMs. NO incluye disco per-VM (ver §4.1). |
-| `GET /instances/{name}/metrics` | <50 ms (cache hit) / hasta ~2-5 s (cache miss con `du` de filestore grande) | 10 s | JSON per-instancia para la pestaña Métricas del panel. Cacheado ~30s/VM (el `du` ~5min). Pollear cada 30-60s. Ver §4.1.2. |
+| `GET /instances/{name}/metrics` | <50 ms (cache hit) / ~1ms recompute, hasta ~2-5 s sólo en cache miss del `du` de un filestore grande | 10 s | JSON per-instancia para la pestaña Métricas del panel. Cacheado ~4s/VM (el `du` ~5min aparte). Pollear cada ~5s. Ver §4.1.2. |
 | `GET /api/v1/health` | <10 ms | 5 s | |
 | `GET /api/v1/cells` | <100 ms | 5 s | |
 | `GET /instances/{name}` | 200-800 ms | 5 s | Incluye psql probe + TCP probe + `/proc/<pid>` read. Durante un create async devuelve 404 hasta los primeros ~1-2s. |
