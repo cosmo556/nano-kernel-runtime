@@ -34,11 +34,11 @@ const DU_TTL: Duration = Duration::from_secs(300);
 // serve the cached JSON in between. A recompute is ~1ms (a handful of procfs +
 // cgroup file reads); the only heavy bit, the disk `du`, is independently
 // cached for DU_TTL (5 min) so it's untouched by a fast poll. TTL kept just
-// below a 5s poll so the panel always gets a fresh sample — and it still
+// below a ~2s panel poll so each poll gets a fresh sample — and it still
 // coalesces burst/duplicate requests. (`guest_mem` only refreshes every
 // BALLOON_STATS_INTERVAL_SECS — that one number lags the rest.)
 static VM_METRICS_CACHE: Mutex<Option<HashMap<String, (Instant, serde_json::Value)>>> = Mutex::new(None);
-const VM_METRICS_TTL: Duration = Duration::from_secs(4);
+const VM_METRICS_TTL: Duration = Duration::from_secs(2);
 
 // =============================================================================
 // Data structures

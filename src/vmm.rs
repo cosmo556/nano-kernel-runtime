@@ -46,7 +46,7 @@ pub static BALLOON_DECAY_SECS: AtomicU32 = AtomicU32::new(600);
 /// at most every BALLOON_STATS_INTERVAL_SECS (consuming on every guest kick
 /// would ping-pong with the guest's refill).
 static BALLOON_STATS_LAST_TS: AtomicU64 = AtomicU64::new(0);
-const BALLOON_STATS_INTERVAL_SECS: u64 = 15;
+const BALLOON_STATS_INTERVAL_SECS: u64 = 10;
 /// 0=idle, 1=shutdown injected (waiting for VcpuExit::Shutdown or timeout)
 use std::sync::atomic::AtomicU8;
 static SHUTDOWN_PHASE: AtomicU8 = AtomicU8::new(0);
