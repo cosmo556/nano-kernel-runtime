@@ -26,7 +26,7 @@ export TOK="Authorization: Bearer $NKR_API_TOKEN"
 - API HTTPS lista para consumo externo. Smoke test:
   ```
   curl -s https://nkr-api.systemouts.com/api/v1/health
-  # → {"ok":true,"version":"1.3.0"}
+  # → {"ok":true,"version":"1.6.4"}
   ```
 
 ### Conceptos mínimos
@@ -39,11 +39,12 @@ export TOK="Authorization: Bearer $NKR_API_TOKEN"
   2. Poll `GET {poll}` (= `GET /instances/{name}/create-status`) cada 3-5s hasta `status=ready` (o `status=failed` → leer `error`/`message`/`hint`). Ver §4.4.1.
   3. `POST /addons/git` / `PUT /pylibs` — opcional, con VM apagada.
   4. `POST /actions {action:"start"}` — devuelve `202` en <50 ms (async desde v1.5.1). El boot real tarda ~30-60 s (PROD prefork más); el panel **debe polear** `GET /instances/{name}` → `nkr_status.phase` hasta `loading|ready`. (Si mandaste `admin_user_password` en el paso 1, el tenant ya quedó arrancado — verificá con el `create-status` que `running=true`.)
-  4. Updates posteriores — **la estrategia depende del tier** (ver §7.0):
+  5. Updates posteriores — **la estrategia depende del tier** (ver §7.0):
      - **`tier=staging` o `tier=dev`**: `POST /addons/git` con `auto_reload=true` (default). NKR dispara `REL_OD` vía HVC0 al PID de la VM y el supervisor loop respawnea Odoo con el código nuevo en ~3 s. **No llamar restart NI upgrade** — `auto_reload` ya lo cubre. NO depende de `dev_mode` (NKR ya no lo setea en staging/dev desde v1.6.3 por incompatibilidad con virtio-fs + presión runtime del watcher; ver §7.0).
      - **`tier=production`, módulo NUEVO**: `POST /addons/git` y listo. Visible para Install desde Apps (UI). No requiere restart.
      - **`tier=production`, módulo ya instalado que cambió código**: `POST /addons/git` + `POST /actions {action:"restart"}`. **NO usar `POST /modules/upgrade` automático en multi-worker** — solo refresca código en el worker que procesa el upgrade, los demás siguen con código viejo (gotcha conocido de Odoo en `workers≥2`). El restart es la opción correcta para garantizar que TODOS los workers cargan el código nuevo. Tiempo: ~15-25s de downtime con el initramfs v1.6.1+ (timer drain reducido a 5s). En workflows con CI/CD apuntando a prod, el restart automático tras git push es válido — solo asegurate de que el panel polee `nkr_status.port_8069_up` para no servir tráfico mid-restart.
      - **Cambio de pip libs / odoo.conf / kernel** (cualquier tier): requiere `POST /actions {action:"restart"}`.
+  6. **Métricas de un tenant** (para una pestaña tipo "Métricas" en el panel): `GET /api/v1/cells/{cell}/instances/{name}/metrics` → JSON con CPU/RAM/disco/red/etc. de esa instancia. Pollear cada ~2s mientras la pestaña esté abierta (cacheado server-side, no sobrecarga). Ver §4.1.1.
 - **Para probar sin romper nada**: usá nombres con prefijo `test-` o `smoke-`. El endpoint `DELETE` te los limpia después (incluye drop de DB). Ver §12 al final.
 
 ### Primer request de prueba
@@ -145,12 +146,12 @@ Formato `text/plain; version=0.0.4` (Prometheus exposition). Sin auth — pensad
 | `nkr_total_rss_mb` / `nkr_total_balloon_mb` / `nkr_total_dax_savings_mb` | gauge | **(v1.6.4)** Sumas de cluster de las métricas per-VM correspondientes. |
 
 **Qué NO está en `/metrics`** (a propósito o pendiente):
-- **Disco por-VM (`nkr_guest_disk_*`)** — NO se emite acá: con 100+ instancias un `du` sobre cada filestore en cada scrape sería O(segundos). Está en el endpoint per-instancia `GET .../instances/{name}/metrics` (§4.1.2), que el panel pide de a un tenant.
-- **Métricas *guest-internas*** (`nkr_guest_mem_*` vía el stats vq del balloon) — pendiente, ver §4.1.1.
+- **Disco por-VM (`nkr_guest_disk_*`)** — NO se emite acá: con 100+ instancias un `du` sobre cada filestore en cada scrape sería O(segundos). Está en el endpoint per-instancia `GET .../instances/{name}/metrics` (§4.1.1), que el panel pide de a un tenant.
+- **Métricas *guest-internas*** (`nkr_guest_mem_*` vía el stats vq del balloon) — ya implementado, ver §4.1.2.
 - **`nkr_vm_start_time_seconds` (uptime)** — está en el JSON per-instancia (`uptime_seconds`), no en Prometheus.
 - El `vm=` es el `nkr_name` interno, no el `dns` ni el nombre del tenant que ve el cliente — el panel hace el mapping.
 
-#### 4.1.2 `GET /api/v1/cells/{cell}/instances/{nkr_name}/metrics` — snapshot JSON de UNA instancia
+#### 4.1.1 `GET /api/v1/cells/{cell}/instances/{nkr_name}/metrics` — snapshot JSON de UNA instancia
 
 **Esto es lo que el panel usa para la pestaña "Métricas" de cada instancia.** Devuelve un snapshot JSON del momento (no historial — si querés un gráfico en el tiempo, el panel acumula las muestras del lado cliente). Auth bearer (a diferencia de `/metrics`). El daemon **cachea el resultado ~2s por VM** (y el `du` de disco ~5 min aparte) → un poll cada 2s siempre recibe una muestra fresca, y los bursts/duplicados se coalescen; recomputar es ~1ms (un puñado de lecturas de procfs/cgroup), lo único caro (`du`) queda cacheado 5 min aparte, así que pollear rápido no sobrecarga a NKR (la caché *es* el rate-limit, no devuelve 429). **Recomendado: el panel pollea cada ~2s mientras la pestaña esté abierta** (más lento se ve el gráfico choppy), y para de pollear al cerrarla. El campo `as_of` (unix ts) + `stale` (bool) indican la frescura. Nota: `guest_mem` (RAM interna del guest) sólo se refresca cada ~10s — ese número va más lento que el resto.
 
@@ -185,19 +186,17 @@ Notas para el panel:
 
 **Las métricas de NKR están completas con esto** (host-side per-VM + `nkr_up`/build/totales en `/metrics`; CPU/RAM-host/disco/RAM-interna-del-guest en el JSON per-instancia). Lo único que falta es la **vista global/host** para ops (RAM/CPU/disco del servidor — `/proc/meminfo`, `/proc/stat`, `statvfs`), sin diseñar en detalle todavía.
 
-Ejemplo de output: ver `curl -s http://nkr-host:9090/metrics` (bloques `# HELP`/`# TYPE` por métrica seguidos de una línea por VM).
-
-#### 4.1.1 Métricas del *guest* (RAM/CPU/disco internos) — estado
+#### 4.1.2 Métricas del *guest* (RAM/CPU/disco internos) — estado
 
 Las métricas de §4.1 son **host-side** (lo que la VM le cuesta al host). Para "tu Odoo usa X de Y RAM, el disco está al Z%":
 
-**✓ CPU + RAM-del-host del tenant — HECHO (v1.6.4):** `nkr_cpu_seconds_total{vm}` / `nkr_cpu_throttled_seconds_total{vm}` (counters, del `cpu.stat` del cgroup — incluye virtiofsd/vhost) + `nkr_cgroup_memory_bytes{vm}` (del `memory.current` del cgroup). En `/metrics` (§4.1) y en el JSON per-instancia (§4.1.2).
+**✓ CPU + RAM-del-host del tenant — HECHO (v1.6.4):** `nkr_cpu_seconds_total{vm}` / `nkr_cpu_throttled_seconds_total{vm}` (counters, del `cpu.stat` del cgroup — incluye virtiofsd/vhost) + `nkr_cgroup_memory_bytes{vm}` (del `memory.current` del cgroup). En `/metrics` (§4.1) y en el JSON per-instancia (§4.1.1).
 
-**✓ Disco del tenant — HECHO (v1.6.4):** en el JSON per-instancia (§4.1.2), array `disk: [{mount, used_bytes, total_bytes}]` — `du -sb` host-side sobre los dirs virtio-fs (`addons`/`filestore`/`logs`/`pylibs`, cacheado 5 min) + `st_blocks×512` sobre los `.ext4` block. **No** está en `/metrics` (Prometheus) a propósito — un `du` por scrape × 100 VMs sería O(segundos). Salvedad de los filestores backeados por `.ext4` share documentada en §4.1.2.
+**✓ Disco del tenant — HECHO (v1.6.4):** en el JSON per-instancia (§4.1.1), array `disk: [{mount, used_bytes, total_bytes}]` — `du -sb` host-side sobre los dirs virtio-fs (`addons`/`filestore`/`logs`/`pylibs`, cacheado 5 min) + `st_blocks×512` sobre los `.ext4` block. **No** está en `/metrics` (Prometheus) a propósito — un `du` por scrape × 100 VMs sería O(segundos). Salvedad de los filestores backeados por `.ext4` share documentada en §4.1.1.
 
-**✓ Salud / labels — HECHO (v1.6.4):** `nkr_up{vm,cell,tier}` (1/0, incluye tenants parados) — métrica info para joins en Grafana (`metric * on(vm) group_left(cell,tier) nkr_up`). + `nkr_build_info{version}`, `nkr_vm_count`, `nkr_total_{rss,balloon,dax_savings}_mb`. Uptime: `uptime_seconds` en el JSON per-instancia (§4.1.2).
+**✓ Salud / labels — HECHO (v1.6.4):** `nkr_up{vm,cell,tier}` (1/0, incluye tenants parados) — métrica info para joins en Grafana (`metric * on(vm) group_left(cell,tier) nkr_up`). + `nkr_build_info{version}`, `nkr_vm_count`, `nkr_total_{rss,balloon,dax_savings}_mb`. Uptime: `uptime_seconds` en el JSON per-instancia (§4.1.1).
 
-**✓ RAM *interna real* del guest — HECHO (v1.6.4):** vía el **stats virtqueue del virtio-balloon** (3ª queue, `VIRTIO_BALLOON_F_STATS_VQ`). `balloon.rs` ahora maneja la statsq (índice 2): el guest empuja un buffer con pares `(le16 tag, le64 val)` (`MEMFREE`/`MEMTOT`/`AVAIL`/`CACHES`/`SWAP_IN/OUT`/`MAJFLT/MINFLT`), el vmm lo drena cada ~30s y persiste el snapshot al state file (`state::update_guest_mem`, patrón `update_balloon_mb`). El daemon lo expone como `guest_mem: {total/available/free/cached_bytes}` en el JSON per-instancia (§4.1.2) + `nkr_guest_mem_total/available/free/cached_bytes{vm}` en `/metrics`. Verificado en `intech-devp` (~1255 MiB total / ~922 MiB available idle) sin romper inflate/deflate (la statsq se suma a inflateq/deflateq, las rutas existentes intactas).
+**✓ RAM *interna real* del guest — HECHO (v1.6.4):** vía el **stats virtqueue del virtio-balloon** (3ª queue, `VIRTIO_BALLOON_F_STATS_VQ`). `balloon.rs` ahora maneja la statsq (índice 2): el guest empuja un buffer con pares `(le16 tag, le64 val)` (`MEMFREE`/`MEMTOT`/`AVAIL`/`CACHES`/`SWAP_IN/OUT`/`MAJFLT/MINFLT`), el vmm lo drena cada ~30s y persiste el snapshot al state file (`state::update_guest_mem`, patrón `update_balloon_mb`). El daemon lo expone como `guest_mem: {total/available/free/cached_bytes}` en el JSON per-instancia (§4.1.1) + `nkr_guest_mem_total/available/free/cached_bytes{vm}` en `/metrics`. Verificado en `intech-devp` (~1255 MiB total / ~922 MiB available idle) sin romper inflate/deflate (la statsq se suma a inflateq/deflateq, las rutas existentes intactas).
 
 **Pendiente — vista global / host** (lo único que queda; para ops, no para el cliente): métricas del *host* — `nkr_host_mem_{total,available}_bytes` (de `/proc/meminfo`), `nkr_host_cpu_seconds_total` (de `/proc/stat`), `nkr_host_disk_{used,total}_bytes{mount}` (`statvfs` de `/mnt/nkr` y `/`) — para "cuánta RAM me queda en el server". + un dashboard global que junte eso con el agregado per-VM (`/metrics` ya lo tiene). Sin diseñar en detalle todavía.
 
@@ -205,7 +204,7 @@ Las métricas de §4.1 son **host-side** (lo que la VM le cuesta al host). Para 
 
 ```bash
 curl -s http://nkr-host:9090/api/v1/health
-# → {"ok":true,"version":"1.3.0"}
+# → {"ok":true,"version":"1.6.4"}
 ```
 
 ### 4.3 `GET /api/v1/cells` — Listar cells con capacidad
@@ -2210,7 +2209,7 @@ sudo systemctl enable --now nkr-api-server.service
 
 # Verificar
 curl -s http://127.0.0.1:9090/api/v1/health
-# → {"ok":true,"version":"1.3.0"}
+# → {"ok":true,"version":"1.6.4"}
 ```
 
 **Config panel-side:**
@@ -2456,6 +2455,8 @@ Si NKR detecta que un IP fuera de la lista CF está enviando `CF-Connecting-IP` 
 
 ## 7.2 Watchdog automático — auto-restart al cumplir 60s sin :8069
 
+> **Estado actual: DESHABILITADO** — el deploy tiene `Environment=NKR_WATCHDOG_DISABLED=1` en `/etc/systemd/system/nkr.service` (a pedido, mientras el panel pushea cambios activamente y los auto-restart interferían). Con el watchdog off, un cuelgue de tenant **no se auto-recupera** — queda para el operador/panel. Para re-habilitarlo: borrar esa línea del unit + `systemctl daemon-reload && systemctl restart nkr`. El resto de esta sección describe cómo funciona cuando está habilitado (default del template del repo).
+
 Desde v1.6.3, el daemon `nkr` arranca un thread (`src/watchdog.rs`) que sondea cada **15s** el puerto TCP 8069 de cada tenant `running`. Cuando un tenant lleva **`HUNG_THRESHOLD_SECS=60`** consecutivos sin responder, NKR dispara `action=restart` automáticamente vía `api::handle_action`. El panel no tiene que hacer nada.
 
 **Propósito:** cubrir cuelgues residuales (workers Odoo D-state, kernel paths con `do_select` bloqueado, etc.) sin necesidad de operador. Pre-watchdog, requería operador para dispatch manual.
@@ -2502,7 +2503,7 @@ Environment=NKR_WATCHDOG_DISABLED=1
 | Endpoint | Duración típica | Timeout mínimo recomendado | Notas |
 |---|---|---|---|
 | `GET /metrics` | <100 ms | 5 s | Prometheus, todas las VMs. NO incluye disco per-VM (ver §4.1). |
-| `GET /instances/{name}/metrics` | <50 ms (cache hit) / ~1ms recompute, hasta ~2-5 s sólo en cache miss del `du` de un filestore grande | 10 s | JSON per-instancia para la pestaña Métricas del panel. Cacheado ~2s/VM (el `du` ~5min aparte). Pollear cada ~2s. Ver §4.1.2. |
+| `GET /instances/{name}/metrics` | <50 ms (cache hit) / ~1ms recompute, hasta ~2-5 s sólo en cache miss del `du` de un filestore grande | 10 s | JSON per-instancia para la pestaña Métricas del panel. Cacheado ~2s/VM (el `du` ~5min aparte). Pollear cada ~2s. Ver §4.1.1. |
 | `GET /api/v1/health` | <10 ms | 5 s | |
 | `GET /api/v1/cells` | <100 ms | 5 s | |
 | `GET /instances/{name}` | 200-800 ms | 5 s | Incluye psql probe + TCP probe + `/proc/<pid>` read. Durante un create async devuelve 404 hasta los primeros ~1-2s. |
@@ -2514,6 +2515,10 @@ Environment=NKR_WATCHDOG_DISABLED=1
 | `GET /logs/download` | hasta 5 s | **30 s** | Cap 64 MiB; SSD local. |
 | **`POST /init-db`** | **<500 ms** (async) | 10 s | **Asíncrono** — devuelve 202 inmediato; el panel poll `GET /instances/{name}`. |
 | `POST /modules/{install,upgrade,uninstall}` | 10-300 s (síncrono) | **600 s** | Bloquea hasta completar la transacción de Odoo. |
+| `POST /reload` | <50 ms (async, ~3s en el guest) | 5 s | REL_OD vía HVC0 — reload de workers Odoo sin reiniciar la VM. Idempotente. Ver §4.17.1. |
+| `POST /balloon` | <50 ms (async) | 5 s | Marca la VM ACTIVE en el ballooning dinámico (renueva el TS). Ver §4.17.2. |
+| `POST /sso` | 200-800 ms | 5 s | Pre-auth interno + firma HMAC. Devuelve URL TTL 30s. Ver §4.18. |
+| `GET\|POST /diag` | ~50-200 ms | 5 s | Captura stacks/wchan/cpu host-side de los threads del proc nkr. Idempotente. Ver §4.19. |
 | `POST /psql` | <30 s | **35 s** | Statement timeout PG-side = 30 s. |
 | `PATCH /config` (sin restart) | <200 ms | 10 s | Solo reescribe `odoo.conf`. |
 | `PATCH /config` (con restart) | 15-60 s | **90 s** | Incluye graceful stop + start. |
@@ -2713,6 +2718,25 @@ curl -s -X POST -H "$TOK" -H "Content-Type: application/json" \
   -d '{"action":"restart"}' \
   $NKR_API_BASE/api/v1/cells/$CELL/instances/$NAME/actions
 
+# Reload de workers Odoo SIN reiniciar la VM (~3s) — tras un addons/git manual
+curl -s -X POST -H "$TOK" $NKR_API_BASE/api/v1/cells/$CELL/instances/$NAME/reload
+
+# Métricas de la instancia (JSON snapshot — pestaña Métricas del panel; pollear ~2s)
+curl -s -H "$TOK" $NKR_API_BASE/api/v1/cells/$CELL/instances/$NAME/metrics
+
+# SSO: URL firmada HMAC TTL 30s para auto-login (sin password)
+curl -s -X POST -H "$TOK" -H "Content-Type: application/json" \
+  -d '{"user":"admin"}' \
+  $NKR_API_BASE/api/v1/cells/$CELL/instances/$NAME/sso
+# → { "url":"https://demo-1.systemouts.com/nkr-sso?u=admin&exp=...&sig=...", "expires_in":30, ... }
+
+# Balloon → ACTIVE (renueva el TS; tras decay_secs sin renovación decae a IDLE)
+curl -s -X POST -H "$TOK" -d '{"state":"active"}' \
+  $NKR_API_BASE/api/v1/cells/$CELL/instances/$NAME/balloon
+
+# Diag: stacks/wchan/cpu host-side de los threads del proceso nkr (pre-restart forensics)
+curl -s -H "$TOK" $NKR_API_BASE/api/v1/cells/$CELL/instances/$NAME/diag
+
 # Cleanup completo
 curl -s -X DELETE -H "$TOK" "$NKR_API_BASE/api/v1/cells/$CELL/instances/$NAME/dns?delete_cert=1"
 curl -s -X DELETE -H "$TOK" "$NKR_API_BASE/api/v1/cells/$CELL/instances/$NAME?drop_db=1"
@@ -2817,7 +2841,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 # 4. Sanity:
 curl -s https://nkr-api.systemouts.com/api/v1/health
-# → {"ok":true,"version":"1.3.0"}
+# → {"ok":true,"version":"1.6.4"}
 ```
 
 ### 11.2 nginx default_server SSL (evita leak de certs a hostnames no provisionados)
@@ -2982,7 +3006,7 @@ export TOK="Authorization: Bearer $(sudo cat /etc/nkr/api.env | grep -oP '(?<==)
 
 # Sanity: API responde
 curl -s $NKR_API_BASE/api/v1/health
-# → {"ok":true,"version":"1.3.0"}
+# → {"ok":true,"version":"1.6.4"}
 
 # Sanity: hay cells disponibles (esperás odoo-v17 y odoo-v19)
 curl -s -H "$TOK" $NKR_API_BASE/api/v1/cells | python3 -m json.tool
