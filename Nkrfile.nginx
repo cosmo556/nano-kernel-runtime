@@ -1,0 +1,118 @@
+# =============================================================================
+# Nkrfile.nginx — Proxy reverso con nginx + certbot
+# =============================================================================
+# Uso: sudo nkr build -f Nkrfile.nginx -o proxy.ext4 --size-gb 1
+# =============================================================================
+
+FROM debian:bookworm-slim
+
+# Evitar prompts interactivos
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Instalar nginx + certbot + utilidades de red
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nginx \
+    certbot \
+    python3-certbot-nginx \
+    openssl \
+    curl \
+    procps \
+    net-tools \
+    iproute2 \
+    ca-certificates \
+    cron \
+    logrotate \
+    && rm -rf /var/lib/apt/lists/*
+
+# Crear directorios necesarios
+RUN mkdir -p \
+    /etc/nginx/sites-available \
+    /etc/nginx/sites-enabled \
+    /etc/nginx/ssl \
+    /etc/nginx/conf.d \
+    /etc/letsencrypt \
+    /var/www/certbot \
+    /var/www/html \
+    /var/log/nginx \
+    /run/nginx
+
+# Generar certificado self-signed por defecto (para funcionar sin Let's Encrypt)
+RUN openssl req -x509 -nodes -days 3650 \
+    -newkey rsa:2048 \
+    -keyout /etc/nginx/ssl/default.key \
+    -out /etc/nginx/ssl/default.crt \
+    -subj "/CN=nkr-proxy/O=NKR/C=US"
+
+# Configuración base de nginx optimizada para proxy reverso
+RUN cat > /etc/nginx/nginx.conf << 'NGINXCONF'
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+error_log /var/log/nginx/error.log warn;
+
+events {
+    worker_connections 1024;
+    multi_accept on;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # Logging
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+    access_log /var/log/nginx/access.log main;
+
+    # Performance
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    client_max_body_size 100m;
+
+    # Gzip
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types text/plain text/css application/json application/javascript
+               text/xml application/xml application/xml+rss text/javascript
+               image/svg+xml;
+
+    # Proxy headers por defecto
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # Timeouts para proxy
+    proxy_connect_timeout 60s;
+    proxy_send_timeout 120s;
+    proxy_read_timeout 120s;
+
+    # WebSocket support (para Odoo longpolling)
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        '' close;
+    }
+
+    # Incluir sites
+    include /etc/nginx/conf.d/*.conf;
+    include /etc/nginx/sites-enabled/*;
+}
+NGINXCONF
+
+# Página de status por defecto
+RUN echo '<h1>NKR Proxy</h1><p>Reverse proxy running.</p>' > /var/www/html/index.html
+
+# Script de renovación de certificados (cron diario)
+RUN cat > /etc/cron.d/certbot-renew << 'CRON'
+0 3 * * * root certbot renew --quiet --deploy-hook "nginx -s reload" >> /var/log/nginx/certbot-renew.log 2>&1
+CRON
+RUN chmod 0644 /etc/cron.d/certbot-renew
+
+# Exponer puertos
+EXPOSE 80 443

@@ -1,0 +1,58 @@
+[Unit]
+Description=NKR root daemon (UDS IPC backend)
+Documentation=https://github.com/anthropics/nano-kernel-runtime
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root — needs KVM, cgroups, netlink, iptables, mount, loop devices.
+# Privilege separation happens at the API boundary: the HTTP server
+# (nkr-api-server.service) runs unprivileged and proxies via UDS.
+User=root
+Group=root
+
+Environment=RUST_BACKTRACE=1
+# Uncomment to relocate the UDS (must match nkr-api-server.service):
+# Environment=NKR_SOCKET_PATH=/run/nkr/nkr.sock
+
+ExecStart=/usr/local/bin/nkr serve
+
+# Restart on crashes, back off exponentially.
+Restart=on-failure
+RestartSec=2s
+StartLimitBurst=5
+StartLimitIntervalSec=60s
+
+# Kill signal handling: KillMode=process porque las VMs guest spawneadas vía
+# API quedan en el cgroup del daemon. Con KillMode=mixed, si el daemon tarda
+# >TimeoutStopSec en exit gracefully, systemd manda SIGKILL al cgroup ENTERO
+# y mata las VMs (incidentes confirmados 2026-05-10). KillMode=process solo
+# signal'a al main proc del daemon — las VMs hijas siguen vivas (mismo
+# comportamiento que las VMs spawneadas via `compose up -d` que ya quedan
+# huérfanas de init y sobreviven). Trade-off: si el daemon crashea, las VMs
+# siguen corriendo huérfanas (las limpia el janitor del daemon nuevo o
+# requiere intervención manual).
+KillMode=process
+TimeoutStopSec=20s
+
+# Logs to journalctl -u nkr
+StandardOutput=journal
+StandardError=journal
+
+# Conservative hardening (root daemon still needs most surface).
+# Do NOT enable ProtectSystem=strict / PrivateDevices / PrivateNetwork here —
+# the daemon touches /dev/kvm, /dev/vhost-*, /sys/fs/cgroup, /proc, network
+# namespaces, iptables, and mounts loop devices.
+NoNewPrivileges=false
+ProtectKernelTunables=false
+ProtectKernelModules=false
+
+# FD budget: cada VM consume ~10-15 FDs (memfd, virtio-fs vhost, taps, blk
+# files, eventfd, irqfd). Una cell densa con 22 VMs ≈ 330 FDs sólo de KVM,
+# más sockets, logs, registry. El default 1024 saltó techo en escenarios
+# multi-cell. 65536 deja margen amplio para 100+ VMs en este host.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

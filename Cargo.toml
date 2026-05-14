@@ -1,0 +1,64 @@
+[package]
+name = "nkr"
+version = "1.6.5"
+edition = "2021"
+authors = ["NKR Contributors"]
+description = """
+Nano-Kernel Runtime (NKR) — Hipervisor bare-metal customizado que reemplaza Docker
+para ejecutar unikernels directamente sobre /dev/kvm sin dependencias externas.
+"""
+license = "MIT"
+readme = "README.md"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dependencias del ecosistema rust-vmm
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Todas las crates provienen del proyecto rust-vmm (https://github.com/rust-vmm),
+# la base compartida de hipervisores como Firecracker y Cloud Hypervisor.
+#
+# Política de versiones: se fijan versiones menores para garantizar
+# compatibilidad cruzada entre crates del ecosistema.
+# ══════════════════════════════════════════════════════════════════════════════
+
+[dependencies]
+kvm-ioctls = "0.19"
+kvm-bindings = { version = "0.10", features = ["fam-wrappers"] }
+vm-memory = { version = "0.14", features = ["backend-mmap"] }
+linux-loader = { version = "0.11", features = ["elf", "bzimage"] }
+vmm-sys-util = "0.12"
+libc = "0.2"
+virtio-queue = "0.12"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+io-uring = "0.6"       # Feature B — async I/O para block y net (degradación silenciosa en kernel < 5.1)
+hmac = "0.12"          # SSO: HMAC-SHA256 sobre el session_id firmado entregado al browser
+sha2 = "0.10"          # idem (backend de hmac)
+base64 = "0.22"        # idem (encoding URL-safe del payload firmado)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Binary targets
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `nkr`            — root daemon (src/main.rs). Listens on UDS /var/run/nkr.sock.
+# `nkr-api-server` — unprivileged HTTP proxy (src/bin/nkr_api_server.rs).
+#                    Only uses ipc.rs + api_http.rs via #[path], stripping all
+#                    KVM/cell/state deps from its binary.
+# ══════════════════════════════════════════════════════════════════════════════
+
+[[bin]]
+name = "nkr"
+path = "src/main.rs"
+
+[[bin]]
+name = "nkr-api-server"
+path = "src/bin/nkr_api_server.rs"
+
+[profile.release]
+opt-level = 3
+lto = true          # Link-Time Optimization — binario más pequeño y rápido
+strip = true        # Eliminar símbolos de debug del binario final
+codegen-units = 1   # Máxima optimización (sacrifica tiempo de compilación)
+panic = "abort"     # Sin stack unwinding — reduce tamaño del binario
