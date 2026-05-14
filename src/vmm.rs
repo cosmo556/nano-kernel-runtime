@@ -1103,20 +1103,29 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
         pmem_dev_opt = Some(pmem_dev);
     }
 
-    // 2c. VirtIO-Balloon (v1.3) — elastic RAM reclaim
-    // Advertised to the guest if --balloon-mb > 0 (estático) O si hay
-    // ballooning dinámico configurado (--balloon-idle-mb != --balloon-mb): en
-    // ese caso la VM nace ACTIVE con target = balloon_mb (típicamente 0 en
-    // tier=dev) pero el state machine necesita el driver del guest attacheado
-    // para poder inflar al transicionar a IDLE. Si NO emitimos el MMIO device
-    // en el cmdline cuando balloon_mb==0, el guest nunca probea el driver y el
-    // `set_target_mb(idle)` posterior es un no-op (bug pre-v1.6.4: tier=dev
-    // "tenía" ballooning dinámico que en realidad nunca inflaba).
+    // 2c. VirtIO-Balloon (v1.3) — elastic RAM reclaim + STATS_VQ source
+    // v1.6.6+: **SIEMPRE** advertised, independiente de si va a inflar.
+    // Razones:
+    //   1. STATS_VQ (process_stats) requiere que el driver del guest esté
+    //      attacheado. Sin advertise, el driver no se carga y `guest_mem_*`
+    //      (MEMFREE/MEMAVAIL/CACHED del guest) queda en 0 → el endpoint
+    //      `GET /instances/{name}/metrics` devuelve `guest_mem: null` → el
+    //      panel no puede mostrar "RAM usada interna". Bug reportado
+    //      2026-05-14 en tier=production (balloon_mb=0, idle=0 → ambos 0 →
+    //      pre-fix no se anunciaba).
+    //   2. Ballooning dinámico (set_target_mb post-boot) también necesita el
+    //      driver — fix histórico pre-v1.6.4 cuando tier=dev "tenía"
+    //      ballooning dinámico que jamás inflaba.
+    //   3. Costo de advertise sin inflar: ~100 KB del driver del guest +
+    //      ~64 bytes/30s del stats msg. Negligible.
+    // El target SIGUE siendo opt-in via balloon_mb (boot) y set_target_mb
+    // (runtime). Cero advertise → cero inflate sigue siendo el default si
+    // balloon_mb=0 y no hay decay configurado.
     // We pass ram_mb so the device caps its HashSet of inflated pages to the
     // guest's total RAM — defense against host DoS from a hostile guest.
     let balloon_dynamic = config.balloon_idle_mb != 0
         && config.balloon_idle_mb != config.balloon_mb;
-    let balloon_advertised = config.balloon_mb > 0 || balloon_dynamic;
+    let balloon_advertised = true;
     let mut balloon_dev = VirtioBalloonDevice::new(guest_mem.clone(), config.ram_mb);
     if config.balloon_mb > 0 {
         balloon_dev.set_target_mb(config.balloon_mb);
