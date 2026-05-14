@@ -560,6 +560,27 @@ for f in /mnt/nkr/cells/odoo-v19/.nkr-data/ent-tpl-build-*; do
   mv "$f" "${f/ent-tpl-build-/odoo-template-enterprise-}"
 done
 
+#    b2) CRÍTICO — renombrar la carpeta filestore DENTRO del .ext4 (no la del
+#        host: la que está montada bajo /var/lib/odoo/filestore/ del guest).
+#        Sin este paso, todos los clones nacen con sus íconos / CSS rotos:
+#        el initramfs intenta renombrar filestore/<db-from> → filestore/<db-to>
+#        pero <db-from> NO existe en el .ext4 (sigue siendo el nombre original
+#        ent-tpl-build), entonces el rename falla silente y los attachments
+#        del template (ir_attachment.store_fname) apuntan a un path inexistente.
+#        Mide tu propia carpeta antes: lo que está adentro es el db-name del
+#        clone fuente, NO el nuevo nombre del template.
+mkdir -p /tmp/fix-ent
+mount -o loop,rw /mnt/nkr/cells/odoo-v19/.nkr-data/odoo-template-enterprise-var_lib_odoo.ext4 \
+                 /tmp/fix-ent
+mv /tmp/fix-ent/filestore/db-odoo-v19-ent-tpl-build \
+   /tmp/fix-ent/filestore/db-odoo-v19-odoo-template-enterprise
+# Si existía el marker, lo dejamos (el rename ya pasó para el template):
+# el clone hijo lo va a heredar y el initramfs SKIPEA el rename — entonces
+# el next-marker hay que dejarlo BORRADO para que el initramfs del clone SÍ
+# renombre:
+rm -f /tmp/fix-ent/filestore/.nkr-filestore-renamed
+sync && umount /tmp/fix-ent && rmdir /tmp/fix-ent
+
 #    c) Actualizar odoo.conf paths internos:
 sed -i 's|ent-tpl-build|odoo-template-enterprise|g' \
   /mnt/nkr/cells/odoo-v19/instances/odoo-v19-odoo-template-enterprise/config/odoo.conf
