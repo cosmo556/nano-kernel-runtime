@@ -1,198 +1,348 @@
-# NKR vs Docker — comparativo real (2026-04-27)
+# NKR vs Docker — comparativo real (actualizado 2026-05-14, v1.6.5)
 
 Comparación medida sobre el host actual (`nkr-master`, Xeon E-2176G 6c/12t, 62 GiB RAM)
-con los **6 NKRs vivos** vs lo que costaría correr lo mismo en Docker (mismo host, mismo
-stack Odoo+PG+pgbouncer, sin micro-optimizar la imagen de Docker — instalación oficial).
+con **21 NKRs vivos** (2 cells de infra + 1 tenant productivo + 18 tenants de testing
+del sprint security/audit-sprint1) vs lo que costaría el mismo stack en Docker
+(`postgres:16`, `edoburu/pgbouncer`, `odoo:17/19` oficial), sin tunning de imagen.
 
-> Todas las cifras de NKR vienen de `nkr stats` y `/proc/<pid>/status` (PSS/RSS reales,
-> no del límite configurado en cgroup). Las cifras de Docker son medianas observadas
-> en deploys equivalentes (`postgres:16`, `edoburu/pgbouncer`, `odoo:17/19` oficial)
-> sobre el mismo hardware, sin tunning.
-
----
-
-## 1. Inventario actual (NKR)
-
-| Cell      | VM                  | RAM cfg | RAM real (PSS) | DAX save | CPU% | Uptime  |
-|-----------|---------------------|--------:|---------------:|---------:|-----:|---------|
-| odoo-v17  | odoo-v17-db (PG16)  | 1024 MB |        258 MB  |  -660 MB | 0.0% | 133h    |
-| odoo-v17  | odoo-v17-pgb        |  128 MB |         60 MB  |   -13 MB | 5.0% | 16h     |
-| odoo-v19  | odoo-v19-db (PG16)  | 1024 MB |        535 MB  |  -419 MB | 0.0% | 133h    |
-| odoo-v19  | odoo-v19-pgb        |  128 MB |         62 MB  |   -11 MB | 0.0% | 16h     |
-| odoo-v19  | tesito-14 (Odoo 19) | 2048 MB |       1293 MB  |  -465 MB | 0.0% | 14h     |
-| odoo-v19  | intech-19 (Odoo 19) | 2048 MB |        566 MB  | -1246 MB | 0.0% | 24m     |
-| **TOTAL** |                     | **6400 MB** | **2774 MB** | **-2814 MB** | **— ** | — |
-
-- **Host RAM en uso por el stack NKR puro:** ~2.9 GB de 62 GB (2.6 GB en los 6 procesos
-  `nkr` + 263 MB en 4 `virtiofsd` — uno por Odoo con shares).
-- **`free -h` reporta 5.3 GiB used total** porque incluye otros consumidores ajenos a NKR
-  que están corriendo en este host de desarrollo:
-  - VS Code Remote + Claude Code: ~1.3 GB (8 procesos `node`/`claude`)
-  - dockerd + containerd: ~150 MB (residual del pipeline de build, NKR no usa Docker en runtime)
-  - SSH, journald, nginx, fail2ban, kernel slab, page tables: ~0.6 GB
-- **Densidad real medida hoy:** 6 VMs en 2.9 GB → ~480 MB promedio por VM (mezcla PG+pgb+Odoo).
-- **Ahorro DAX vs configurado:** 52.7% (2.8 GB liberados por virtio-pmem + DAX bypass del
-  page cache del guest — la rootfs RO se mapea directo desde el `.ext4` del host).
+> Las cifras de NKR vienen de `nkr stats` y `/proc/<pid>/status` (RSS reales,
+> no el tope configurado en cgroup). Las cifras de Docker son medianas de deploys
+> equivalentes en el mismo hardware.
 
 ---
 
-## 2. Mismo stack en Docker (estimado, sin tunning)
+## 1. Inventario actual (NKR, hoy)
 
-Componentes equivalentes:
+`nkr stats` reporta el agregado del stack:
 
-| Servicio Docker        | Imagen oficial         | RAM RSS típica idle | RAM RSS bajo carga |
-|------------------------|------------------------|--------------------:|-------------------:|
-| Postgres 16            | `postgres:16-alpine`   |      ~250–350 MB    |       ~600–900 MB  |
-| pgbouncer              | `edoburu/pgbouncer`    |       ~25–40 MB     |        ~40–80 MB   |
-| Odoo 17 (workers=2)    | `odoo:17`              |     ~700–900 MB     |    ~1500–2200 MB   |
-| Odoo 19 (workers=2)    | `odoo:19`              |     ~750–950 MB     |    ~1600–2400 MB   |
+```
+TOTAL  RAM real=5737MB  cfg=26568MB  -balloon=4352MB  -dax=15445MB  (78.4% ahorro)
+```
+
+| Capa            | RAM configurada | RAM real (RSS) | Ahorro virtio-balloon | Ahorro DAX (page-cache dedup) |
+|-----------------|----------------:|---------------:|----------------------:|------------------------------:|
+| **TOTAL 21 VMs** |    **26.6 GB**  |     **5.7 GB** |          **4.3 GB**   |       **15.4 GB**             |
+
+Desglose representativo:
+
+| Cell      | Servicio                  | RAM cfg | RAM real | Balloon  | DAX save |
+|-----------|---------------------------|--------:|---------:|---------:|---------:|
+| odoo-v17  | db (PG 16)                | 1024 MB |   ~260 MB|       —  | -660 MB  |
+| odoo-v17  | pgbouncer                 |  128 MB |    ~60 MB|       —  |  -13 MB  |
+| odoo-v19  | db (PG 16)                | 1024 MB |   ~540 MB|       —  | -420 MB  |
+| odoo-v19  | pgbouncer                 |  128 MB |    ~62 MB|       —  |  -11 MB  |
+| odoo-v19  | intech-devp (Odoo 19 dev) | 1300 MB |   ~250 MB|  -256 MB | -740 MB  |
+| odoo-v19  | prod-t1 (Odoo 19 prd)     | 2048 MB |   ~415 MB|       —  |-1500 MB  |
+| odoo-v19  | stag-t1 (Odoo 19 stg)     | 1024 MB |   ~210 MB|  -768 MB |       —  |
+
+**Lectura clave:** el host configuró 26.6 GB para 21 VMs y el stack vive en **5.7 GB
+de RAM real**. Eso significa 78 % de ahorro frente a lo que la suma "ingenua" de
+los límites de cgroup sugeriría. Las dos palancas:
+
+1. **virtio-balloon dinámico (4.3 GB recuperados):** VMs `tier=dev` y `tier=staging`
+   transicionan a IDLE post-decay (600 s sin tráfico) y devuelven 256 MB al host
+   via balloon. `tier=production` queda ACTIVE estático (doctrina: cero latencia
+   de desinflado en picos).
+2. **DAX virtio-pmem + virtio-fs (15.4 GB recuperados):** la rootfs `odoo19.ext4`
+   se mapea con `dax,ro` desde el `.ext4` master. Los 18 Odoos NO duplican el
+   page-cache del guest del intérprete Python, las libs (`psycopg2`, `werkzeug`,
+   `lxml`), ni los `.pyc`. Una sola copia en RAM del host alimenta a todos.
+
+Otros datos del stack hoy:
+
+| Métrica                   | Valor    | Comentario |
+|---------------------------|---------:|------------|
+| Procesos VMM (`nkr run`)  | 23       | 1 por VM (incluye 2 que ya están en stale stop-pending) |
+| `virtiofsd`               | 117      | ~5 por Odoo (rootfs + 4-5 shares: addons, logs, pylibs, overrides, systemouts-addons, enterprise opt) |
+| Compose supervisors       | 23       | 1 por VM, escriben a log per-invocación (Phase 1, v1.6.5) |
+| Free disk en `/mnt/nkr`   | 755 GB / 795 GB | btrfs reflink hace clones O(1) en disco |
+| `free -h` total used      | ~8.4 GB  | incluye host services (VS Code Remote, fail2ban, journald, etc.) |
+
+---
+
+## 2. El mismo stack en Docker (estimado)
+
+Componentes equivalentes sin tunning:
+
+| Servicio Docker     | Imagen           | RAM RSS idle | RAM RSS carga |
+|---------------------|------------------|-------------:|--------------:|
+| Postgres 16         | `postgres:16-alpine`| 250–350 MB | 600–900 MB   |
+| pgbouncer           | `edoburu/pgbouncer`|   25–40 MB | 40–80 MB     |
+| Odoo 17 (workers=2) | `odoo:17`        |  700–900 MB | 1500–2200 MB |
+| Odoo 19 (workers=2) | `odoo:19`        |  750–950 MB | 1600–2400 MB |
+| Odoo 19 enterprise  | `odoo:19` + `web_enterprise` | +0 MB | ídem |
 
 **¿Por qué Docker pesa más?**
-1. **No hay DAX:** cada container mantiene su propio page cache de la rootfs; `python3.11`,
-   `psycopg2`, `werkzeug`, `lxml` se cachean N veces (una por container).
-2. **Glibc + intérprete duplicado:** los `.so` y los `.pyc` no se comparten entre Odoos.
-   Con NKR la rootfs maestra (`odoo19.ext4`) se mapea pmem-DAX y todos los Odoos leen del
-   mismo backing file → ahorro lineal con N.
-3. **Container runtime overhead:** `containerd-shim` + `runc` + namespaces + cgroup
-   wrappers suman ~30–50 MB por container.
-4. **Sin balloon ni reclaim coordinado:** Docker no devuelve RAM "no usada" al host
-   transparentemente. NKR sí (virtio-balloon, hoy -128 MB en cada Odoo).
+
+1. **No hay DAX:** cada container mantiene su propio page cache. `python3.11`,
+   `psycopg2`, `werkzeug`, `lxml` se cachean N veces. Con NKR la rootfs maestra
+   (`odoo19.ext4`, ~2 GB) se mapea pmem-DAX y todos los Odoos comparten ese
+   page-cache del host.
+2. **Glibc + intérprete duplicado:** los `.so` y los `.pyc` no se comparten
+   entre Odoos. NKR sí (ver Bug audit AUDIT_PMEM_RO.md — ya implementado con
+   per-cell reflink + master `chattr +i`).
+3. **Container runtime overhead:** `containerd-shim` + `runc` + namespaces +
+   cgroup wrappers suman ~30–50 MB por container.
+4. **Sin balloon coordinado:** Docker no devuelve RAM al host transparentemente.
+   NKR sí (virtio-balloon dinámico — IDLE post-decay 256 MB recuperados de cada
+   tenant dev/staging idle, sin tocar Odoo).
+5. **Page cache divergente bajo carga:** 100 Odoos en Docker → 100 page caches
+   independientes que compiten contra el WAL de PG. NKR con DAX evita esa lucha
+   porque el rootfs no usa page cache del guest en absoluto.
 
 ---
 
-## 3. Cálculo lado a lado (mismo workload)
+## 3. Cálculo lado a lado (workload comparable)
 
-> 2× Postgres + 2× pgbouncer + 2× Odoo (= 6 servicios — exactamente lo que corre hoy en NKR).
+Si comparamos **2× PG + 2× pgbouncer + 2× Odoo** (similar a lo que corría hoy
+en NKR antes de los 16 test tenants del sprint):
 
-| Recurso                    |     NKR (medido) | Docker (estimado idle) | Docker bajo carga |
-|----------------------------|-----------------:|-----------------------:|------------------:|
-| RAM efectiva                |         **3.0 GB** |             ~2.0–2.5 GB |     **~5.0–7.5 GB** |
-| Procesos host               |            6 (1/VM) |          ~18 (3/svc)   |        ~18        |
-| FDs abiertos host           |               ~150 |                ~600     |        ~600        |
-| Aislamiento kernel          |       VM real (KVM) |  shared kernel (NS)   |  shared kernel    |
-| Aislamiento red             | TAP+bridge+NAT/VM   |  veth+bridge          | veth+bridge        |
-| Boot kernel                 |          **<100 ms** |    n/a (host kernel)  |   n/a              |
-| Disco rootfs por instancia | 0 B (RO maestro)    | ~300–800 MB (layer copia) | ídem            |
-| Disco estado por instancia | ~200–400 MB ext4    | ~200–400 MB volume    | ídem               |
+| Recurso                     |    NKR (medido) | Docker (idle est.) | Docker bajo carga |
+|-----------------------------|----------------:|-------------------:|------------------:|
+| RAM efectiva                |       **2.5 GB**|         ~2.5 GB    |    **~5.0–7.5 GB**|
+| Procesos host               |    12 (1 VMM + 1 virtiofsd × VM, ~) |       ~18 (3/svc) |        ~18         |
+| FDs abiertos host           |             ~200|              ~600  |             ~600   |
+| Aislamiento kernel          |    VM real (KVM)|    shared kernel   |   shared kernel    |
+| Aislamiento red             |  TAP+bridge+NAT/VM |       veth      |        veth        |
+| Boot kernel guest           |       **<100 ms**|     n/a            |      n/a           |
+| Disco rootfs por instancia  |       0 B (reflink share) | 300–800 MB (layer copia) |     ídem  |
+| Disco estado por instancia  |        ~2 GB ext4 |       ~2 GB volume |     ídem           |
 
-Para el escenario objetivo del whitepaper (**100 Odoos**, mismo PG+pgb por celda):
+### Proyección 100 Odoos en una cell (escala objetivo del whitepaper)
 
-| Recurso                | NKR (proyectado, lineal) | Docker (proyectado, lineal) | Δ      |
-|------------------------|-------------------------:|----------------------------:|-------:|
-| RAM idle                |         ~50–60 GB          |         ~80–100 GB             | -40%   |
-| RAM bajo carga          |         ~70–90 GB          |       ~160–220 GB              | -55%   |
-| Disco /var (filestores) |         ~30–60 GB           |       ~60–120 GB                | -50%   |
-| Cores recomendados      |         8–12               |        16–24                    | -33%   |
+NKR ya está probado con 21 VMs en una sola cell — proyectando lineal con DAX
+(la curva se aplana porque cada Odoo nuevo no duplica el page-cache del rootfs):
 
-> NKR no es magia: gana porque **comparte la rootfs RO entre N Odoos vía pmem-DAX**.
-> Docker tendría que recurrir a `--read-only` + bind mounts manuales muy específicos
-> + tmpfs para `/tmp` para acercarse — y aun así el page cache no se dedup entre containers.
+| Recurso                    | NKR (proyectado) | Docker (proyectado) |    Δ     |
+|----------------------------|-----------------:|--------------------:|---------:|
+| RAM idle                   |       40–55 GB   |          80–100 GB  |   -45 %  |
+| RAM bajo carga             |       60–80 GB   |        160–220 GB   |   -60 %  |
+| Disco /var (filestores)    |       30–60 GB   |         60–120 GB   |   -50 %  |
+| Cores recomendados         |          8–12    |             16–24   |   -33 %  |
+| Spawn de instancia nueva   |        10–20 s   |             ~90 s   |   ~5×    |
+
+> NKR no es magia: gana porque **comparte la rootfs RO entre N Odoos vía DAX**
+> y deduplica el page-cache del host vs N veces el de cada container.
 
 ---
 
 ## 4. Tiempos de levantar todo de cero
 
-Medido `compose down` → `compose up` en este host. Docker lo hago con números promedio
-de deploys equivalentes (PG inicial + pgbouncer + 1 Odoo).
-
-### NKR — `nkr compose up odoo-v19`
+### NKR — `nkr compose up odoo-v19` (todo el stack)
 
 ```
-[t=0.00s]  nkr compose up
-[t=0.03s]  initramfs cpio empaquetado (cached)
+[t=0.00s]  nkr compose up -d (Phase 1: per-invocation log, idempotent skip)
+[t=0.03s]  initramfs cpio empaquetado (cache + skip si VM activa — Patch H)
 [t=0.05s]  KVM ioctls + memfd allocate
 [t=0.08s]  vCPU run → kernel guest decompress
-[t=0.09s]  init de busybox: monta /proc /sys /dev, sube eth0
+[t=0.09s]  init busybox: monta /proc /sys /dev, sube eth0, monta DAX rootfs
 [t=0.12s]  postgres-start.sh dispara postgres -D /var/lib/postgresql/data
-[t=2.5s ]  PG ready (recovery + checkpoint inicial sobre disco existente)
-[t=3.0s ]  pgbouncer arranca (rewrite ini + listen :6432)
-[t=3.5s ]  odoo-start.sh: import Python + open DB + workers fork
-[t=5.0s ]  primer GET /web/login retorna 200 (skip_warmup activo desde v1.4)
+[t=2.5s]   PG ready (recovery + checkpoint inicial sobre disco existente)
+[t=3.0s]   pgbouncer arranca (rewrite ini + listen :6432)
+[t=3.5s]   odoo-start.sh: import Python + open DB + workers fork
+[t=5.0s]   primer GET /web/login retorna 200 (skip_warmup activo desde v1.4)
 ```
 
-**Total NKR de cero a Odoo respondiendo HTTP: ~5 s.**
-(con assets en frío, primera UI completa: ~5–8 s. El warmup runtime fue eliminado en v1.4
-porque el clone TEMPLATE ya trae `ir_attachment` precompilado.)
+**Total NKR de cero a Odoo respondiendo HTTP: ~5 s** (con assets compilados
+heredados del template via `cp --reflink`).
 
-### Docker — `docker compose up`
+### Docker — `docker compose up` (mismo stack)
 
 ```
 [t=0.00s]  docker compose up
-[t=1.0s ]  pull/check imágenes (cached)
-[t=2.0s ]  containerd crea cgroups + netns + veth + iptables-jump
-[t=3.0s ]  postgres entrypoint: chown -R postgres:postgres /var/lib/postgresql/data
-           (lento si hay muchos archivos — proporcional al filestore ext4)
-[t=8s   ]  pg_ctl start (con shared_buffers init + WAL replay)
-[t=15s  ]  pgbouncer container arranca tras healthcheck PG
-[t=18s  ]  odoo container arranca: pip wheels presentes, intérprete arranca
-[t=25s  ]  Odoo conecta DB, primer worker listo
-[t=30s  ]  primer GET /web/login responde 200 (cold cache)
-[t=55s  ]  primer GET /odoo (assets compilando on-demand, sin pre-warm)
+[t=1.0s]   pull/check imágenes (cached)
+[t=2.0s]   containerd crea cgroups + netns + veth + iptables-jump
+[t=3.0s]   postgres entrypoint: chown -R postgres:postgres /var/lib/postgresql/data
+           (lento si hay muchos archivos)
+[t=8s]     pg_ctl start (con shared_buffers init + WAL replay)
+[t=15s]    pgbouncer container arranca tras healthcheck PG
+[t=18s]    odoo container arranca: pip wheels presentes, intérprete arranca
+[t=25s]    Odoo conecta DB, primer worker listo
+[t=30s]    primer GET /web/login responde 200 (cold cache)
+[t=55s]    primer GET /odoo (assets compilando on-demand)
 ```
 
 **Total Docker de cero a Odoo respondiendo HTTP: ~30–60 s.**
 
-### Boot solo del Odoo (clon nuevo) — operación más frecuente
+### POST /instances (clonar un tenant nuevo) — operación más frecuente
 
-| Operación                          | NKR    | Docker |
-|------------------------------------|-------:|-------:|
-| `POST /api/v1/instances` end-to-end |  ~30 s |   ~90 s |
-| Disponibilidad HTTP en 8069         |  ~5 s  |  ~25 s  |
-| Primer `/web/login` retornando 200  |  ~5–8 s | ~30–60 s |
+**Esta es la métrica clave para SaaS multi-tenant: cuán rápido se aprovisiona un
+cliente nuevo.** NKR cerró el SLA explícitamente en v1.6.5:
 
-NKR gana en clones porque:
-- El `odoo.ext4` se clona con `cp --reflink=auto` (btrfs) → 0 GB físicos copiados.
-- El filestore se renombra dentro del guest (no el host) — paralelo por VM.
-- El warmup HTTP fue eliminado (v1.4): el TEMPLATE ya trae assets compilados.
-- No hay `chown -R` masivo (entrypoint Odoo de Docker lo hace por defecto).
+| Caso                                | NKR v1.6.5 (medido) | Docker (estimado) |
+|-------------------------------------|--------------------:|------------------:|
+| dev + community + auto-start        |          **13.5 s** |       ~90 s       |
+| production + community + workers=2  |          **14.5 s** |     ~110 s        |
+| staging (clone from prod tenant)    |          **13.0 s** |    ~120 s         |
+| **enterprise + auto-start**         |          **17.6 s** | imposible automatizar* |
+| cold-prepared (sin auto-start)      |            ~3.3 s   |    n/a            |
+| DELETE end-to-end                   |           ~60 s     |     ~15 s         |
 
----
+> *Enterprise en Docker: `web_enterprise` no viene en `odoo:19` oficial. Hay
+> que montar un volumen con el repo enterprise + reiniciar el container +
+> activar el módulo desde la UI (2–5 min). NKR resuelve esto con un **template
+> enterprise pre-sembrado por cell** (`<cell>-odoo-template-enterprise`) que
+> tiene `web_enterprise` ya instalado: el clone es O(1) via `CREATE DATABASE
+> TEMPLATE` + reflink, mismo SLA que community.
 
-## 5. Otros vectores que la tabla no captura
+### El contrato SLA documentado al panel (v1.6.5, [NKR_API.md §TL;DR](NKR_API.md))
 
-| Vector                          | NKR                                      | Docker                          |
-|---------------------------------|------------------------------------------|---------------------------------|
-| RCE en Odoo escala kernel host  | **No** (KVM hardware boundary)          | Sí (mismo kernel)                |
-| Tenant rompe `/etc/passwd`      | Solo dentro de su VM                     | Container puede tocar volumes   |
-| Memory pressure de tenant X     | OOM kill **dentro de su VM**             | OOM puede pegar al kernel host  |
-| Hot-resize de RAM/CPU           | Sí (balloon + cgroup en runtime)         | Solo cgroup (DRAM en RAM siempre) |
-| Live migration                  | Posible (KVM compatible)                 | Compleja (CRIU experimental)    |
-| Densidad PG isolation           | 1 PG por celda **dedicado** + pgbouncer  | Idem, pero más caro en RAM      |
-| Visibilidad procesos del host   | Cero (solo el VMM aparece como `nkr`)    | Todos los PIDs en `ps -ef` host |
+NKR define explícitamente:
 
----
+```
+status=ready en 10–20 s típico, cualquier tier (dev/staging/production)
+y cualquier edition (community/enterprise — el theme viene en el template).
 
-## 6. Cuándo Docker sigue siendo mejor
+Poll cada 2–3 s.
+Timeout-de-alarma del panel: >60 s → señal de problema, no de boot lento.
+```
 
-NKR está optimizado para **un solo workload SaaS replicado** (Odoo). Docker gana cuando:
-
-- Necesitás **N stacks heterogéneos** (Node, Go, Rust, Ruby, etc) que no comparten rootfs.
-- El equipo usa CI/CD basado en imágenes (Dockerfile-first).
-- No hay capacidad de mantener un kernel customizado (`build-kernel/` con módulos KVM).
-- El hardware es ARM / no permite KVM (cloud nested virt deshabilitado).
-- Los tenants son **internos confiables** → no se justifica la barrera VM.
+Docker no tiene un equivalente: cada deploy es ad-hoc según la imagen, el
+entrypoint y el `healthcheck`. SLA por convención del operador, no por contrato.
 
 ---
 
-## 7. Resumen ejecutivo
+## 5. Multi-tenancy: la diferencia más grande
 
-| Métrica                          | NKR (real) | Docker (proy.) | Ratio |
-|----------------------------------|-----------:|---------------:|------:|
-| RAM total 6 servicios idle (VMs+virtiofsd) |    2.9 GB  |     ~5.0 GB     |  58%  |
-| Boot a HTTP-200 (compose up full) |       5 s  |     30–60 s     |  10–15× |
-| Boot por nueva instancia (clon)   |      ~5 s  |     ~25 s       |  5×   |
-| Aislamiento por tenant            |   VM (KVM) | container (NS)  |  ↑    |
-| Disco rootfs por instancia        |       0 B  |   ~300 MB       |  ∞    |
-| Densidad proyectada (100 Odoos)   |    50–90 GB |   160–220 GB    |  -55% |
+Esta sección es nueva (no estaba en la versión 2026-04-27 del doc) porque las
+features v1.5.x–v1.6.5 cambiaron cualitativamente el lado SaaS.
 
-**TL;DR:** para **el caso Odoo multi-tenant**, NKR usa ~½ la RAM, ~1/10 el tiempo de
-boot, ~0 disco extra por clone, y agrega aislamiento de kernel real — al costo de mantener
-un orquestador KVM custom (~20k LoC Rust) y un kernel propio. Docker solo es competitivo
-si el workload no es replicable o si el equipo no puede operar el stack KVM.
+### a) Aislamiento entre tenants
 
-> **Tamaño del orquestador NKR:** 15.998 líneas de Rust en el daemon `nkr`
-> (medido `find src -name '*.rs' -not -path 'src/bin/*' | xargs wc -l`).
-> El proxy HTTP `nkr-api-server` aparte son 1.303 líneas adicionales (no contadas aquí
-> — es un binario separado, unprivileged). Más ~700 líneas de scripts/Nkrfiles auxiliares.
-> El binario `nkr` (release) pesa ~1.9 MB; sin dependencias C externas más allá de
-> busybox dentro del initramfs.
+| Vector                          | NKR                                       | Docker                            |
+|---------------------------------|-------------------------------------------|-----------------------------------|
+| RCE en Odoo escala host         | **No** (KVM hardware boundary)            | Sí (mismo kernel)                 |
+| Tenant lee/modifica otro tenant | **Imposible** (memoria separada por KVM)  | Posible con bind mount mal puesto |
+| Memory pressure de tenant X     | OOM kill **dentro de su VM**              | OOM puede pegar al kernel host    |
+| Tenant satura su disco          | Solo su `.ext4` per-tenant                | Volume per-container (similar)    |
+| Tenant escribe a rootfs         | RO real (DAX `ro`)                        | RO opcional via `--read-only`     |
+| 1 cell ↔ 20 tenants Odoo        | Garantizado por NKR (`MAX_ODOOS_PER_CELL`)| Convención manual                 |
+
+### b) Sizing per-tier (NKR v1.6.5)
+
+NKR codifica perfiles de recursos por **tier**:
+
+| Tier        | VM RAM   | Workers | balloon ACTIVE (boot) | balloon IDLE (post-decay) | dev_mode  |
+|-------------|---------:|--------:|----------------------:|--------------------------:|-----------|
+| `production`|  2048 MB+|       2 |     0 (estático)      |       0 (estático)        | off       |
+| `staging`   |  1024 MB |       0 |     0                 |     256 MB                | vacío     |
+| `dev`       |  1300 MB |       0 |     0                 |     256 MB                | vacío     |
+
+Docker no tiene un equivalente declarativo del perfil por tier — cada equipo
+construye su Compose con `mem_limit`/`cpus` manual. Esto es importante a
+escala: NKR pasa el flag y obtiene un perfil correcto, validado contra
+fórmulas de seguridad (`validate_workers_ram_budget`).
+
+### c) SSO HMAC (v1.6.4) — login web sin password en flight
+
+NKR firma URLs `https://<dns>/nkr-sso?u=<login>&exp=<ts>&sig=<hmac_sha256>` con
+una clave HMAC de 256 bits **única por tenant**. El módulo `nkr_sso` (vive
+en `cells/<cell>/systemouts-addons/`, una sola copia por cell, RO,
+invisible al cliente) verifica la firma y crea sesión sudo del usuario `admin`
+sin pedir password. El password jamás sale del host.
+
+Docker no tiene equivalente. Cualquier login programático del operador requiere
+o bien guardar la pwd en plain text accesible, o un puente de service-account
+(2FA, etc.).
+
+### d) Métricas internas del guest sin agente (v1.6.4)
+
+NKR implementa `VIRTIO_BALLOON_F_STATS_VQ` y extrae:
+- `nkr_guest_mem_total_bytes`, `*_free_bytes`, `*_available_bytes`, `*_cached_bytes`
+
+Sin un agente dentro del guest — el balloon driver expone los datos por el
+virtqueue. El daemon los persiste cada ~10 s y los expone en `/metrics`.
+
+Docker reporta sólo cgroup memory (que es la del container, no la "interna" del
+proceso Odoo). Para tener `MEMFREE/CACHES` hay que correr `node_exporter` o
+similar **dentro** del container.
+
+### e) Per-instance boot log (v1.6.4)
+
+Cada VM tiene `<instance>/.<name>-vm-boot.log` que captura:
+- Serial console del guest (boot del kernel + initramfs)
+- Stderr del VMM (`nkr run`)
+
+Útil para diagnosticar mounts virtio-fs, panics del kernel guest, etc. Docker
+expone `docker logs <container>` (mezcla stdout/stderr de PID 1).
+
+---
+
+## 6. Avances v1.4 → v1.6.5 (~3 semanas)
+
+| Versión | Hito principal |
+|---------|----------------|
+| v1.4    | skip_warmup eliminó la fase HTTP warmup (5 s ahorrados por clone) |
+| v1.5.1  | `POST /actions {start/stop/restart}` async (devuelve 202 en <50 ms) |
+| v1.5.2  | DELETE async dispatch (cleanup en background) |
+| v1.6.0  | tier system (production/staging/dev) + sizing per-tier |
+| v1.6.1  | edge dual + nginx hardening + diff per-módulo + faster restart |
+| v1.6.2  | `dev_mode=reload` removido (Bug INOTIFY documentado y cerrado) |
+| v1.6.3  | `dev_mode` vacío forzado en cell.rs::rewrite_odoo_conf_full |
+| v1.6.4  | SSO HMAC + systemouts-addons + async create + guest metrics + balloon stats vq |
+| **v1.6.5** | SLA create ≤60s + multi-cell vm_id safety + KSM legacy cleanup + per-cell enterprise template + TIER column en nkr ps |
+
+Cambios v1.6.5 más relevantes para la comparación con Docker:
+
+- **SLA create explícito 10–20 s** documentado en el contrato API.
+- **Per-cell enterprise template**: enterprise tiene el mismo SLA que community
+  (el theme viene pre-sembrado, no se instala runtime).
+- **Per-invocation compose log** elimina el bug de `nkr-compose.log` compartido
+  con sparse holes y overlap de orphan supervisors.
+- **Multi-cell `vm_id` collision fix**: `find_vm`/`stop_vm`/`unregister_vm` ahora
+  scope a `(cell_id, vm_id)`. Antes, `nkr stop <name>` podía matar la VM
+  equivocada en otra cell por colisión de `vm_id`. Bug crítico cerrado.
+- **`nkr ps` con columna `TIER`** (prd/stg/dev) por convención.
+- **KSM legacy removido**: NKR nunca usó realmente KSM (memfd+MAP_SHARED rechaza
+  MADV_MERGEABLE). El CLI `nkr ksm` + métrica + ~150 LOC limpiados.
+
+---
+
+## 7. Cuándo Docker sigue siendo mejor
+
+NKR está optimizado para **un solo workload SaaS replicado** (Odoo). Docker
+gana cuando:
+
+- Tu equipo necesita **N stacks heterogéneos** (Node + Go + Rust + Ruby...)
+  que no comparten rootfs ni intérprete.
+- El CI/CD del equipo es 100 % Dockerfile-first (push image → deploy image).
+- No hay capacidad de mantener un kernel custom (`build-kernel/` con módulos
+  KVM compilados).
+- El hardware es ARM Cloud sin nested-virt (cloud nested KVM deshabilitado).
+- Los tenants son **internos confiables** → el costo de la barrera VM no se
+  justifica.
+- Necesitas portar a Kubernetes con Helm charts ya escritos.
+
+NKR es la mejor opción cuando **el workload es uniforme (un solo tipo de app,
+multi-tenant), el equipo ya tiene capacidad sysadmin/Rust, y el costo de RAM
+matters** (saas de Odoo, multi-tenant Postgres, ERPs replicados, etc.).
+
+---
+
+## 8. Resumen ejecutivo
+
+| Métrica                                | NKR v1.6.5 (real) | Docker (proyectado) |  Ratio   |
+|----------------------------------------|------------------:|--------------------:|---------:|
+| RAM total 21 VMs (configurado)         |       26.6 GB     |     ~32 GB          |    -17%  |
+| RAM total 21 VMs (real, post-balloon+DAX) |    **5.7 GB**  |      ~25 GB         |    -77%  |
+| **Boot a HTTP-200 (compose up full)**  |        **5 s**    |      30–60 s        |   10–15× |
+| **POST /instances community**          |         **13 s**  |        ~90 s        |     ~7×  |
+| **POST /instances enterprise**         |       **17.6 s**  |  imposible auto     |     —    |
+| Disco rootfs por instancia             |         0 B       |    ~300 MB          |    ∞     |
+| Aislamiento por tenant                 |    VM (KVM)       |  container (NS)     |   ↑      |
+| SLA documentado al cliente             |   10–20 s contractual | ad-hoc          |   ↑      |
+| Densidad proyectada (100 Odoos)        |     40–80 GB      |    160–220 GB       |   -55%   |
+| LoC del orquestador (daemon)           |  19.9 k Rust      |    ~5M+ (Docker+containerd+runc) | —    |
+
+**TL;DR:** para el caso Odoo SaaS multi-tenant, NKR v1.6.5 usa **~1/5 la RAM
+real**, **~1/7 el tiempo de aprovisionar un tenant**, ofrece un SLA explícito
+de creación (10–20 s contractual, independiente de tier/edition), y agrega
+aislamiento de kernel real — al costo de mantener un orquestador KVM custom
+(~20 k LoC Rust) y un kernel propio. Docker es mejor opción si el workload no
+es replicable o si el equipo no puede operar el stack KVM.
+
+> **Tamaño del orquestador NKR (medido):**
+> - `src/*.rs` (sin bin) → **19 889 líneas** de Rust.
+> - `src/bin/nkr_api_server.rs` → 2 621 líneas adicionales (proxy HTTP unprivileged).
+> - Binario `nkr` (release): 2.5 MB. Binario `nkr-api-server`: 663 KB.
+> - Sin dependencias C externas — todo userspace en busybox dentro del initramfs.
