@@ -490,45 +490,124 @@ Cada cell que vaya a soportar `edition=enterprise` necesita un **segundo templat
 
 **Por qué este modelo (vs activación en runtime):** Instalar `web_enterprise` toma 2–5 min y dispara `update_list()` sobre ~750 manifests del repo enterprise. Hasta v1.6.4, NKR lo hacía en cada create → frágil (Bug F: en muchos casos `web_enterprise` no aparecía tras `update_list`), lento (rompía SLA 60 s), y no testeable (resultado variable per-instancia). v1.6.5+ mueve la instalación al template — se hace **una sola vez por cell**, el operador la prueba bien, y todos los clones nacen O(1) vía `CREATE DATABASE … TEMPLATE`.
 
-**Runbook (una vez por cell, ej. `odoo-v19`):**
+**Runbook (una vez por cell, ej. `odoo-v19`) — probado 2026-05-14:**
 
 ```bash
-# 1. Clonar el template community a un instance temporal (con auto_start).
+# Pre-flight checks:
+ls /mnt/nkr/enterprise/19.0/web_enterprise/__manifest__.py  # debe existir
+ls /mnt/nkr/cells/odoo-v19/instances/odoo-v19-odoo-template-enterprise/  # debe NO existir
+TOKEN="..."
+PG_PWD=$(awk '/POSTGRES_PASSWORD:/{gsub(/[",]/,""); print $2; exit}' /mnt/nkr/cells/odoo-v19/nkr-compose.yml | head -1)
+
+# 1. Clonar el template community con edition=enterprise (esto inyecta la
+#    share /mnt/extra-enterprise + addons_path; mode=dev permite source
+#    explícito; el clone hereda admin/admin del template community).
 curl -sS -X POST $NKR/api/v1/cells/odoo-v19/instances \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"nkr_name":"ent-tpl-build","odoo_version":"19.0","tier":"production",
-       "edition":"community","workers":1,
+  -d '{"nkr_name":"ent-tpl-build","odoo_version":"19.0",
+       "tier":"production","mode":"dev",
+       "source":"odoo-v19-odoo-template",
+       "edition":"enterprise","workers":1,
        "admin_passwd":"<gen 16-128 chars>", "admin_user_password":"<gen 8-128>"}'
-# Poll create-status hasta status=ready.
+# Poll create-status hasta status=ready. ~15-20 s.
 
-# 2. Login a la UI del nuevo tenant (vía https://<dns> o /nkr-sso), Apps →
-#    Update Apps List → Install Web Enterprise. Tarda 2–5 min.
-#    Verificar /web/login muestra theme enterprise.
+# 2. Instalar web_enterprise via JSON-RPC (NO via UI — más rápido + scriptable).
+#    update_list registra ~226 manifests del repo enterprise (~7 s).
+#    button_immediate_install activa el theme (~10 s).
+HOST=<guest_ip de ent-tpl-build>
+PWD=<admin_user_password que pasaste>
+COOKIE=$(curl -sS -i -X POST "http://$HOST:8069/web/session/authenticate" \
+  -H 'Content-Type: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"method\":\"call\",\"params\":{\"db\":\"db-odoo-v19-ent-tpl-build\",\"login\":\"admin\",\"password\":\"$PWD\"}}" \
+  | grep -i '^Set-Cookie' | head -1 | awk '{print $2}' | tr -d ';')
+# 2a. update_list — escanea /mnt/extra-enterprise
+curl -sS -X POST "http://$HOST:8069/web/dataset/call_kw" \
+  -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"call","params":{"model":"ir.module.module","method":"update_list","args":[],"kwargs":{}}}'
+# 2b. install web_enterprise
+WE_ID=$(curl -sS -X POST "http://$HOST:8069/web/dataset/call_kw" \
+  -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"call","params":{"model":"ir.module.module","method":"search","args":[[["name","=","web_enterprise"]]],"kwargs":{}}}' \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"][0])')
+curl -sS -X POST "http://$HOST:8069/web/dataset/call_kw" \
+  -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"method\":\"call\",\"params\":{\"model\":\"ir.module.module\",\"method\":\"button_immediate_install\",\"args\":[[$WE_ID]],\"kwargs\":{}}}"
+# 2c. CRÍTICO — restablecer admin/admin (NKR le rotó la pwd en el step 1; el
+#     template DEBE tener admin/admin para que clones futuros lo puedan rotar):
+curl -sS -X POST "http://$HOST:8069/web/dataset/call_kw" \
+  -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"method\":\"call\",\"params\":{\"model\":\"res.users\",\"method\":\"change_password\",\"args\":[\"$PWD\",\"admin\"],\"kwargs\":{}}}"
 
 # 3. Parar la VM.
 curl -sS -X POST $NKR/api/v1/cells/odoo-v19/instances/odoo-v19-ent-tpl-build/actions \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"action":"stop"}'
+# Espera ~60s (graceful shutdown del VMM).
 
-# 4. Promoción a template (edición manual del cell por el operador):
-#    a) Renombrar la DB en PG:
-sudo -u postgres psql -c \
+# 4. Promoción a template:
+#    a) Renombrar la DB en PG. Las conexiones de pgbouncer la mantienen
+#       abierta — terminar primero:
+PGPASSWORD=$PG_PWD psql -h 10.0.2.2 -U odoo -d postgres -c "
+  SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+  WHERE datname='db-odoo-v19-ent-tpl-build' AND pid <> pg_backend_pid();"
+PGPASSWORD=$PG_PWD psql -h 10.0.2.2 -U odoo -d postgres -c \
   "ALTER DATABASE \"db-odoo-v19-ent-tpl-build\" RENAME TO \"db-odoo-v19-odoo-template-enterprise\";"
-#    b) Renombrar el dir de la instancia:
-sudo mv /mnt/nkr/cells/odoo-v19/instances/odoo-v19-ent-tpl-build \
-        /mnt/nkr/cells/odoo-v19/instances/odoo-v19-odoo-template-enterprise
-#    c) Editar /mnt/nkr/cells/odoo-v19/nkr-compose.yml:
-#       - Cambiar nkr_name: "odoo-v19-ent-tpl-build" → "odoo-v19-odoo-template-enterprise"
-#       - Setear disabled: true (no debe arrancar nunca solo, igual que el template community)
-#       - balloon_mb: 128 (no necesita más, idem template community)
-#       - Actualizar las rutas de disks/volumes/shares del bloque al nuevo nombre.
-#    d) Renombrar el archivo del state (si la VM fue activa en algún momento):
-sudo rm /tmp/nkr-vms/c<cell_id>-v<vm_id>.json  # ya no aplica, idempotente.
 
-# 5. Verificación: a partir de ahora, POST /instances edition=enterprise en
-#    odoo-v19 resuelve source automáticamente al template enterprise y los
-#    creates duran 10–20s igual que community. Probarlo con un tenant test.
+#    b) Renombrar el dir de la instancia + nkr-data files:
+mv /mnt/nkr/cells/odoo-v19/instances/odoo-v19-ent-tpl-build \
+   /mnt/nkr/cells/odoo-v19/instances/odoo-v19-odoo-template-enterprise
+for f in /mnt/nkr/cells/odoo-v19/.nkr-data/ent-tpl-build-*; do
+  mv "$f" "${f/ent-tpl-build-/odoo-template-enterprise-}"
+done
+
+#    c) Actualizar odoo.conf paths internos:
+sed -i 's|ent-tpl-build|odoo-template-enterprise|g' \
+  /mnt/nkr/cells/odoo-v19/instances/odoo-v19-odoo-template-enterprise/config/odoo.conf
+
+#    d) Actualizar meta.json (nkr_name):
+python3 -c "
+import json
+p='/mnt/nkr/cells/odoo-v19/instances/odoo-v19-odoo-template-enterprise/meta.json'
+d=json.load(open(p)); d['nkr_name']='odoo-v19-odoo-template-enterprise'
+json.dump(d, open(p,'w'), indent=2)"
+
+#    e) Actualizar /mnt/nkr/registry.json (re-key del vm_id):
+python3 -c "
+import json
+p='/mnt/nkr/registry.json'
+d=json.load(open(p))
+e=d['entries']
+if 'odoo-v19/odoo-v19-ent-tpl-build' in e:
+    e['odoo-v19/odoo-v19-odoo-template-enterprise']=e.pop('odoo-v19/odoo-v19-ent-tpl-build')
+    json.dump(d, open(p,'w'), indent=2)"
+
+#    f) Editar el bloque del nkr-compose.yml. CAMBIOS NECESARIOS:
+#       - header: `  ent-tpl-build:` → `  odoo-template-enterprise:`
+#       - disabled: true (no debe arrancar)
+#       - nkr_name: "odoo-v19-odoo-template-enterprise"
+#       - ram: 512, chrs: 1, balloon_mb: 128 (sizing template)
+#       - todos los paths /mnt/nkr/cells/odoo-v19/instances/odoo-v19-ent-tpl-build/
+#         → /mnt/nkr/cells/odoo-v19/instances/odoo-v19-odoo-template-enterprise/
+#       - REMOVER NKR_RENAME_FILESTORE_FROM/TO del environment (template no
+#         necesita rename; el clone los inyectará al clonar).
+#       - REMOVER balloon_idle_mb / balloon_decay_secs si los hay (template
+#         estático).
+#    (En el script de seeding usé un pequeño Python: src/scripts/promote-block.py.)
+
+# 5. Verificación final:
+nkr ps | grep odoo-template-enterprise  # NO debe aparecer (disabled:true)
+ls /mnt/nkr/cells/odoo-v19/instances/odoo-v19-odoo-template-enterprise/  # debe existir
+
+# 6. Probar:
+curl -sS -X POST $NKR/api/v1/cells/odoo-v19/instances \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"nkr_name":"ent-test","odoo_version":"19.0","tier":"production",
+       "edition":"enterprise","workers":1,
+       "admin_passwd":"<...>","admin_user_password":"<...>"}'
+# → status=ready en ~15-20s. web_enterprise heredado.
 ```
+
+**Tiempo total ≈ 5 minutos** una vez que tenés los comandos a mano (la mayoría es esperar al stop). Validado en odoo-v19.
 
 **Validar después:**
 ```bash
