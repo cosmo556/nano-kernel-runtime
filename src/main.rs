@@ -123,7 +123,7 @@ fn main() {
 
         cli::Command::Stop { id } => {
             if let Some(vm) = state::find_vm_by_id_str(&id) {
-                if let Err(e) = state::stop_vm(vm.vm_id) {
+                if let Err(e) = state::stop_vm(vm.cell_id, vm.vm_id) {
                     eprintln!("[NKR] Error deteniendo VM: {e}");
                     process::exit(1);
                 }
@@ -166,7 +166,7 @@ fn main() {
 
             eprintln!("[NKR-RESTART] Reiniciando VM {} ({})...", vm.vm_id, vm.name);
 
-            if let Err(e) = state::stop_vm(vm.vm_id) {
+            if let Err(e) = state::stop_vm(vm.cell_id, vm.vm_id) {
                 eprintln!("[NKR-RESTART] Error deteniendo VM: {e}");
                 process::exit(1);
             }
@@ -333,33 +333,6 @@ fn main() {
             }
         }
 
-        cli::Command::Ksm { action } => {
-            match action.as_str() {
-                "on" => match metrics::ksm_enable() {
-                    Ok(()) => {
-                        eprintln!("[KSM] Activado con parámetros optimizados para Odoo");
-                        metrics::print_ksm_status();
-                    }
-                    Err(e) => {
-                        eprintln!("[KSM] Error: {e}");
-                        process::exit(1);
-                    }
-                },
-                "off" => match metrics::ksm_disable() {
-                    Ok(()) => eprintln!("[KSM] Desactivado"),
-                    Err(e) => {
-                        eprintln!("[KSM] Error: {e}");
-                        process::exit(1);
-                    }
-                },
-                "status" | "" => metrics::print_ksm_status(),
-                _ => {
-                    eprintln!("[KSM] Acción desconocida: '{}'. Usar: on, off, status", action);
-                    process::exit(1);
-                }
-            }
-        }
-
         cli::Command::Serve { port: _ } => {
             // `--port` is legacy and ignored since v1.5. The daemon now serves
             // an IPC-only UDS endpoint (default /var/run/nkr.sock, override
@@ -460,7 +433,7 @@ fn main() {
                         // No compose: stop all VMs with that cell_id
                         for vm in state::list_vms() {
                             if vm.cell_id == config.cell_id {
-                                let _ = state::stop_vm(vm.vm_id);
+                                let _ = state::stop_vm(vm.cell_id, vm.vm_id);
                             }
                         }
                     }

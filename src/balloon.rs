@@ -10,7 +10,7 @@
 //   Without balloon: 30 × 700 MB = 21 GB (only 11 GB left for the host)
 //   With balloon (300 MB inflated on idle VMs):
 //     30 × 400 MB real = 12 GB → 20 GB free for more instances
-//   Combined with PMEM+DAX (−200 MB/VM) and KSM (−100 MB/VM):
+//   Combined with virtio-fs + DAX (−200 MB/VM, dedupe Python/.pyc/libs):
 //     30 × 200 MB real = 6 GB → 26 GB free → 103+ instances possible
 //
 // Device ID: 5, MMIO: 0xD004_0000, IRQ: 18

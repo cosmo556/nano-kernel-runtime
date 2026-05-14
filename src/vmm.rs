@@ -100,18 +100,15 @@ const GDT_ADDR: u64 = 0x500;
 fn ensure_bridge(cell_id: u8) -> Result<(), Box<dyn std::error::Error>> {
     crate::cell::ensure_cell_bridge(cell_id)?;
 
-    // KSM intentionally NOT enabled. Reason: NKR maps guest RAM via
+    // KSM intentionally NOT used (v1.5+). Reason: NKR maps guest RAM via
     // memfd_create + MAP_SHARED (required by vhost-user SET_MEM_TABLE so
-    // virtiofsd can access virtio buffers). The kernel rejects
-    // MADV_MERGEABLE (silent EINVAL) on VMAs with VM_SHARED, so KSM
-    // never receives pages to scan and only burns kmmod CPU.
-    //
-    // The real density comes from virtio-fs + DAX (dedupes Python binaries,
-    // .pyc, shared libs) and, in the future, pre-compile of QWeb assets at
-    // build-time. See CLAUDE.md §1 for details.
-    //
-    // If you move to hybrid memory (anon-private + memfd-shared) in the future,
-    // re-enable here with metrics::ksm_enable().
+    // virtiofsd can access virtio buffers). The kernel rejects MADV_MERGEABLE
+    // (silent EINVAL) on VMAs with VM_SHARED, so KSM never receives pages to
+    // scan and only burns ksmd CPU. La densidad viene de virtio-fs + DAX
+    // (dedupe de Python/.pyc/shared libs). Ver CLAUDE.md §1.
+    // El soporte KSM (CLI command + métricas + funciones) fue removido en
+    // v1.6.5 — si en el futuro se introduce memoria híbrida anon+memfd, hay
+    // que reescribir el path desde cero, no hay nada que re-habilitar.
 
     Ok(())
 }
@@ -636,7 +633,7 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
     eprintln!("║  NKR v1.0 — Nano-Kernel Runtime                            ║");
     eprintln!("╠══════════════════════════════════════════════════════════════╣");
-    eprintln!("║  RAM:    {} MB (lazy, KSM habilitado)", config.ram_mb);
+    eprintln!("║  RAM:    {} MB (lazy)", config.ram_mb);
     eprintln!("║  CPU:    {} chrs ({}% de core físico)", config.chrs, config.chrs * 20);
     if let Some(ref rootfs) = config.rootfs {
         eprintln!("║  RootFS: {} (VirtIO-FS compartido)", rootfs);
@@ -741,18 +738,15 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
     // are only allocated when the guest touches them (EPT fault → host page fault → alloc).
     // With MAP_NORESERVE, 50 VMs × 256 MB do not consume 12 GB of commit limit.
     //
-    // After creating the regions we apply two additional madvise calls:
-    //   MADV_MERGEABLE → KSM (Kernel Same-page Merging). NOTE: the call is
-    //                    KEPT for documentation/future use, but it returns
-    //                    EINVAL silently here because guest RAM is backed by
-    //                    memfd+MAP_SHARED (required by vhost-user
-    //                    SET_MEM_TABLE for virtiofsd). The kernel rejects
-    //                    MERGEABLE on VMAs with VM_SHARED. CLAUDE.md §1
-    //                    documents this — KSM would require a hybrid layout
-    //                    (anon-private + memfd-shared regions).
-    //   MADV_NOHUGEPAGE → avoids THP (Transparent HugePages): a 2MB THP can only
-    //                     be freed if all 512 subpages are cold simultaneously.
-    //                     With granular 4KB pages, the kernel can evict page by page.
+    // After creating the regions we apply MADV_NOHUGEPAGE:
+    //   evita THP (Transparent HugePages): un THP de 2MB sólo se libera si las
+    //   512 subpages están cold simultáneamente. Con páginas granulares de 4KB
+    //   el kernel puede desalojar página por página.
+    //
+    // KSM (MADV_MERGEABLE) NO se aplica: la guest RAM está respaldada por
+    // memfd+MAP_SHARED (requisito de vhost-user SET_MEM_TABLE para virtiofsd),
+    // y el kernel rechaza MERGEABLE en VMAs con VM_SHARED (silent EINVAL). La
+    // densidad viene de virtio-fs+DAX, no de KSM. Removed v1.6.5.
     let high_mem = ram_bytes - 0x100000;
 
     // Guest memory backed by memfd (sharable with virtiofsd via vhost-user SET_MEM_TABLE)
@@ -799,14 +793,11 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
         memfd_offset: r.start_addr().0, // memfd offset = GPA (by design)
     }).collect();
 
-    // Apply lazy/KSM hints to each guest RAM region
+    // Apply lazy/THP hints to each guest RAM region
     for region in guest_mem.iter() {
         let ptr = region.as_ptr() as *mut libc::c_void;
         let len = region.size();
         unsafe {
-            // KSM (no-op on MAP_SHARED — see comment above; kept for future
-            // hybrid memory layout that re-enables it).
-            libc::madvise(ptr, len, libc::MADV_MERGEABLE);
             // No THP: 4KB pages → granular eviction under memory pressure
             libc::madvise(ptr, len, libc::MADV_NOHUGEPAGE);
         }
@@ -1079,8 +1070,8 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
     //     stays mapped on the host. With 50 VMs × 6 GB = 300 GB of file-backed mmap that
     //     competes with the anonymous RAM of the guests.
     //
-    // Recommendation for ≥20 VMs: pmem=false (VirtIO-Block) + KSM active.
-    // pmem=true only makes sense with few VMs and small disks (< 2 GB).
+    // Recommendation for ≥20 VMs: pmem=false (VirtIO-Block). pmem=true only
+    // makes sense with few VMs and small disks (< 2 GB).
     let mut pmem_dev_opt: Option<VirtioPmemDevice> = None;
     if config.use_pmem && !config.disks.is_empty() {
         eprintln!("[NKR] PMEM: mapeando '{}' para DAX (zero-copy rootfs)", config.disks[0]);
@@ -1382,7 +1373,7 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[NKR-DBG] unregister_vm...");
     // Unregister VM from global state (always, even on error)
-    state::unregister_vm(config.vm_id);
+    state::unregister_vm(config.cell_id, config.vm_id);
 
     // Clean up cgroup
     if config.chrs > 0 {

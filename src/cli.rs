@@ -224,17 +224,6 @@ pub enum Command {
         watch: Option<u32>,
     },
 
-    /// Manage KSM (Kernel Same-page Merging) to save RAM between VMs
-    ///
-    /// KSM merges identical memory pages between processes (e.g. multiple
-    /// Odoo instances share the same Python/library pages).
-    /// Typically saves 20-40% RAM in multi-tenant Odoo stacks.
-    Ksm {
-        /// Action: on, off, status
-        #[arg(default_value = "status")]
-        action: String,
-    },
-
     /// Start a Prometheus-compatible metrics server (Feature 5)
     ///
     /// Exposes /metrics in Prometheus text exposition 0.0.4 format.

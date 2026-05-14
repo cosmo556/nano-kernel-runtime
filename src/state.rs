@@ -111,24 +111,15 @@ pub fn update_guest_mem(cell_id: u8, vm_id: u8, total: u64, free: u64, avail: u6
 
 /// Removes a VM's registration. Accepts vm_id alone (legacy) and scans the
 /// state dir for any file matching that vm_id regardless of cell_id.
-pub fn unregister_vm(vm_id: u8) {
-    // Remove all state files matching this vm_id across any cell_id.
-    let dir = Path::new(STATE_DIR);
-    if !dir.exists() { return; }
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map_or(false, |e| e == "json") {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(state) = serde_json::from_str::<VmState>(&content) {
-                        if state.vm_id == vm_id {
-                            let _ = fs::remove_file(&path);
-                            eprintln!("[NKR] VM {}/{} desregistrada", state.cell_id, vm_id);
-                        }
-                    }
-                }
-            }
-        }
+pub fn unregister_vm(cell_id: u8, vm_id: u8) {
+    // Borra el state file de UNA VM scoped a (cell_id, vm_id). Antes (pre-v1.6.5)
+    // esta función borraba TODAS las VMs con `vm_id` matcheando, independiente del
+    // cell_id — un bug real que causó pérdida de state files de v17-db cuando
+    // alguien hizo `nkr stop odoo-v19-db` (ambas tenían vm_id=1 en cells distintas).
+    let path = state_path_scoped(cell_id, vm_id);
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+        eprintln!("[NKR] VM {}/{} desregistrada", cell_id, vm_id);
     }
 }
 
@@ -165,25 +156,52 @@ pub fn list_vms() -> Vec<VmState> {
 
 /// Finds a VM by ID. Scans the state dir since the file name now includes
 /// cell_id; if multiple cells share the vm_id this returns the first live one.
-pub fn find_vm(vm_id: u8) -> Option<VmState> {
+/// Busca una VM scoped a (cell_id, vm_id). Reemplaza al `find_vm(vm_id)` legacy
+/// que era ambiguo en multi-cell (mismo vm_id en distintas cells).
+pub fn find_vm(cell_id: u8, vm_id: u8) -> Option<VmState> {
     for state in list_vms() {
-        if state.vm_id == vm_id {
+        if state.cell_id == cell_id && state.vm_id == vm_id {
             return Some(state);
         }
     }
     None
 }
 
-/// Finds a VM by numeric ID, short hash, or name
+/// Finds a VM by numeric ID, `cell_id/vm_id` slashed, short hash, or name.
+///
+/// Multi-cell safety (v1.6.5+): un `id_str` numérico es ambiguo en multi-cell
+/// (mismo vm_id existe en cells distintas). Si hay >1 match retornamos `None`
+/// — el caller debe usar `<cell_id>/<vm_id>` o el nombre completo. Esto
+/// previene el accidente histórico de `nkr stop 1` matando v19-db cuando
+/// queríamos v17-db (ambos vm_id=1).
 pub fn find_vm_by_id_str(id_str: &str) -> Option<VmState> {
-    // Try parsing as legacy numeric ID
-    if let Ok(num) = id_str.parse::<u8>() {
-        if let Some(state) = find_vm(num) {
-            return Some(state);
+    // Sintaxis nueva: "cell_id/vm_id" → resolución exacta, sin ambigüedad.
+    if let Some((c_str, v_str)) = id_str.split_once('/') {
+        if let (Ok(c), Ok(v)) = (c_str.parse::<u8>(), v_str.parse::<u8>()) {
+            return find_vm(c, v);
         }
     }
-    
-    // Search by exact hash or exact name
+
+    // Numeric solo: aceptar si hay UNA SOLA VM con ese vm_id.
+    if let Ok(num) = id_str.parse::<u8>() {
+        let matches: Vec<VmState> = list_vms().into_iter()
+            .filter(|s| s.vm_id == num)
+            .collect();
+        match matches.len() {
+            0 => {}
+            1 => return matches.into_iter().next(),
+            n => {
+                eprintln!("[NKR] id '{}' ambiguo: {} VMs comparten vm_id={}", id_str, n, num);
+                for s in &matches {
+                    eprintln!("      cell_id={} vm_id={} → '{}' (usar `{}/{}` o el nombre)",
+                        s.cell_id, s.vm_id, s.name, s.cell_id, s.vm_id);
+                }
+                return None;
+            }
+        }
+    }
+
+    // Search by exact hash or exact name (names ya son únicos cross-cell).
     for state in list_vms() {
         if state.hash == id_str || state.name == id_str {
             return Some(state);
@@ -193,9 +211,9 @@ pub fn find_vm_by_id_str(id_str: &str) -> Option<VmState> {
 }
 
 /// Stops a VM by sending SIGTERM to its PID
-pub fn stop_vm(vm_id: u8) -> Result<(), Box<dyn std::error::Error>> {
-    let state = find_vm(vm_id)
-        .ok_or_else(|| format!("VM {} no encontrada o ya detenida", vm_id))?;
+pub fn stop_vm(cell_id: u8, vm_id: u8) -> Result<(), Box<dyn std::error::Error>> {
+    let state = find_vm(cell_id, vm_id)
+        .ok_or_else(|| format!("VM {}/{} no encontrada o ya detenida", cell_id, vm_id))?;
     stop_vm_by_state(state)
 }
 
@@ -250,7 +268,7 @@ fn stop_vm_by_state(state: VmState) -> Result<(), Box<dyn std::error::Error>> {
     if !pid_matches_vm(state.pid, &state.name) {
         eprintln!("[NKR] VM {} (PID {}): cmdline no matchea, asumiendo ya muerto",
             vm_id, state.pid);
-        unregister_vm(vm_id);
+        unregister_vm(state.cell_id, vm_id);
         return Ok(());
     }
 
@@ -260,7 +278,7 @@ fn stop_vm_by_state(state: VmState) -> Result<(), Box<dyn std::error::Error>> {
         let err = std::io::Error::last_os_error();
         // If the process no longer exists, clean up and report
         if err.raw_os_error() == Some(libc::ESRCH) {
-            unregister_vm(vm_id);
+            unregister_vm(state.cell_id, vm_id);
             return Err(format!("VM {} ya no existe (PID {} muerto)", vm_id, state.pid).into());
         }
         return Err(format!("No se pudo enviar SIGTERM a PID {}: {}", state.pid, err).into());
@@ -271,7 +289,7 @@ fn stop_vm_by_state(state: VmState) -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..900 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if !is_pid_alive(state.pid) {
-            unregister_vm(vm_id);
+            unregister_vm(state.cell_id, vm_id);
             eprintln!("[NKR] VM {} detenida exitosamente", vm_id);
             return Ok(());
         }
@@ -283,7 +301,7 @@ fn stop_vm_by_state(state: VmState) -> Result<(), Box<dyn std::error::Error>> {
     if !pid_matches_vm(state.pid, &state.name) {
         eprintln!("[NKR] VM {} (PID {}): cmdline cambió antes de SIGKILL — \
                    PID fue reciclado, omitiendo kill", vm_id, state.pid);
-        unregister_vm(vm_id);
+        unregister_vm(state.cell_id, vm_id);
         return Ok(());
     }
 
@@ -291,7 +309,7 @@ fn stop_vm_by_state(state: VmState) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[NKR] VM {} no respondió a SIGTERM, enviando SIGKILL...", vm_id);
     unsafe { libc::kill(state.pid as i32, libc::SIGKILL); }
     std::thread::sleep(std::time::Duration::from_millis(200));
-    unregister_vm(vm_id);
+    unregister_vm(state.cell_id, vm_id);
     eprintln!("[NKR] VM {} forzada a detenerse", vm_id);
     Ok(())
 }
@@ -361,6 +379,7 @@ pub fn print_vm_table() {
         ("CELL", 14usize),
         ("ID", 3),
         ("NOMBRE", 24),
+        ("TIER", 4),
         ("PID", 6),
         ("RAM", 6),
         ("CHRS", 4),
@@ -392,10 +411,38 @@ pub fn print_vm_table() {
         let ram_disp = format!("{}M", vm.ram_mb);
         let cell_disp = cell_names.get(&vm.cell_id).map(|s| s.as_str()).unwrap_or("—");
 
+        // TIER column (v1.6.5+): leemos meta.json del instance para mostrar
+        // production→prd / staging→stg / dev→dev. Infra (db, pgb) no tiene
+        // meta.json (son cell-level) → los marcamos como prd por convención.
+        let tier_disp = if vm.name.ends_with("-db") || vm.name.ends_with("-pgb") {
+            "prd".to_string()
+        } else {
+            // Path: cells/<cell>/instances/<vm.name>/meta.json
+            let cell_name_lower = cell_disp.to_lowercase();
+            let meta_path = crate::cell::cells_dir()
+                .join(&cell_name_lower)
+                .join("instances")
+                .join(&vm.name)
+                .join("meta.json");
+            match std::fs::read_to_string(&meta_path).ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("tier").and_then(|t| t.as_str().map(|x| x.to_string())))
+            {
+                Some(t) => match t.as_str() {
+                    "production" => "prd".to_string(),
+                    "staging" => "stg".to_string(),
+                    "dev" => "dev".to_string(),
+                    other => truncate_str(other, 4),
+                },
+                None => "—".to_string(),
+            }
+        };
+
         let cells = [
             truncate_str(cell_disp, 14),
             vm.vm_id.to_string(),
             truncate_str(name_disp, 24),
+            tier_disp,
             vm.pid.to_string(),
             ram_disp,
             vm.chrs.to_string(),

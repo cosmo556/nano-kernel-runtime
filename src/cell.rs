@@ -373,6 +373,29 @@ pub fn cell_compose_path(name: &str) -> PathBuf {
     cells_dir().join(&key).join("nkr-compose.yml")
 }
 
+/// Nombre del template community: `<cell>-odoo-template`. Source default para
+/// `edition=community` (o sin edition explícita). Cada cell debe tener uno.
+pub fn cell_template_community_name(cell_name: &str) -> String {
+    format!("{}-odoo-template", cell_name)
+}
+
+/// Nombre del template enterprise: `<cell>-odoo-template-enterprise`. Source
+/// default para `edition=enterprise` (v1.6.5+). El operador siembra este
+/// template una vez por cell instalando `web_enterprise` desde la UI sobre un
+/// clone del community template. Si la cell no tiene este template, los
+/// `POST /instances edition=enterprise` devuelven `409 enterprise_template_missing`.
+pub fn cell_template_enterprise_name(cell_name: &str) -> String {
+    format!("{}-odoo-template-enterprise", cell_name)
+}
+
+/// True si el `nkr_name` es uno de los templates oficiales del cell. Usado por
+/// `handle_create` (v1.6.5+) para decidir si rotar admin/admin (sí, para
+/// templates) o si rechazar `admin_user_password` (sí, para clones-from-tenant).
+pub fn is_template_name(cell_name: &str, nkr_name: &str) -> bool {
+    nkr_name == cell_template_community_name(cell_name)
+        || nkr_name == cell_template_enterprise_name(cell_name)
+}
+
 /// Directory of a cell
 #[allow(dead_code)]
 pub fn cell_dir(name: &str) -> PathBuf {
@@ -689,6 +712,13 @@ fn append_compose_block(
     balloon_idle_mb_override: Option<u32>,
     balloon_decay_secs_override: Option<u32>,
     include_enterprise: bool,
+    // v1.6.5+: si `start_disabled=true`, el bloque se escribe con `disabled: true`
+    // → `nkr compose up -d` no lo levanta. Caso de uso: cold-prepared (sin
+    // admin_user_password). El panel después llama `POST /actions {start}` que
+    // flippea a `false` y arranca. Antes, todos los clones tenían `disabled:
+    // false` forzado → un create-with-pwd posterior arrancaba todos los cold
+    // hermanos sin pedido (visto en testing 2026-05-13).
+    start_disabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compose_path = cell_compose_path(&cell.name);
     if !compose_path.exists() {
@@ -761,6 +791,24 @@ fn append_compose_block(
     let mut has_skip_warmup = false;
     let mut has_ram = false;
     let mut has_chrs = false;
+    // Healthcheck override (v1.6.5): el template hereda `initial_delay: 30`
+    // que en cold-cell scenarios bloquea readiness 30s aunque el tenant esté
+    // listo en 5s. Reescribimos a `initial_delay: 3, interval: 1, retries: 30`
+    // → techo del wait baja de 140s a 43s, happy-case sin cambio (early-exit
+    // por NKR-READY de algún vecino sigue funcionando). Aplica sólo al bloque
+    // healthcheck del servicio (indent 4, claves a indent 6).
+    let mut in_healthcheck = false;
+    // Environment dedup (v1.6.5): el bloque del source puede traer env vars
+    // que también vienen en `extra_env` — caso típico clone-from-tenant donde
+    // el source heredó `NKR_RENAME_FILESTORE_*` de su propio clone original.
+    // Sin dedup, terminamos con la misma key dos veces (primero la inyectada,
+    // después la del source). YAML lo parsea como map → la 2ª gana → el
+    // tenant nuevo aplicaría `from: db-<template>` cuando debería ser `from:
+    // db-<source>`. Track `in_environment` y skipear las keys que ya están
+    // en extra_env.
+    let extra_env_keys: std::collections::HashSet<&str> =
+        extra_env.iter().map(|(k, _)| k.as_str()).collect();
+    let mut in_environment = false;
     // v1.5.x guarantee: every Odoo instance born from a clone must have the
     // balloon active. Balloon is essential for density — without it a cell
     // with 20 tenants will exhaust host RAM. If the src_block doesn't carry
@@ -834,11 +882,15 @@ fn append_compose_block(
         }
         if trimmed.starts_with("disabled:") {
             // El template tiene `disabled: true` por design (no debe arrancar
-            // nunca solo). Pero los clones SÍ deben arrancar — heredar el flag
-            // dejaría al nuevo tenant apagado para siempre. Forzar `false`.
+            // nunca solo). Para clones: si `start_disabled=true` (cold-prepared,
+            // sin admin_user_password) preservamos `disabled: true`; si no,
+            // forzamos `false` para que el create con admin_user_password
+            // levante la VM. El panel flippea via POST /actions {start} cuando
+            // quiere arrancar un cold-prepared.
             let indent_len = lines[block_start + idx].len() - lines[block_start + idx].trim_start().len();
             let indent_str = " ".repeat(indent_len);
-            new_block.push(format!("{}disabled: false", indent_str));
+            let flag = if start_disabled { "true" } else { "false" };
+            new_block.push(format!("{}disabled: {}", indent_str, flag));
             continue;
         }
         if trimmed.starts_with("environment:") {
@@ -850,6 +902,59 @@ fn append_compose_block(
                 new_block.push(format!("{}{}: \"{}\"", inner_indent, k, v));
             }
             env_section_injected = true;
+            in_environment = true;
+            continue;
+        }
+        // Healthcheck rewrite — al entrar al bloque marcamos `in_healthcheck`
+        // hasta salir (siguiente clave al nivel del servicio, indent ≤ 4 + ':').
+        // Mientras estemos adentro, reescribimos initial_delay/interval/retries.
+        // Mantenemos `port:` original (necesario para detectar :8069 vs :5432).
+        let svc_key_indent = {
+            // El header del servicio (idx==0) está a indent 2; sus claves a indent 4.
+            // Cualquier línea con indent == 4 + ':' al final ES otra key del servicio
+            // → salimos del healthcheck.
+            let l = &lines[block_start + idx];
+            let ind = l.len() - l.trim_start().len();
+            ind
+        };
+        if in_environment {
+            // Aún dentro si el indent es > 4 (entradas anidadas indent 6 o más).
+            if svc_key_indent > 4 {
+                // Extract key (before the first ':') y dedup contra extra_env.
+                let key_end = trimmed.find(':').unwrap_or(trimmed.len());
+                let key = &trimmed[..key_end];
+                if extra_env_keys.contains(key) {
+                    // Skip: ya inyectamos la versión correcta arriba.
+                    continue;
+                }
+                // Otras env vars (DB_HOST, DB_PORT, DB_USER, etc.) pasan tal cual.
+            } else {
+                in_environment = false;
+            }
+        }
+        if in_healthcheck {
+            // Aún dentro si el indent es > 4 (claves anidadas como port: 8069 etc.).
+            if svc_key_indent > 4 {
+                if trimmed.starts_with("initial_delay:") {
+                    new_block.push(format!("      initial_delay: 3"));
+                    continue;
+                }
+                if trimmed.starts_with("interval:") {
+                    new_block.push(format!("      interval: 1"));
+                    continue;
+                }
+                if trimmed.starts_with("retries:") {
+                    new_block.push(format!("      retries: 30"));
+                    continue;
+                }
+                // port: + otros pasan tal cual.
+            } else {
+                in_healthcheck = false;
+            }
+        }
+        if trimmed.starts_with("healthcheck:") {
+            in_healthcheck = true;
+            new_block.push(s);
             continue;
         }
         // Migración legacy: si el template todavía tiene addons como `volume`
@@ -1314,7 +1419,7 @@ pub fn clone_instance_with_opts(
         append_compose_block(&cell, src_nkr, dst_nkr, dst_vm_id, &extra_env,
             opts.ram_mb, opts.chrs, opts.balloon_mb,
             opts.balloon_idle_mb, opts.balloon_decay_secs,
-            include_enterprise)?;
+            include_enterprise, opts.start_disabled)?;
     } else {
         eprintln!("[NKR-CLONE] no_compose=true: añade el bloque al nkr-compose.yml manualmente.");
     }
@@ -1466,6 +1571,12 @@ pub struct CloneOptions {
     /// Tier del tenant (production/staging/dev). Se propaga a meta.json,
     /// odoo.conf (dev_mode/log_level) y vhost (rate-limit/cache off).
     pub tier: Tier,
+    /// Si `true`, el bloque del compose se escribe con `disabled: true`
+    /// → la VM no arranca cuando alguien corre `nkr compose up -d`.
+    /// La API lo setea para clones COLD-PREPARED (sin admin_user_password).
+    /// El panel arranca después vía `POST /actions {start}`, que flippea
+    /// el flag a `false` antes de levantar la VM. v1.6.5+.
+    pub start_disabled: bool,
 }
 
 impl Default for InstanceMode {
@@ -2175,7 +2286,7 @@ pub fn delete_instance(nkr_name: &str, drop_db: bool) -> Result<String, Box<dyn 
     let running = crate::state::list_vms().into_iter().find(|v| v.name == nkr_name);
     if let Some(vm) = running {
         eprintln!("[NKR-DELETE] Deteniendo VM '{}' (PID {})...", nkr_name, vm.pid);
-        if let Err(e) = crate::state::stop_vm(vm.vm_id) {
+        if let Err(e) = crate::state::stop_vm(vm.cell_id, vm.vm_id) {
             eprintln!("[NKR-DELETE] WARN: stop_vm falló: {} — intentando por nombre", e);
             if let Err(e2) = crate::state::stop_vm_by_name(nkr_name) {
                 eprintln!("[NKR-DELETE] WARN: stop_vm_by_name también falló: {} (continuando)", e2);
@@ -2265,6 +2376,100 @@ fn drop_database(cell_id: u8, nkr_name: &str) -> Result<(), Box<dyn std::error::
     }
     eprintln!("[NKR-DELETE] DB '{}' eliminada en {}:5432", db_name, db_ip);
     Ok(())
+}
+
+/// Flippea `disabled: true|false` en el bloque del compose de un tenant.
+/// Idempotente: si la línea ya tiene el valor pedido, no escribe nada.
+/// Si el bloque no tiene `disabled:` lo agrega después del header. v1.6.5+.
+///
+/// Usado por `POST /actions {start}` cuando arranca un cold-prepared (flip a
+/// false antes del `nkr compose up -d`), y simétricamente por `stop` no (el
+/// stop deja el bloque como está → un compose up futuro lo levantaría; pero
+/// el operador puede stop+start otra vez, no necesita re-disable).
+pub fn set_compose_block_disabled(
+    cell_name: &str,
+    nkr_name: &str,
+    disabled: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let compose_path = cells_dir().join(cell_name).join("nkr-compose.yml");
+    if !compose_path.exists() {
+        return Err(format!("no existe {}", compose_path.display()).into());
+    }
+    let content = fs::read_to_string(&compose_path)?;
+    let lines: Vec<&str> = content.lines().collect();
+
+    let mut blk_start: Option<usize> = None;
+    let mut blk_end: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("nkr_name:") {
+            let rhs = trimmed.trim_start_matches("nkr_name:").trim().trim_matches('"').trim_matches('\'');
+            if rhs == nkr_name {
+                for j in (0..=i).rev() {
+                    let l = lines[j];
+                    if l.len() >= 3
+                        && l.starts_with("  ") && !l.starts_with("   ")
+                        && l.trim_end().ends_with(':')
+                        && !l.trim_start().starts_with('-')
+                    {
+                        blk_start = Some(j);
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    let start = blk_start.ok_or_else(|| format!("bloque '{}' no encontrado en compose", nkr_name))?;
+    for i in (start + 1)..lines.len() {
+        let l = lines[i];
+        let is_service_header = l.len() >= 3
+            && l.starts_with("  ") && !l.starts_with("   ")
+            && l.trim_end().ends_with(':')
+            && !l.trim_start().starts_with('-')
+            && !l.trim_start().starts_with('#');
+        let is_top_level = !l.is_empty() && !l.starts_with(' ') && !l.starts_with('#');
+        if is_service_header || is_top_level {
+            blk_end = Some(i);
+            break;
+        }
+    }
+    let end = blk_end.unwrap_or(lines.len());
+
+    let want = if disabled { "true" } else { "false" };
+    let mut new_lines: Vec<String> = Vec::with_capacity(lines.len());
+    let mut found_disabled = false;
+    let mut changed = false;
+    for (i, l) in lines.iter().enumerate() {
+        if i >= start && i < end {
+            let t = l.trim_start();
+            if t.starts_with("disabled:") {
+                found_disabled = true;
+                let indent_len = l.len() - t.len();
+                let indent = " ".repeat(indent_len);
+                let new_line = format!("{}disabled: {}", indent, want);
+                if new_line != *l { changed = true; }
+                new_lines.push(new_line);
+                continue;
+            }
+        }
+        new_lines.push(l.to_string());
+    }
+    // Si el bloque no tenía `disabled:` y queremos `false`, no hace falta inyectarlo
+    // (default del compose es habilitado). Si queremos `true` y no estaba, inyectamos
+    // después del header.
+    if !found_disabled && disabled {
+        new_lines.insert(start + 1, format!("    disabled: true"));
+        changed = true;
+    }
+    if !changed {
+        return Ok(false);
+    }
+    let _bak = backup_compose_with_rotation(&compose_path);
+    fs::write(&compose_path, new_lines.join("\n") + "\n")?;
+    eprintln!("[NKR-COMPOSE] disabled: {} aplicado a '{}' en {}",
+        want, nkr_name, compose_path.display());
+    Ok(true)
 }
 
 fn remove_compose_block(cell: &CellConfig, nkr_name: &str) -> Result<(), Box<dyn std::error::Error>> {

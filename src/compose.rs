@@ -159,37 +159,26 @@ fn default_chrs() -> u32 { 1 }
 const PID_FILE: &str = "/tmp/nkr-compose.pid";
 const LOG_DIR: &str = "logs";
 const LOG_NAME: &str = "nkr-compose.log";
-const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
-const LOG_KEEP: u32 = 3;                      // keep 3 rotated (.1 .2 .3)
 const SNAPSHOT_DIR: &str = ".nkr/snapshots";
 
 // =============================================================================
-// Log rotation — Rotates logs when they exceed LOG_MAX_BYTES
+// Log path resolution (per-invocation files, v1.6.5+)
 // =============================================================================
+//
+// Hasta v1.6.4, todos los `nkr compose up -d` compartían un único archivo
+// `logs/nkr-compose.log`. Cada invocación lo truncaba con `File::create`, pero
+// los daemons orphan de invocaciones previas (PPID=1 tras systemctl restart
+// nkr) mantenían sus fds heredados con offsets antiguos → escribían en medio
+// del archivo nuevo y garblaban las líneas [NKR-READY] del create actual.
+// El parent's readiness wait timeouteaba a 140s aunque la VM estaba lista en
+// ~5s. v1.6.5+ usa `nkr-compose-<ts_ms>.log` por invocación + un symlink
+// `nkr-compose.log → ...` para back-compat de operadores haciendo `tail -f`.
+// Housekeeping: 5 logs per-invocación más recientes; el resto se borra.
 
 fn resolve_log_dir(yaml_path: &str) -> std::path::PathBuf {
     let yaml = std::path::Path::new(yaml_path);
     let base = yaml.parent().unwrap_or_else(|| std::path::Path::new("."));
     base.join(LOG_DIR)
-}
-
-fn rotate_logs(log_path: &std::path::Path) {
-    if !log_path.exists() { return; }
-    if let Ok(meta) = fs::metadata(log_path) {
-        if meta.len() < LOG_MAX_BYTES { return; }
-    }
-    let base = log_path.to_string_lossy().to_string();
-    // Remove the oldest
-    let oldest = format!("{}.{}", base, LOG_KEEP);
-    let _ = fs::remove_file(&oldest);
-    // Rotate .2→.3, .1→.2, etc.
-    for i in (1..LOG_KEEP).rev() {
-        let from = format!("{}.{}", base, i);
-        let to = format!("{}.{}", base, i + 1);
-        let _ = fs::rename(&from, &to);
-    }
-    // Current → .1
-    let _ = fs::rename(log_path, format!("{}.1", base));
 }
 
 fn canonical_or_self(path: &Path) -> PathBuf {
@@ -468,18 +457,76 @@ fn resolve_snapshot_dir(yaml_dir: &Path) -> PathBuf {
 
 pub fn compose_up(yaml_path: &str, detach: bool) -> Result<(), Box<dyn std::error::Error>> {
     let log_dir = resolve_log_dir(yaml_path);
-    let log_path = log_dir.join(LOG_NAME);
+    // Compat name "nkr-compose.log" sigue siendo el path que ven los operadores
+    // para `tail -f`. Lo usamos como symlink al log per-invocación más reciente
+    // (v1.6.5+, fix del orphan-log-interleaving). Antes era el archivo físico
+    // compartido por TODAS las invocaciones del daemon → tras varios creates
+    // con orphans supervisando VMs viejas, sus fds heredados con offsets
+    // antiguos sobreescribían las líneas [NKR-READY] del create nuevo, lo que
+    // hacía que el parent's readiness wait timeoutee a los 140s aunque la VM
+    // estaba lista en ~5s.
+    let compat_log_path = log_dir.join(LOG_NAME);
 
     // ── Daemon mode: re-launch as a background process ──
     if detach {
         fs::create_dir_all(&log_dir)
             .map_err(|e| format!("No se pudo crear '{}': {}", log_dir.display(), e))?;
-        rotate_logs(&log_path);
+
+        // Log per-invocación: cada `compose up -d` escribe a su propio archivo.
+        // Los orphans de invocaciones previas (sus fds apuntando al archivo
+        // viejo, ahora distinto inode si rotamos el symlink) NO interfieren.
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let log_path = log_dir.join(format!("nkr-compose-{}.log", ts_ms));
 
         let exe = std::env::current_exe().unwrap_or_else(|_| "nkr".into());
         let log = fs::File::create(&log_path)
             .map_err(|e| format!("No se pudo crear log '{}': {}", log_path.display(), e))?;
         let log_err = log.try_clone()?;
+
+        // Apuntar el compat symlink `nkr-compose.log` al nuevo per-invocación.
+        // Operadores que hacen `tail -f logs/nkr-compose.log` siempre ven la
+        // invocación más reciente. Si querés ver una vieja, lista
+        // `logs/nkr-compose-*.log` ordenado por mtime.
+        // El reemplazo es best-effort: si el symlink existe pero apunta a
+        // otra cosa (archivo regular, dir, etc.), lo dejamos y solo
+        // garantizamos que el nuevo file exista.
+        let _ = fs::remove_file(&compat_log_path); // ignora si no existe
+        let target_basename = std::path::Path::new(&log_path)
+            .file_name()
+            .map(|n| std::path::PathBuf::from(n))
+            .unwrap_or_else(|| log_path.clone());
+        if let Err(e) = std::os::unix::fs::symlink(&target_basename, &compat_log_path) {
+            eprintln!("[NKR-COMPOSE] WARN: no pude crear symlink compat \
+                '{}' → '{}': {} (no fatal, el log per-invocación funciona)",
+                compat_log_path.display(), target_basename.display(), e);
+        }
+
+        // Housekeeping: borrar logs per-invocación viejos. Conservamos los 5
+        // más recientes para forensics + el currente. Cada log típicamente
+        // pesa <100 KB tras un compose up sano; tras un timeout ~3.5 MB con
+        // sparse. 5 archivos = ~20 MB worst case.
+        if let Ok(entries) = fs::read_dir(&log_dir) {
+            let mut per_invocation: Vec<(std::path::PathBuf, std::time::SystemTime)> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let path = e.path();
+                    let fname = path.file_name()?.to_string_lossy().to_string();
+                    if fname.starts_with("nkr-compose-") && fname.ends_with(".log") {
+                        let mtime = e.metadata().and_then(|m| m.modified()).ok()?;
+                        Some((path, mtime))
+                    } else { None }
+                })
+                .collect();
+            per_invocation.sort_by(|a, b| b.1.cmp(&a.1));
+            for (old, _) in per_invocation.into_iter().skip(5) {
+                if old != log_path {
+                    let _ = fs::remove_file(&old);
+                }
+            }
+        }
 
         // setsid() in the child: creates a new session, disconnects from the
         // controlling terminal so SIGHUP at terminal close doesn't kill the VMs.
@@ -648,6 +695,16 @@ pub fn compose_up(yaml_path: &str, detach: bool) -> Result<(), Box<dyn std::erro
         services.retain(|(_, s)| !s.disabled);
     }
 
+    // Idempotency hint para el regen-loop de abajo (v1.6.5+): VMs ya activas
+    // tienen su initramfs viejo cargado en RAM — regenerar el archivo en disco
+    // es waste de I/O (no se aplica hasta el próximo restart, y para una VM
+    // viva eso es decisión del operador). Skipearlo evita tormenta de regen
+    // post-deploy (binary_mtime > initramfs_mtime → en un cell con 10 VMs
+    // serializa 10 regens × ~10s = 100s de retraso en el siguiente
+    // `nkr compose up -d`). El first create post-deploy baja de 145s a ~25s.
+    let active_vm_names_for_regen: std::collections::HashSet<String> =
+        state::list_vms().iter().map(|v| v.name.clone()).collect();
+
     // Resolve paths: look up local first, then central store (NKR_DATA_DIR)
     for (name, svc) in &mut services {
         // Resolve disks (local → central images/)
@@ -695,29 +752,40 @@ pub fn compose_up(yaml_path: &str, detach: bool) -> Result<(), Box<dyn std::erro
         );
 
         // Auto-regenerate initramfs if it doesn't exist, if the kernel is newer,
-        // or if the NKR binary is newer (changes in generate_init_script)
+        // or if the NKR binary is newer (changes in generate_init_script).
+        // EXCEPT: si la VM ya está activa, su initramfs viejo está en RAM —
+        // regenerar el archivo de disco es waste de I/O hasta el próximo
+        // restart. Skip → first-create-post-deploy de un cell con 10 VMs
+        // activas baja de ~145s a ~25s (sólo regenera la del nuevo tenant).
+        let config_name_for_regen = svc.nkr_name.clone()
+            .unwrap_or_else(|| format!("{}-{}", stack_name, name));
         let kernel_path = svc.kernel.as_deref().unwrap_or("nanolinux");
         let nkr_binary = std::env::current_exe().ok();
-        let needs_regen = match &svc.initramfs {
-            None => true, // Doesn't exist → generate
-            Some(initramfs_path) => {
-                if !Path::new(initramfs_path).exists() {
-                    true // Referenced file doesn't exist → regenerate
-                } else {
-                    let initramfs_mtime = fs::metadata(initramfs_path)
-                        .and_then(|m| m.modified())
-                        .ok();
-                    let kernel_mtime = fs::metadata(kernel_path)
-                        .and_then(|m| m.modified())
-                        .ok();
-                    let binary_mtime = nkr_binary.as_deref()
-                        .and_then(|p| fs::metadata(p).ok())
-                        .and_then(|m| m.modified().ok());
-                    match initramfs_mtime {
-                        None => true,
-                        Some(it) => {
-                            kernel_mtime.map_or(false, |kt| kt > it)
-                                || binary_mtime.map_or(false, |bt| bt > it)
+        let needs_regen = if active_vm_names_for_regen.contains(&config_name_for_regen) {
+            // VM activa → su initramfs ya está en RAM, no regenerar en disco.
+            false
+        } else {
+            match &svc.initramfs {
+                None => true, // Doesn't exist → generate
+                Some(initramfs_path) => {
+                    if !Path::new(initramfs_path).exists() {
+                        true // Referenced file doesn't exist → regenerate
+                    } else {
+                        let initramfs_mtime = fs::metadata(initramfs_path)
+                            .and_then(|m| m.modified())
+                            .ok();
+                        let kernel_mtime = fs::metadata(kernel_path)
+                            .and_then(|m| m.modified())
+                            .ok();
+                        let binary_mtime = nkr_binary.as_deref()
+                            .and_then(|p| fs::metadata(p).ok())
+                            .and_then(|m| m.modified().ok());
+                        match initramfs_mtime {
+                            None => true,
+                            Some(it) => {
+                                kernel_mtime.map_or(false, |kt| kt > it)
+                                    || binary_mtime.map_or(false, |bt| bt > it)
+                            }
                         }
                     }
                 }
@@ -1096,10 +1164,36 @@ except Exception:\n    \
 
     let mut handles = Vec::new();
 
+    // Idempotencia (v1.6.5): VMs ya activas no se re-lanzan. `nkr compose up -d`
+    // disparado por la API para crear UN tenant nuevo no debe tocar los demás —
+    // antes lo hacía y choctan en el socket virtiofsd (`Timeout esperando socket`
+    // → panic en vmm.rs:1012). Detectamos via `state::list_vms()` por nombre;
+    // las VMs ya activas saltan el spawn pero corren healthcheck igual (su puerto
+    // ya está bindeado, el probe pasa al primer intento → [NKR-READY] inmediato).
+    let active_vm_names: std::collections::HashSet<String> = state::list_vms()
+        .iter().map(|v| v.name.clone()).collect();
+
     for (_idx, (name, svc)) in services.into_iter().enumerate() {
         let config_name = svc.nkr_name.clone().unwrap_or_else(|| format!("{}-{}", stack_name, name));
         let vm_id = resolve_service_id_scoped(cell_name.as_deref(), &config_name, svc.id)?;
         let guest_ip = registry::id_to_ip(cell_id, vm_id);
+
+        if active_vm_names.contains(&config_name) {
+            eprintln!("[NKR-COMPOSE] '{}' ya activa (cell={}, id={}, IP={}) — skip launch, healthcheck igual",
+                name, cell_id, vm_id, guest_ip);
+            // Aún encolamos la healthcheck (sin child) para que el [NKR-READY]
+            // aparezca en el log → el readiness wait del invocador se desbloquea.
+            // Usamos un PID placeholder (proceso `true` que muere al instante)
+            // para mantener la estructura de `handles` y `wait()` posterior.
+            let dummy = std::process::Command::new("true")
+                .spawn()
+                .ok();
+            if let Some(child) = dummy {
+                handles.push((name.clone(), vm_id, guest_ip.clone(),
+                    svc.healthcheck.clone(), child, config_name.clone(), svc.skip_warmup));
+            }
+            continue;
+        }
 
         eprintln!("[NKR-COMPOSE] Lanzando '{}' (cell={}, id={}, IP={})",
             name, cell_id, vm_id, guest_ip);
@@ -1393,7 +1487,7 @@ pub fn compose_down(yaml_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            match state::stop_vm(vm.vm_id) {
+            match state::stop_vm(vm.cell_id, vm.vm_id) {
                 Ok(()) => {
                     any_stopped = true;
                     eprintln!("[NKR-COMPOSE] VM {} detenida", vm.vm_id);

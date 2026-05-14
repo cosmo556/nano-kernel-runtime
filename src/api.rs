@@ -123,6 +123,23 @@ pub struct CreateInstanceReq {
     /// quedan disponibles para otros tenants.
     #[serde(default)]
     pub chrs: Option<u32>,
+    /// **Opcional (v1.6.5+).** Si `true`, NKR arranca la VM al final del create
+    /// (compose up + wait :8069). Si `false` o ausente, el create se queda en
+    /// "cold-prepared" — la VM queda registrada pero no se levanta hasta que
+    /// el panel haga `POST /actions {start}`. Default = `admin_user_password.is_some()`
+    /// (back-compat: hasta v1.6.4 mandar pwd implicaba auto-start).
+    ///
+    /// Casos:
+    /// - source es template del cell + `admin_user_password` provisto → rotate
+    ///   admin/admin → arranca (auto_start implícito = true).
+    /// - source es template sin `admin_user_password` → cold-prepared (admin/admin
+    ///   queda; el panel debe rotar antes de exponer). Mandá `auto_start: true`
+    ///   si querés arrancar igualmente sin rotar (no recomendado).
+    /// - source es otro tenant (staging, mode=dev) → `admin_user_password`
+    ///   PROHIBIDO (el clone hereda la pwd del source via TEMPLATE). Usá
+    ///   `auto_start: true` para arrancar el clone tras crearlo.
+    #[serde(default)]
+    pub auto_start: Option<bool>,
 }
 
 /// Recursos derivados a partir del workers count. Single source of truth para
@@ -225,8 +242,13 @@ pub fn derive_resources_for_tier(workers: u32, tier: Tier) -> DerivedResources {
             ram_mb: 1024,
             limit_memory_soft: 600 * 1024 * 1024,
             limit_memory_hard: 700 * 1024 * 1024,
-            balloon_mb: 256,          // ACTIVE (boot): 1024 - 768 = 256 inflados
-            balloon_idle_mb: 768,     // IDLE post-decay: 1024 - 256 = 768
+            // v1.6.5+: ballooning suave igual que dev (boot=0, idle=256). El
+            // perfil viejo (boot=256, idle=768) ahogaba a Odoo: con 1024 RAM −
+            // 768 squeeze IDLE = 256 MB reales, muy por debajo del hard limit
+            // de 700 MB → al primer pico post-IDLE el guest entraba en swap o
+            // OOM. Ahora boot llega con toda la RAM, decay sólo recupera 256.
+            balloon_mb: 0,
+            balloon_idle_mb: 256,
         },
         Tier::Production => {
             let w = workers.max(1);
@@ -541,6 +563,49 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
         Tier::Dev => InstanceMode::Production,
     };
 
+    // Selección del template default según `edition` (v1.6.5+):
+    //   community → <cell>-odoo-template
+    //   enterprise → <cell>-odoo-template-enterprise (siembra del operador, una
+    //                vez por cell con web_enterprise pre-instalado)
+    // Reglas: cuando el `source` viene del template, NKR rota admin/admin después
+    // del boot. Cuando el source viene de otro tenant (mode=dev / tier=staging),
+    // NKR NO rota — el clone hereda res_users.password del source via TEMPLATE.
+    let want_enterprise = matches!(req.edition, Some(crate::cell::Edition::Enterprise));
+    let default_template = if want_enterprise {
+        crate::cell::cell_template_enterprise_name(&resolved_cell.name)
+    } else {
+        crate::cell::cell_template_community_name(&resolved_cell.name)
+    };
+    let template_error_for = |cell: &str, tpl: &str| {
+        if tpl.ends_with("-odoo-template-enterprise") {
+            IpcResponse::json(409, serde_json::json!({
+                "error": "enterprise_template_missing",
+                "message": format!("La cell '{}' no tiene template enterprise '{}'. El operador debe sembrarlo una vez: clonar el template community, instalar `web_enterprise` desde la UI, marcarlo como template (disabled:true). Sin él, edition=enterprise no se puede crear via API en esta cell.", cell, tpl),
+                "cell": cell,
+                "expected_template": tpl,
+                "hint": "Ver NKR_API.md §4.4 'Sembrar template enterprise' para el runbook completo.",
+            }))
+        } else {
+            IpcResponse::json(409, serde_json::json!({
+                "error": "cell_template_missing",
+                "message": format!("La cell '{}' no tiene template '{}'. Crearlo o reseed la cell.", cell, tpl),
+                "cell": cell,
+                "expected_template": tpl,
+            }))
+        }
+    };
+    let check_template_exists = |tpl: &str| -> Option<IpcResponse> {
+        let tpl_dir = crate::cell::cells_dir()
+            .join(&resolved_cell.name)
+            .join("instances")
+            .join(tpl);
+        if !tpl_dir.exists() {
+            Some(template_error_for(&resolved_cell.name, tpl))
+        } else {
+            None
+        }
+    };
+
     let source = match req.tier {
         Tier::Production => match req.mode {
             InstanceMode::Production => {
@@ -551,20 +616,10 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
                         "cell": resolved_cell.name,
                     }));
                 }
-                let tpl = format!("{}-odoo-template", resolved_cell.name);
-                let tpl_dir = crate::cell::cells_dir()
-                    .join(&resolved_cell.name)
-                    .join("instances")
-                    .join(&tpl);
-                if !tpl_dir.exists() {
-                    return IpcResponse::json(409, serde_json::json!({
-                        "error": "cell_template_missing",
-                        "message": format!("La cell '{}' no tiene template '{}'. Crearlo o reseed la cell.", resolved_cell.name, tpl),
-                        "cell": resolved_cell.name,
-                        "expected_template": tpl,
-                    }));
+                if let Some(resp) = check_template_exists(&default_template) {
+                    return resp;
                 }
-                tpl
+                default_template.clone()
             }
             InstanceMode::Dev => match req.source.clone() {
                 Some(s) => s,
@@ -615,22 +670,26 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
                     "cell": resolved_cell.name,
                 }));
             }
-            let tpl = format!("{}-odoo-template", resolved_cell.name);
-            let tpl_dir = crate::cell::cells_dir()
-                .join(&resolved_cell.name)
-                .join("instances")
-                .join(&tpl);
-            if !tpl_dir.exists() {
-                return IpcResponse::json(409, serde_json::json!({
-                    "error": "cell_template_missing",
-                    "message": format!("La cell '{}' no tiene template '{}'. Crearlo o reseed la cell.", resolved_cell.name, tpl),
-                    "cell": resolved_cell.name,
-                    "expected_template": tpl,
-                }));
+            if let Some(resp) = check_template_exists(&default_template) {
+                return resp;
             }
-            tpl
+            default_template.clone()
         }
     };
+
+    // v1.6.5+: `admin_user_password` está PROHIBIDO en clones-from-tenant. El
+    // clone hereda la pwd del source via CREATE DATABASE TEMPLATE; intentar
+    // change_password con admin/admin falla porque ya no es esa la pwd. El
+    // panel debe omitir el campo cuando source != template.
+    let is_template_clone = crate::cell::is_template_name(&resolved_cell.name, &source);
+    if !is_template_clone && req.admin_user_password.is_some() {
+        return IpcResponse::json(400, serde_json::json!({
+            "error": "admin_user_password_not_applicable_for_clone",
+            "message": format!("source='{}' es otro tenant (no un template del cell). Los clones heredan res_users.password del source via CREATE DATABASE TEMPLATE — NKR no puede rotar la pwd porque admin/admin ya no es válido. Omitir `admin_user_password` del body.", source),
+            "source": source.clone(),
+            "hint": "El panel ya conoce la pwd del source (la generó él mismo cuando lo creó). Usar esa misma pwd para autenticarse contra el clone, o cambiarla post-create vía JSON-RPC.",
+        }));
+    }
 
     let dst_name = ensure_cell_prefix(&resolved_cell.name, &req.nkr_name);
 
@@ -738,10 +797,25 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
         balloon_decay_secs: Some(600),
         skip_db_clone: false,
         tier: req.tier,
+        // Cold-prepared (v1.6.5+): bloque nace `disabled: true` cuando el
+        // panel no pide auto-start. El POST /actions {start} flippea a `false`.
+        // Default de auto_start: presencia de `admin_user_password` (back-compat
+        // con v1.6.4: mandar pwd implicaba arrancar). Para clones-from-tenant
+        // (no aceptan admin_user_password) el panel debe usar `auto_start: true`
+        // explícito.
+        start_disabled: !req.auto_start.unwrap_or(req.admin_user_password.is_some()),
     };
 
-    let admin_user_pwd = req.admin_user_password.clone();
-    let is_enterprise = matches!(req.edition, Some(crate::cell::Edition::Enterprise));
+    // v1.6.5+: decisiones de arranque + rotación de pwd:
+    //  - source==template + admin_user_password → rotate admin/admin (boot_and_set_admin_password).
+    //  - source!=template (clone) + auto_start → solo compose_up_and_wait_ready (sin rotate).
+    //  - cold-prepared (no auto_start) → ni se arranca.
+    let admin_user_pwd = if is_template_clone {
+        req.admin_user_password.clone()
+    } else {
+        None // validado arriba que es None cuando !is_template_clone
+    };
+    let auto_start = req.auto_start.unwrap_or(req.admin_user_password.is_some());
     let cell_name = resolved_cell.name.clone();
 
     // ── Async create (v1.6.4) ──────────────────────────────────────────────
@@ -834,13 +908,21 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
 
             match clone_instance_with_opts(&source_owned, &dst_owned, &opts) {
                 Ok(info) => {
-                    if let Some(new_pwd) = admin_user_pwd {
+                    // v1.6.5: dos paths post-clone:
+                    //  (a) source es template + admin_user_password → rota admin/admin via
+                    //      boot_and_set_admin_password (compose up + login + change_password).
+                    //  (b) auto_start sin admin_user_password → arranca VM sin rotar pwd
+                    //      (clone-from-tenant hereda res_users.password del source).
+                    //  (c) cold-prepared → ni se arranca; el bloque tiene `disabled: true`.
+                    let boot_phase = if let Some(new_pwd) = admin_user_pwd.as_ref() {
+                        // Path (a): rotar pwd implica auto-start. Sólo entramos acá si
+                        // is_template_clone (validado en sync layer).
                         write_status(serde_json::json!({
                             "nkr_name": dst_owned, "cell": cell_owned, "source": source_owned,
                             "status": "provisioning", "phase": "setting_admin_pwd",
                             "started_at": started_at,
                         }));
-                        if let Err(e) = boot_and_set_admin_password(&info, &new_pwd, is_enterprise) {
+                        if let Err(e) = boot_and_set_admin_password(&info, new_pwd) {
                             eprintln!("[API] create({}) async: admin_password_setup_failed: {}", dst_owned, e);
                             write_status(serde_json::json!({
                                 "nkr_name": dst_owned, "cell": cell_owned, "source": source_owned,
@@ -852,15 +934,51 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
                             }));
                             return;
                         }
-                    }
-                    eprintln!("[API] create({}) async ok ({}ms)", dst_owned, t0.elapsed().as_millis());
+                        "setting_admin_pwd"
+                    } else if auto_start {
+                        // Path (b): boot sin rotar. Caso clone-from-tenant + auto_start.
+                        write_status(serde_json::json!({
+                            "nkr_name": dst_owned, "cell": cell_owned, "source": source_owned,
+                            "status": "provisioning", "phase": "starting",
+                            "started_at": started_at,
+                        }));
+                        if let Err(e) = compose_up_and_wait_ready(&info) {
+                            eprintln!("[API] create({}) async: boot_failed: {}", dst_owned, e);
+                            write_status(serde_json::json!({
+                                "nkr_name": dst_owned, "cell": cell_owned, "source": source_owned,
+                                "status": "failed", "phase": "starting",
+                                "error": "boot_failed", "message": e,
+                                "started_at": started_at, "finished_at": now_unix(),
+                                "elapsed_ms": t0.elapsed().as_millis() as u64,
+                                "hint": "El tenant se clonó pero su VM no respondió :8069 en el wait window. Reintentar via POST /actions {start}.",
+                            }));
+                            return;
+                        }
+                        "starting"
+                    } else {
+                        // Path (c): cold-prepared. No boot.
+                        "cold"
+                    };
+
+                    eprintln!("[API] create({}) async ok ({}ms, phase={})",
+                        dst_owned, t0.elapsed().as_millis(), boot_phase);
+
+                    // Refresh info post-boot (v1.6.5): el `info` de clone_instance está
+                    // stale (running:false, port_8069_up:false). Releer para reportar el
+                    // estado real al panel.
+                    let info_fresh = get_instance_info(&dst_owned).ok();
+                    let (running, port_up) = match info_fresh.as_ref() {
+                        Some(i) => (i.nkr_status.running, i.nkr_status.port_8069_up),
+                        None => (info.nkr_status.running, info.nkr_status.port_8069_up),
+                    };
+
                     write_status(serde_json::json!({
                         "nkr_name": dst_owned, "cell": cell_owned, "source": source_owned,
                         "status": "ready", "phase": "done",
                         "started_at": started_at, "finished_at": now_unix(),
                         "elapsed_ms": t0.elapsed().as_millis() as u64,
-                        "running": info.nkr_status.running,
-                        "port_8069_up": info.nkr_status.port_8069_up,
+                        "running": running,
+                        "port_8069_up": port_up,
                         "guest_ip": info.guest_ip,
                         "db_name": info.db_name,
                         "dns": info.dns,
@@ -895,7 +1013,7 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
         "source": source,
         "status": "accepted",
         "async": true,
-        "message": "create despachado en background (30-200s típico; PROD prefork es más lento). Poll GET /api/v1/cells/{cell}/instances/{name}/create-status hasta status=ready|failed, o GET /instances/{name} hasta nkr_status.phase=ready.",
+        "message": "create despachado en background (10-20s típico, community y enterprise — el theme enterprise viene pre-instalado en el template). Poll GET /api/v1/cells/{cell}/instances/{name}/create-status hasta status=ready|failed.",
         "poll": poll_path,
         "started_at": started_at,
     }))
@@ -984,14 +1102,15 @@ fn compose_up_and_wait_ready(info: &crate::cell::InstanceInfo) -> Result<(), Str
 /// Para usuarios que pidieron `admin_user_password` en POST /instances:
 /// (1) `nkr compose up -d` para arrancar el tenant, (2) polling TCP :8069 hasta
 /// que responda, (3) JSON-RPC login admin/admin → res.users.change_password.
-/// Si `is_enterprise=true`, además: (4) `ir.module.module.update_list()` para
-/// registrar manifests de /mnt/extra-enterprise/, y (5) install web_enterprise
-/// para activar el theme enterprise.
-/// Bloquea hasta ~120s + ~3-5min si is_enterprise. Errores propagan al caller.
+/// Bloquea hasta ~120s. Errores propagan al caller.
+///
+/// **Enterprise activation NO se hace acá** (v1.6.5): la instalación de
+/// `web_enterprise` toma 2-5 min y rompía el target de creación en ≤60s. Ahora
+/// vive en `enable_enterprise_async` que se dispara como fase post-ready desde
+/// `handle_create`.
 fn boot_and_set_admin_password(
     info: &crate::cell::InstanceInfo,
     new_pwd: &str,
-    is_enterprise: bool,
 ) -> Result<(), String> {
     // 1+2: compose up + wait :8069 — extraído al helper para que el flow
     // `auto_start=true sin admin_user_password` también lo pueda usar.
@@ -1053,119 +1172,9 @@ fn boot_and_set_admin_password(
     }
     eprintln!("[API] admin user password set para tenant '{}' (uid={:?})",
         info.nkr_name, uid);
-
-    // 5. Si edition=enterprise: registrar manifests del repo enterprise +
-    //    instalar web_enterprise para activar el theme. Sin esto el tenant
-    //    montó la share /mnt/extra-enterprise pero ir_module_module sólo tiene
-    //    los 14 modulos del template + algunos enterprise descubiertos al
-    //    azar. update_list() escanea addons_path y registra TODOS los
-    //    manifests faltantes (~750 entries en v19). Después instalar
-    //    web_enterprise dispara reinstalación de modulos base con el
-    //    overlay enterprise — la UI cambia al theme enterprise.
-    if is_enterprise {
-        if let Err(e) = enable_enterprise_runtime(host, &cookie, &info.nkr_name) {
-            // No es fatal — el tenant queda funcional como community. Loggeamos.
-            // El operador puede ejecutar manualmente "Update Apps List" + Install
-            // Web Enterprise desde la UI.
-            eprintln!("[API] enterprise activation falló para '{}': {} \
-                (tenant funcional como community; activar manual desde UI)",
-                info.nkr_name, e);
-        }
-    }
     Ok(())
 }
 
-/// Ejecuta el flujo de activación de Odoo Enterprise sobre un tenant ya
-/// arrancado y autenticado: update_list (escanea manifests) + install
-/// web_enterprise (cambia theme + dependencias). Tarda 2-5 min.
-fn enable_enterprise_runtime(
-    host: &str,
-    cookie: &str,
-    nkr_name: &str,
-) -> Result<(), String> {
-    // 1. update_list — registra manifests nuevos en ir_module_module.
-    let upd = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "call",
-        "params": {
-            "model": "ir.module.module",
-            "method": "update_list",
-            "args": [],
-            "kwargs": {},
-        }
-    }).to_string();
-    let (code, _, _) = http_post_json(
-        host, 8069, "/web/dataset/call_kw",
-        &upd, Some(cookie), 120,
-    ).map_err(|e| format!("update_list http: {}", e))?;
-    if code != 200 {
-        return Err(format!("update_list status={}", code));
-    }
-    eprintln!("[API] enterprise: update_list OK en '{}'", nkr_name);
-
-    // 2. find web_enterprise id.
-    let find = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "call",
-        "params": {
-            "model": "ir.module.module",
-            "method": "search_read",
-            "args": [
-                [["name", "=", "web_enterprise"]],
-                ["id", "state"],
-            ],
-            "kwargs": {"limit": 1},
-        }
-    }).to_string();
-    let (find_code, _, find_resp) = http_post_json(
-        host, 8069, "/web/dataset/call_kw",
-        &find, Some(cookie), 30,
-    ).map_err(|e| format!("search web_enterprise: {}", e))?;
-    if find_code != 200 {
-        return Err(format!("search status={}", find_code));
-    }
-    let find_json: serde_json::Value = serde_json::from_str(&find_resp)
-        .map_err(|e| format!("search json: {}", e))?;
-    let id = find_json.pointer("/result/0/id").and_then(|v| v.as_i64());
-    let state = find_json.pointer("/result/0/state").and_then(|v| v.as_str())
-        .unwrap_or("").to_string();
-    let id = match id {
-        Some(i) => i,
-        None => return Err("web_enterprise no aparece tras update_list — \
-            ¿el repo enterprise no está descargado en /mnt/nkr/enterprise/<v>?".to_string()),
-    };
-    if state == "installed" {
-        eprintln!("[API] enterprise: web_enterprise ya installed en '{}', skip", nkr_name);
-        return Ok(());
-    }
-
-    // 3. install web_enterprise. Esto bloquea hasta que termine la
-    //    instalación (puede tardar 2-5 min porque arrastra deps).
-    let install = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "call",
-        "params": {
-            "model": "ir.module.module",
-            "method": "button_immediate_install",
-            "args": [[id]],
-            "kwargs": {},
-        }
-    }).to_string();
-    let (inst_code, _, inst_resp) = http_post_json(
-        host, 8069, "/web/dataset/call_kw",
-        &install, Some(cookie), 480,
-    ).map_err(|e| format!("install web_enterprise: {}", e))?;
-    if inst_code != 200 {
-        return Err(format!("install status={}", inst_code));
-    }
-    let inst_json: serde_json::Value = serde_json::from_str(&inst_resp)
-        .map_err(|e| format!("install json: {}", e))?;
-    if inst_json.get("error").is_some() {
-        return Err(format!("install error: {}", inst_json.get("error").unwrap()));
-    }
-    eprintln!("[API] enterprise: web_enterprise installed en '{}' (id={})", nkr_name, id);
-    Ok(())
-}
 
 pub fn handle_get_info(nkr_name: &str) -> IpcResponse {
     if !is_safe_identifier(nkr_name) {
@@ -1462,6 +1471,22 @@ fn start_instance(
         return Ok(());
     }
     let dir = cell_dir.ok_or("no se pudo resolver cell dir para start")?;
+
+    // Cold-prepared (v1.6.5+): si el bloque del compose tiene `disabled: true`
+    // — caso de tenants creados sin `admin_user_password` — flippearlo a
+    // `false` antes del compose up; si no, el filtro de compose lo omitiría.
+    // Idempotente: si ya estaba `false`, no escribe.
+    let cell_name = dir.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if !cell_name.is_empty() {
+        if let Err(e) = crate::cell::set_compose_block_disabled(cell_name, nkr_name, false) {
+            eprintln!("[API] start({}) WARN: no pude flippear disabled→false: {} \
+                (sigo con compose up, si el bloque ya estaba habilitado funciona)",
+                nkr_name, e);
+        }
+    }
+
     let status = Command::new("nkr")
         .current_dir(dir)
         .args(["compose", "up", "-d"])
@@ -1475,7 +1500,7 @@ fn start_instance(
 fn stop_instance(nkr_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let vm = crate::state::list_vms().into_iter().find(|v| v.name == nkr_name);
     match vm {
-        Some(v) => crate::state::stop_vm(v.vm_id),
+        Some(v) => crate::state::stop_vm(v.cell_id, v.vm_id),
         None => Ok(()),
     }
 }
@@ -3909,14 +3934,16 @@ mod tests {
 
     #[test]
     fn derive_resources_staging_tier_fixed_profile() {
-        // STAGING: ram=1024, ACTIVE=256 (boot, ram-768), IDLE=768 (post-decay, ram-256).
+        // STAGING v1.6.5+: ram=1024, balloon suave igual que DEV (boot=0,
+        // idle=256). El perfil viejo (boot=256, idle=768) ahogaba al guest
+        // post-IDLE en picos de carga.
         let r = derive_resources_for_tier(99, Tier::Staging);
         assert_eq!(r.workers, 0);
         assert_eq!(r.ram_mb, 1024);
         assert_eq!(r.limit_memory_soft, 600 * 1024 * 1024);
         assert_eq!(r.limit_memory_hard, 700 * 1024 * 1024);
-        assert_eq!(r.balloon_mb, 256);
-        assert_eq!(r.balloon_idle_mb, 768);
+        assert_eq!(r.balloon_mb, 0);
+        assert_eq!(r.balloon_idle_mb, 256);
     }
 
     #[test]

@@ -34,9 +34,13 @@ export TOK="Authorization: Bearer $NKR_API_TOKEN"
 - **Cells hoy disponibles:** `odoo-v17` (PG16 + PgBouncer, Odoo 17.0) y `odoo-v19` (PG16 + PgBouncer, Odoo 19.0). Ambas con 19 slots libres (1 ocupado por el template).
 - **Patrón mental:** cell = rack (versión fija + infra compartida), instancia = tenant.
 - **Cada cell tiene un `<cell>-odoo-template` reservado** como source automático de `mode=production`. Está apagado por default — su DB vive en PG y los archivos en disco; eso basta para clonar. Ver §4.4 "Convención del template".
-- **`POST /instances` es ASÍNCRONO (v1.6.4+)** — valida sync (4xx al toque), despacha el clone en background y devuelve `202`. Deja la VM preparada pero APAGADA (`running: false`) salvo que mandes `admin_user_password` (en cuyo caso el job también arranca el tenant). Secuencia del panel:
+- **`POST /instances` es ASÍNCRONO (v1.6.4+)** — valida sync (4xx al toque), despacha el clone en background y devuelve `202`. **SLA v1.6.5: `status=ready` típico en 10–20 s** en cualquier tier (dev/staging/production) y cualquier edition (community/enterprise — el theme enterprise viene pre-instalado en el template, ver §4.4.2). Defaults de arranque:<br>
+  • Sin `admin_user_password` y sin `auto_start:true` → cold-prepared (VM no arranca; bloque del compose con `disabled: true`). Panel arranca después con `POST /actions {start}`.<br>
+  • Con `admin_user_password` (sólo permitido si source es template del cell) → NKR rota admin/admin → admin/`<tu_pwd>` y arranca el tenant.<br>
+  • Con `auto_start: true` (típico en clones-from-tenant: staging, mode=dev) → arranca el tenant sin tocar credenciales (el clone hereda la pwd del source).<br>
+  Secuencia del panel:
   1. `POST /instances` con `mode=production` (cliente nuevo) o `mode=dev + source` (clone de tenant existente) → `202 {nkr_name, poll}`. **Usar el `nkr_name` devuelto.**
-  2. Poll `GET {poll}` (= `GET /instances/{name}/create-status`) cada 3-5s hasta `status=ready` (o `status=failed` → leer `error`/`message`/`hint`). Ver §4.4.1.
+  2. Poll `GET {poll}` (= `GET /instances/{name}/create-status`) cada 2-3s hasta `status=ready` (o `status=failed` → leer `error`/`message`/`hint`). Ver §4.4.1. Si esperás >60 s sin `ready`, es señal de problema (no de boot lento normal).
   3. `POST /addons/git` / `PUT /pylibs` — opcional, con VM apagada.
   4. `POST /actions {action:"start"}` — devuelve `202` en <50 ms (async desde v1.5.1). El boot real tarda ~30-60 s (PROD prefork más); el panel **debe polear** `GET /instances/{name}` → `nkr_status.phase` hasta `loading|ready`. (Si mandaste `admin_user_password` en el paso 1, el tenant ya quedó arrancado — verificá con el `create-status` que `running=true`.)
   5. Updates posteriores — **la estrategia depende del tier** (ver §7.0):
@@ -131,7 +135,6 @@ Formato `text/plain; version=0.0.4` (Prometheus exposition). Sin auth — pensad
 | `nkr_balloon_mb{vm}` | gauge | RAM inflada en el VirtIO-Balloon (= devuelta al host). Refleja el estado **runtime**: 0 cuando ACTIVE, 256 cuando un tenant DEV decayó a IDLE, etc. Se actualiza en cada transición ACTIVE↔IDLE. |
 | `nkr_dax_savings_mb{vm}` | gauge | Estimación de RAM ahorrada por DAX/virtio-pmem (el page-cache del guest no se duplica en el host): `max(0, ram_allocated − rss − balloon − 50 MB overhead)`. Sólo en VMs con DAX (rootfs virtio-fs/pmem). |
 | `nkr_total_savings_mb{vm}` | gauge | `balloon_mb + dax_savings_mb` por VM. |
-| `nkr_ksm_savings_mb` | gauge | (cluster-level, sin label) RAM ahorrada por KSM. **Siempre 0** — KSM está deshabilitado por doctrina (NKR usa memfd+MAP_SHARED+DAX, no KSM). |
 | `nkr_io_read_bytes{vm}` | counter | Bytes leídos de disco por el proceso VMM (`/proc/<pid>/io`). **Nota**: en tenants Odoo el rootfs es virtio-fs servido por un proceso `virtiofsd` aparte → esas lecturas NO las ve el VMM; este counter sólo cuenta el block device `/var/lib/odoo`, así que suele ser bajo o 0. No es bug — es la fuente de datos. |
 | `nkr_io_write_bytes{vm}` | counter | Bytes escritos a disco por el VMM. Idem nota de arriba (el grueso de escrituras de Odoo a virtio-fs no cuenta acá). |
 | `nkr_net_rx_bytes{vm}` | counter | Bytes recibidos en la interfaz TAP de la VM (tráfico externo→VM). Usar `rate()` en Grafana. |
@@ -283,10 +286,11 @@ El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la 
 | `mode` | `"dev"` (**opcional**) | **Legacy / back-compat.** Cuando `tier=production`: clone de un tenant existente — `source` obligatorio. Para el caso "clonar de producción para testing" usar `tier=staging` (más explícito y aplica config dev). |
 | `cell` | `null` | Auto-selecciona la cell con `odoo_version` match y menos `used_odoos`. |
 | `cell` | `"foo"` | Fuerza esa cell; 409 si versión no matchea o está llena. |
-| `source` | `null` (con `mode=production`) | NKR usa `<cell>-odoo-template` automáticamente. **No mandar source en mode=production**: si lo mandás, 409 `source_not_allowed_in_production`. |
+| `source` | `null` (con `mode=production`) | NKR resuelve **automáticamente** según `edition`: community → `<cell>-odoo-template`, enterprise → `<cell>-odoo-template-enterprise` (v1.6.5+, ver §"Sembrar template enterprise"). **No mandar source en mode=production**: si lo mandás, 409 `source_not_allowed_in_production`. Si el template requerido no existe → 409 `cell_template_missing` (community) o `enterprise_template_missing` (enterprise). |
 | `source` | `"<tenant>"` (con `mode=dev`) | **Obligatorio.** Tenant a clonar (mismo cell). Si falta en `mode=dev` → 400 `source_required`. |
-| `edition` | `"enterprise"` \| `"community"` \| `null` | **Determina si la instancia monta `/mnt/extra-enterprise`** (share del repo enterprise descargado vía 4.11). `community` (o `null`): no se monta y no se incluye en `addons_path` → tenant 100% community. `enterprise`: se monta y se incluye → tenant ve los módulos enterprise. **Cambio post-creación**: para upgrade community→enterprise, el panel debe llamar `PATCH /config` con `addons_path` extendido manualmente más restart; el remount automático no está implementado todavía. |
-| `admin_user_password` | string `[A-Za-z0-9._-]{8,128}` \| `null` | **OPCIONAL.** Password de login del user `admin` del tenant (login web, distinta del `admin_passwd` master). Si se manda, NKR — **en el job background del create async** — además del clone hace: (1) `nkr compose up -d`, (2) polling :8069 hasta TCP up, (3) JSON-RPC login `admin/admin` (la default heredada del template) → `res.users.change_password`. El resultado aparece en `create-status` (§4.4.1): `status=ready` con `phase=done` si todo OK, o `status=failed` con `error=admin_password_setup_failed` (el tenant queda clonado y arrancado pero sigue con `admin/admin`). Si se omite: el job solo clona — el panel debe luego `POST /actions {start}` y opcionalmente cambiar la password vía JSON-RPC manual. **Recomendado siempre mandarla en producción** para cerrar la ventana de `admin/admin`. |
+| `edition` | `"enterprise"` \| `"community"` \| `null` | **v1.6.5+ semántica:** determina cuál template usar como source default. `enterprise` → `<cell>-odoo-template-enterprise` (con `web_enterprise` pre-instalado). `community` o `null` → `<cell>-odoo-template`. La activación del theme **NO se hace runtime** (eliminada en v1.6.5) — viene horneada en el template. Para clones-from-tenant (`mode=dev`/`tier=staging`), `edition` no aplica (el clone hereda del source). |
+| `admin_user_password` | string `[A-Za-z0-9._-]{8,128}` \| `null` | **OPCIONAL — pero las reglas cambiaron en v1.6.5:**<br>• **Source es template del cell** (community o enterprise): si se manda, NKR rota admin/admin → admin/`<tu_pwd>` post-boot (compose up + JSON-RPC login + `res.users.change_password`). Implícitamente activa `auto_start`. Si se omite: tenant queda cold-prepared (admin/admin remains — el panel debe rotar vía UI/JSON-RPC antes de exponer).<br>• **Source es otro tenant** (clone-from-tenant): **PROHIBIDO** — 400 `admin_user_password_not_applicable_for_clone`. El clone hereda `res_users.password` del source vía `CREATE DATABASE TEMPLATE`; intentar rotar con admin/admin falla porque ya no es esa la pwd. Si querés arrancar el clone, usá `auto_start: true`. El panel ya conoce la pwd del source (la generó él mismo). |
+| `auto_start` | `bool` \| `null` (v1.6.5+) | **Default:** `admin_user_password.is_some()` (back-compat). Si `true`, NKR arranca la VM al final del create (compose up + wait :8069). Si `false` o ausente sin pwd, el create se queda cold-prepared (`disabled: true` en el bloque del compose) hasta que el panel haga `POST /actions {start}`. Usar `auto_start: true` explícito en clones-from-tenant donde `admin_user_password` está prohibido. |
 | `python_libs` | `[]` | Si no vacío: 500 hoy (requiere rebuild del master ext4 — pendiente). |
 | `workers` | int `1..=16` \| `null` | **Solo aplica a `tier=production`** (en staging/dev se ignora — workers se fuerza a 0). Default `2` si null. NKR deriva chrs+ram+balloon (compose) y limit_memory_soft/hard (odoo.conf) de este valor — ver tabla abajo. |
 | `balloon_mb` | int `0..` \| `null` | **OPCIONAL.** Override del VirtIO-Balloon. Si `null` (recomendado), NKR aplica el default derivado de `workers` (ver tabla). Si se manda valor explícito, ese valor reemplaza al default. `0` desactiva el balloon (no recomendado para Odoo en cells densas). Subirlo más allá del default agresivo (40 % de la RAM) puede provocar OOM-killer del guest bajo picos de carga (imports, generación de PDF, install/upgrade de módulos). |
@@ -397,16 +401,24 @@ Devuelve el estado del job background lanzado por `POST /instances`. El status f
 { "nkr_name":"odoo-v17-cliente-42", "cell":"odoo-v17", "source":"odoo-v17-odoo-template",
   "status":"provisioning", "phase":"cloning", "started_at":1778512345 }
 ```
-`phase` ∈ `cloning` → `setting_admin_pwd` (solo si mandaste `admin_user_password`) → `done`.
+`phase` ∈ `cloning` → (`setting_admin_pwd` si rota pwd | `starting` si auto_start sin pwd | nada si cold) → `done`. Si `status:failed`, `phase` indica dónde paró: `cloning` (clone falló), `setting_admin_pwd` (rotar pwd falló), `starting` (boot/wait :8069 falló).
 
 **Respuesta 200 — terminado OK:**
 ```json
 { "nkr_name":"odoo-v17-cliente-42", "cell":"odoo-v17", "source":"odoo-v17-odoo-template",
-  "status":"ready", "phase":"done", "started_at":1778512345, "finished_at":1778512520,
-  "elapsed_ms":175000, "running":true, "port_8069_up":true,
+  "status":"ready", "phase":"done", "started_at":1778512345, "finished_at":1778512360,
+  "elapsed_ms":15000, "running":true, "port_8069_up":true,
   "guest_ip":"10.0.1.7", "db_name":"db-odoo-v17-cliente-42", "dns":"cliente-42.systemouts.com" }
 ```
-(`running`/`port_8069_up` reflejan el estado al cierre del job; si mandaste `admin_user_password` el tenant ya quedó arrancado, si no `running` será `false` — el panel arranca después con `POST /actions {start}`.)
+
+> **🆕 v1.6.5 — `running`/`port_8069_up` reflejan el ESTADO REAL al cierre del job.** Antes (1.6.4) se reportaba el snapshot pre-boot del `info` devuelto por el clone → siempre `running:false` aunque la VM estuviera arriba, lo que confundía al panel. Ahora NKR releé `get_instance_info` después de `boot_and_set_admin_password` y reporta el estado verdadero.
+
+> **SLA de creación 10–60s (v1.6.5):** Para community (tier=dev/staging/production), `status=ready` aparece típicamente en **10–20 s** independiente del tier:
+> - Clone: 3 s (reflink + CREATE DATABASE TEMPLATE)
+> - Boot Odoo (con DB ya inicializada por TEMPLATE): 5–7 s threaded, 7–10 s prefork
+> - HTTP poll `/web/database/list` + JSON-RPC `change_password`: 2–4 s
+>
+> Si `edition=enterprise`, ver §4.4.2 — el `status=ready` llega igual en 10–20 s y la activación del theme corre en una fase post-ready independiente que el panel puede mostrar como progreso pero NO bloquear la UX del create.
 
 **Respuesta 200 — falló:**
 ```json
@@ -471,6 +483,64 @@ Cada cell tiene **un instance reservado** llamado `<cell>-odoo-template` que NKR
 **Por qué `production` es ahora rápido:** NKR clona la DB del template via `CREATE DATABASE ... TEMPLATE` (CoW a nivel filesystem PG, ~5 segundos). Cuando Odoo arranca, encuentra la DB ya inicializada y sólo carga workers — boot completo en ~30-60 s para workers=0, más para PROD prefork (workers≥2: master forkea N workers HTTP + 1 cron, cada uno carga el registry completo → puede llegar a ~140s, justo el límite del readiness wait de `nkr compose up`; por eso el create es async, ver arriba). Si en cambio `mode=production` no copiara la DB, Odoo arrancaría contra una DB vacía y se autoinicializaría (cargando `base` desde XML/CSV) → 3-5 minutos. Ese era el comportamiento previo a v1.6.
 
 > Lista completa de errores (síncronos y asíncronos): ver arriba en §4.4 ("Errores síncronos" / "Errores asíncronos") y §4.4.1.
+
+### 4.4.2 Sembrar template enterprise (runbook del operador, v1.6.5+)
+
+Cada cell que vaya a soportar `edition=enterprise` necesita un **segundo template** llamado `<cell>-odoo-template-enterprise` con `web_enterprise` pre-instalado. Sin él, `POST /instances edition=enterprise` devuelve **409 `enterprise_template_missing`**.
+
+**Por qué este modelo (vs activación en runtime):** Instalar `web_enterprise` toma 2–5 min y dispara `update_list()` sobre ~750 manifests del repo enterprise. Hasta v1.6.4, NKR lo hacía en cada create → frágil (Bug F: en muchos casos `web_enterprise` no aparecía tras `update_list`), lento (rompía SLA 60 s), y no testeable (resultado variable per-instancia). v1.6.5+ mueve la instalación al template — se hace **una sola vez por cell**, el operador la prueba bien, y todos los clones nacen O(1) vía `CREATE DATABASE … TEMPLATE`.
+
+**Runbook (una vez por cell, ej. `odoo-v19`):**
+
+```bash
+# 1. Clonar el template community a un instance temporal (con auto_start).
+curl -sS -X POST $NKR/api/v1/cells/odoo-v19/instances \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"nkr_name":"ent-tpl-build","odoo_version":"19.0","tier":"production",
+       "edition":"community","workers":1,
+       "admin_passwd":"<gen 16-128 chars>", "admin_user_password":"<gen 8-128>"}'
+# Poll create-status hasta status=ready.
+
+# 2. Login a la UI del nuevo tenant (vía https://<dns> o /nkr-sso), Apps →
+#    Update Apps List → Install Web Enterprise. Tarda 2–5 min.
+#    Verificar /web/login muestra theme enterprise.
+
+# 3. Parar la VM.
+curl -sS -X POST $NKR/api/v1/cells/odoo-v19/instances/odoo-v19-ent-tpl-build/actions \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"action":"stop"}'
+
+# 4. Promoción a template (edición manual del cell por el operador):
+#    a) Renombrar la DB en PG:
+sudo -u postgres psql -c \
+  "ALTER DATABASE \"db-odoo-v19-ent-tpl-build\" RENAME TO \"db-odoo-v19-odoo-template-enterprise\";"
+#    b) Renombrar el dir de la instancia:
+sudo mv /mnt/nkr/cells/odoo-v19/instances/odoo-v19-ent-tpl-build \
+        /mnt/nkr/cells/odoo-v19/instances/odoo-v19-odoo-template-enterprise
+#    c) Editar /mnt/nkr/cells/odoo-v19/nkr-compose.yml:
+#       - Cambiar nkr_name: "odoo-v19-ent-tpl-build" → "odoo-v19-odoo-template-enterprise"
+#       - Setear disabled: true (no debe arrancar nunca solo, igual que el template community)
+#       - balloon_mb: 128 (no necesita más, idem template community)
+#       - Actualizar las rutas de disks/volumes/shares del bloque al nuevo nombre.
+#    d) Renombrar el archivo del state (si la VM fue activa en algún momento):
+sudo rm /tmp/nkr-vms/c<cell_id>-v<vm_id>.json  # ya no aplica, idempotente.
+
+# 5. Verificación: a partir de ahora, POST /instances edition=enterprise en
+#    odoo-v19 resuelve source automáticamente al template enterprise y los
+#    creates duran 10–20s igual que community. Probarlo con un tenant test.
+```
+
+**Validar después:**
+```bash
+nkr ps                  # NO debe listar odoo-v19-odoo-template-enterprise (disabled:true).
+curl -sS $NKR/api/v1/cells | jq '.cells[] | select(.name=="odoo-v19")'
+# El template enterprise NO debe contarse en `used_odoos` distinto del community
+# (ambos son `disabled: true`, ambos cuentan 1 slot del max=20).
+```
+
+**Errores comunes:**
+- 409 `enterprise_template_missing` tras crear el dir/DB pero no editar el compose → la API resuelve source por presencia del bloque en compose YAML, no del dir solo. Asegurar paso 4c.
+- Tenants enterprise creados ANTES de seedear el template (legacy v1.6.4): siguen funcionales pero sin theme. Activar manual via UI (Update Apps List → Install Web Enterprise) per-tenant; o borrar y recrear ahora que el template existe.
 
 ### 4.5 `POST /api/v1/cells/{cell}/instances` — Crear forzando cell
 

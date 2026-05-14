@@ -11,7 +11,6 @@
 //   /proc/{pid}/status → VmRSS: real physical RAM on the host
 //   /proc/{pid}/io     → bytes read/written to disk
 //   /proc/net/dev      → RX/TX bytes per TAP interface
-//   /sys/kernel/mm/ksm → kernel same-page merging state
 // =============================================================================
 
 use std::collections::HashMap;
@@ -78,23 +77,6 @@ pub struct VmMetrics {
     /// charged to the VM's cgroup (VMM + helper processes). More complete than
     /// `rss_mb` (which is the VMM process only).
     pub cgroup_mem_bytes: u64,
-}
-
-/// State of the kernel KSM subsystem
-#[derive(Debug, Default)]
-pub struct KsmStatus {
-    /// KSM active (1) or stopped (0)
-    pub running: bool,
-    /// Unique pages currently shared (each one substitutes N copies)
-    pub pages_shared: u64,
-    /// Total pages pointing to a shared one (real savings = pages_sharing - pages_shared)
-    pub pages_sharing: u64,
-    /// Pages evaluated but not shareable (unique by content)
-    pub pages_unshared: u64,
-    /// ms between page scans
-    pub sleep_ms: u64,
-    /// Pages scanned per cycle
-    pub pages_to_scan: u64,
 }
 
 // =============================================================================
@@ -367,82 +349,6 @@ pub fn measure_all(vms: &[VmState]) -> Vec<VmMetrics> {
 }
 
 // =============================================================================
-// KSM — Kernel Same-page Merging
-// =============================================================================
-
-const KSM_BASE: &str = "/sys/kernel/mm/ksm";
-
-fn ksm_read(file: &str) -> u64 {
-    fs::read_to_string(format!("{}/{}", KSM_BASE, file))
-        .unwrap_or_default()
-        .trim()
-        .parse()
-        .unwrap_or(0)
-}
-
-fn ksm_write(file: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if !std::path::Path::new(KSM_BASE).exists() {
-        return Err("KSM no disponible en este kernel (CONFIG_KSM no compilado)".into());
-    }
-    fs::write(format!("{}/{}", KSM_BASE, file), value)?;
-    Ok(())
-}
-
-/// Reads the current KSM state
-pub fn ksm_status() -> KsmStatus {
-    if !std::path::Path::new(KSM_BASE).exists() {
-        return KsmStatus::default();
-    }
-    KsmStatus {
-        running: ksm_read("run") == 1,
-        pages_shared: ksm_read("pages_shared"),
-        pages_sharing: ksm_read("pages_sharing"),
-        pages_unshared: ksm_read("pages_unshared"),
-        sleep_ms: ksm_read("sleep_millisecs"),
-        pages_to_scan: ksm_read("pages_to_scan"),
-    }
-}
-
-/// Enables KSM with parameters optimized for multiple Odoo VMs.
-/// With 20 identical Odoos per cell, aggressive values reduce the convergence
-/// time from ~10 min to ~1 min. ksmd consumes 5-10% of a core while scanning,
-/// acceptable because it's bounded (already-merged pages stay merged).
-pub fn ksm_enable() -> Result<(), Box<dyn std::error::Error>> {
-    ksm_write("pages_to_scan", "5000")?;
-    ksm_write("sleep_millisecs", "10")?;
-    ksm_write("run", "1")?;
-    Ok(())
-}
-
-/// Disables KSM (already-shared pages unshare gradually)
-pub fn ksm_disable() -> Result<(), Box<dyn std::error::Error>> {
-    ksm_write("run", "0")?;
-    Ok(())
-}
-
-/// Prints KSM state to the console
-pub fn print_ksm_status() {
-    if !std::path::Path::new(KSM_BASE).exists() {
-        eprintln!("[KSM] No disponible en este kernel");
-        return;
-    }
-    let s = ksm_status();
-    let page_kb = 4u64; // 4 KB pages on x86_64
-    let saved_kb = s.pages_sharing.saturating_sub(s.pages_shared) * page_kb;
-    let saved_mb = saved_kb / 1024;
-
-    eprintln!(
-        "[KSM] estado={} | compartidas={} | ahorro≈{}MB | sin_compartir={} | escaneo={}p/{}ms",
-        if s.running { "ACTIVO" } else { "detenido" },
-        s.pages_sharing,
-        saved_mb,
-        s.pages_unshared,
-        s.pages_to_scan,
-        s.sleep_ms,
-    );
-}
-
-// =============================================================================
 // Stats table printing
 // =============================================================================
 
@@ -473,7 +379,6 @@ fn truncate(s: &str, max: usize) -> String {
 pub fn render_prometheus_metrics() -> String {
     use crate::state;
     let vms = state::list_vms();
-    let ksm = ksm_status();
 
     // 50ms window for frequent scrapes (Prometheus default every 15s)
     let metrics = {
@@ -509,9 +414,6 @@ pub fn render_prometheus_metrics() -> String {
                 cgroup_mem_bytes: cg_mem }
         }).collect::<Vec<_>>()
     };
-
-    let page_kb = 4u64;
-    let ksm_savings_mb = ksm.pages_sharing.saturating_sub(ksm.pages_shared) * page_kb / 1024;
 
     let mut out = String::with_capacity(2048);
 
@@ -557,11 +459,6 @@ pub fn render_prometheus_metrics() -> String {
         let total = m.balloon_mb.saturating_add(m.dax_savings_mb);
         out.push_str(&format!("nkr_total_savings_mb{{vm=\"{}\"}} {}\n", vm.name, total));
     }
-
-    // ── ksm_savings_mb ──
-    out.push_str("# HELP nkr_ksm_savings_mb Estimated RAM saved by KSM in MB\n");
-    out.push_str("# TYPE nkr_ksm_savings_mb gauge\n");
-    out.push_str(&format!("nkr_ksm_savings_mb {}\n", ksm_savings_mb));
 
     // ── io_read_bytes ──
     out.push_str("# HELP nkr_io_read_bytes Total bytes read from disk (cumulative)\n");
@@ -988,7 +885,4 @@ pub fn print_stats_table(vms: &[VmState]) {
         "TOTAL  RAM real={}MB  cfg={}MB  -balloon={}MB  -dax={}MB  ({:.1}% ahorro, {} MB)",
         total_rss, total_cfg, total_balloon, total_dax, savings_pct, total_savings,
     );
-
-    eprintln!();
-    print_ksm_status();
 }
