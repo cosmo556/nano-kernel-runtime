@@ -800,11 +800,30 @@ echo "[NKR-{label}] DNS configurado: $NKR_DNS_LIST"
           fi
         fi
       else
-        # Prefork: SIGHUP master → handler respawnea workers
-        if /bin/busybox pkill -HUP -f '/usr/bin/odoo' 2>/dev/null; then
-          echo "[NKR-{label}] REL_OD (workers=$_NKR_W/prefork): SIGHUP master → workers respawneando"
+        # Prefork (workers>0, PROD): SIGHUP al PID DEL MASTER, leído desde
+        # /newroot/tmp/odoo.pid (lo escribe el inner sh del supervisor antes
+        # del exec a python3 — ese mismo PID se conserva post-exec y es el
+        # master prefork cuando workers>0). Master handler hace kill_workers
+        # + respawn con código fresh. Workers no necesitan HUP (los relanza
+        # el master). No usamos `pkill -HUP -f` porque busybox/initramfs
+        # matching cmdline es inconsistente (mismo bug que motivó el fix de
+        # threaded en v1.6.9 — ver rama de arriba). Fallback a pkill -f sólo
+        # si el PID file falta (caso edge de crash pre-exec).
+        _odoo_pid=$(/bin/busybox cat /newroot/tmp/odoo.pid 2>/dev/null)
+        _dbg "REL_OD: prefork — leyendo /newroot/tmp/odoo.pid → '$_odoo_pid'"
+        if [ -n "$_odoo_pid" ] && /bin/busybox kill -0 "$_odoo_pid" 2>/dev/null; then
+          _dbg "REL_OD: master PID $_odoo_pid vivo, enviando SIGHUP"
+          /bin/busybox kill -HUP "$_odoo_pid" 2>/dev/null
+          _kc=$?
+          _dbg "REL_OD: kill -HUP rc=$_kc"
+          echo "[NKR-{label}] REL_OD (workers=$_NKR_W/prefork): SIGHUP master PID $_odoo_pid → workers respawneando"
         else
-          echo "[NKR-{label}] REL_OD: master Odoo no encontrado (skip)"
+          _dbg "REL_OD: prefork — PID file ausente/stale (val='$_odoo_pid'), fallback a pkill -HUP -f"
+          if /bin/busybox pkill -HUP -f '/usr/bin/odoo' 2>/dev/null; then
+            echo "[NKR-{label}] REL_OD (workers=$_NKR_W/prefork): SIGHUP via pkill -f (fallback, sin PID file)"
+          else
+            echo "[NKR-{label}] REL_OD: master Odoo no encontrado (skip)"
+          fi
         fi
       fi
       continue

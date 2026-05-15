@@ -3733,7 +3733,7 @@ pub fn handle_reload_workers(nkr_name: &str) -> IpcResponse {
     IpcResponse::json(202, serde_json::json!({
         "nkr_name": nkr_name,
         "status": "accepted",
-        "mechanism": "SIGUSR1 → vmm → hvc0 REL_OD → guest reload Odoo (SIGHUP master si prefork, SIGTERM+respawn si threaded)",
+        "mechanism": "SIGUSR1 → vmm → hvc0 REL_OD → guest watcher (SIGKILL PID exacto si threaded ~5–8s, SIGHUP master PID exacto si prefork ~1–2s)",
         "estimated_seconds": 3,
         "note": "Odoo recarga con código fresh del disco. Sin downtime de la VM."
     }))

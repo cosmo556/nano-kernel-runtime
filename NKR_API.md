@@ -1856,7 +1856,12 @@ curl -s -X POST -H "$TOK" -H "Content-Type: application/json" \
 
 ### 4.17.1 `POST /api/v1/cells/{cell}/instances/{nkr_name}/reload` — Reload de workers Odoo (sin reiniciar VM)
 
-**Disponible desde v1.6.2, hardened en v1.6.9.** Recicla los workers HTTP de Odoo del tenant **sin reiniciar la VM ni el master prefork**, garantizando que el código nuevo en disco se cargue. **~5–8 segundos consistente** bajo cualquier carga (sesiones activas, crons en curso), **sin downtime de la VM**.
+**Disponible desde v1.6.2, hardened en v1.6.9 (ambas ramas threaded + prefork).** Recicla Odoo del tenant garantizando que el código nuevo en disco se cargue, **sin downtime de la VM**. Tiempos por tier:
+
+| tier | workers | tiempo | mecánica |
+|---|---|---|---|
+| DEV / STAGING | 0 (threaded) | **~5–8 s consistente** | SIGKILL al python3 → supervisor respawn → Odoo boot completo |
+| PRODUCTION | ≥1 (prefork) | **~1–2 s** | SIGHUP al master → master respawnea workers (master vivo) |
 
 **Por qué existe** (background técnico):
 
@@ -1903,9 +1908,15 @@ Soluciones consideradas y descartadas:
 - En **threaded** (workers=0), el reload mata el proceso entero — el supervisor loop de `nkr-start.sh` (`while true; do exec odoo; sleep 1; done`) lo respawnea inmediato. Estado en memoria se pierde (no hay master).
 - En **prefork** (workers>0), el master Odoo NUNCA se reinicia — solo los workers. Master mantiene caches, conexiones IAP, etc.
 
-> ✅ **Arreglado (v1.6.4) + hardened (v1.6.9):**
-> - **v1.6.4** introdujo el dispatch del watcher hvc0 (lee `workers = N` del `odoo.conf` y elige rama). SIGTERM en threaded, SIGHUP master en prefork.
-> - **v1.6.9** sustituyó el SIGTERM-y-esperar por **SIGKILL directo al PID exacto** (el supervisor escribe `echo \$\$ > /tmp/odoo.pid` antes del exec a python3, el watcher lo lee y hace `kill -KILL $pid`). Razón: con sesiones activas (websocket abierto, cron en curso) el handler SIGTERM de Odoo entraba en "Initiating shutdown" indefinidamente — bug observado 2026-05-15 (commit deploy colgaba 180s+). SIGKILL en threaded es seguro (no hay master que preservar) y el supervisor respawnea con código fresh en ~1s. **Prefork sigue con SIGHUP master**, sin cambios (graceful, master vivo). Verificado: `POST /reload` → `:8069` vuelve en **~5-8s consistente** bajo cualquier carga.
+> ✅ **Arreglado (v1.6.4) + hardened (v1.6.9, ambas ramas):**
+> - **v1.6.4** introdujo el dispatch del watcher hvc0 (lee `workers = N` del `odoo.conf` y elige rama). SIGTERM en threaded, SIGHUP master en prefork — ambos via `pkill -f '/usr/bin/odoo'`.
+> - **v1.6.9 (rama threaded, DEV/STAGING)** sustituyó el SIGTERM-y-esperar por **SIGKILL directo al PID exacto**: el supervisor escribe `echo \$\$ > /tmp/odoo.pid` antes del `exec` a python3 (ese PID se conserva post-exec), el watcher lee `/newroot/tmp/odoo.pid` y hace `kill -KILL $pid`. Razón: con sesiones activas (websocket + cron) el handler SIGTERM de Odoo entraba en "Initiating shutdown" indefinidamente (bug 2026-05-15: commit deploy colgaba 180s+). SIGKILL en threaded es seguro (no hay master que preservar) y el supervisor respawnea con código fresh en ~1s.
+> - **v1.6.9 (rama prefork, PRODUCTION)** aplica el mismo patrón: `kill -HUP` al PID exacto del master (mismo `/newroot/tmp/odoo.pid` — funciona porque el inner shell del supervisor escribe `$$` y el `exec` a python3 hereda ese PID como master prefork). Antes usaba `pkill -HUP -f '/usr/bin/odoo'` que tiene comportamiento inconsistente en busybox/initramfs contexts (mismo bug que motivó el fix threaded). Master maneja SIGHUP → kill_workers + respawn — código fresh sin downtime perceptible.
+> - **Tiempos verificados (2026-05-15) por tier:**
+>   - DEV (workers=0): `~5–8 s` (SIGKILL + supervisor respawn + Odoo boot + 72 módulos custom).
+>   - STAGING (workers=0): idem.
+>   - PRODUCTION (workers≥2): **`~1–2 s`** — el master sobrevive, sólo respawnea workers que toman <1s en levantar.
+> - Fallback `pkill -f` se conserva como red de seguridad (sólo se ejecuta si `/newroot/tmp/odoo.pid` falta — caso edge de crash pre-exec del inner shell).
 > - Diagnóstico vivo: cada paso del watcher se loguea a `<instance>/logs/nkr-watcher.log` (virtio-fs share visible desde host, `tail -f`-able). Útil para diagnosticar reloads lentos sin shell al guest.
 > - Para que un tenant ya corriendo recoja el fix: un `POST /actions {restart}` regenera su initramfs con la versión nueva del binario NKR.
 
@@ -1967,7 +1978,7 @@ La response indica `"reloaded": false, "reload_skipped_reason": "auto_reload=fal
 
 | Estrategia | Tiempo | Downtime VM | Downtime master Odoo | Refresca TODOS los workers |
 |------------|--------|-------------|----------------------|----------------------------|
-| `POST /reload` (recomendado) | **~5–8 s** consistente | NO | NO (sólo workers, master vivo en prefork) | ✅ |
+| `POST /reload` (recomendado) | DEV/STG: **~5–8 s** consistente · PROD: **~1–2 s** | NO | NO (sólo workers, master vivo en prefork) | ✅ |
 | `POST /modules/upgrade` (multi-worker) | 10-15 s | NO | NO | ❌ (solo el worker upgrader) |
 | `POST /actions {restart}` (tier=dev) | ~13 s | sí (~10s) | sí | ✅ |
 | `POST /actions {restart}` (tier=production) | ~20-30 s | sí (~25s) | sí | ✅ |
