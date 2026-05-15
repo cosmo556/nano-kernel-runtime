@@ -735,9 +735,24 @@ echo "[NKR-{label}] DNS configurado: $NKR_DNS_LIST"
                | /bin/busybox awk -F= '{{gsub(/[[:space:]]/, "", $2); print $2}}' \
                | /bin/busybox head -n1)
       if [ -z "$_NKR_W" ] || [ "$_NKR_W" = "0" ]; then
-        # Threaded: kill + supervisor respawn
+        # Threaded: SIGTERM + grace 5s + SIGKILL fallback → supervisor respawn.
+        # Bug 2026-05-15 en intech-devp: con usuario logueado (websocket activo)
+        # + cron en curso, Odoo entró en "Initiating shutdown" y nunca completó
+        # el exit graceful → REL_OD colgado >60s → watchdog mataba la VM entera.
+        # Fix: si SIGTERM no surte efecto en 5s, escalamos a SIGKILL. El
+        # supervisor loop respawnea con código fresh en ~1s.
         if /bin/busybox pkill -TERM -f '/usr/bin/odoo' 2>/dev/null; then
-          echo "[NKR-{label}] REL_OD (workers=0/threaded): SIGTERM → supervisor loop respawn"
+          echo "[NKR-{label}] REL_OD (workers=0/threaded): SIGTERM → esperando 5s"
+          _w=0
+          while /bin/busybox pgrep -f '/usr/bin/odoo' >/dev/null 2>&1 && [ $_w -lt 5 ]; do
+            sleep 1; _w=$((_w+1))
+          done
+          if /bin/busybox pgrep -f '/usr/bin/odoo' >/dev/null 2>&1; then
+            /bin/busybox pkill -KILL -f '/usr/bin/odoo' 2>/dev/null
+            echo "[NKR-{label}] REL_OD: SIGKILL fallback tras 5s (Odoo no respondió a SIGTERM)"
+          else
+            echo "[NKR-{label}] REL_OD: Odoo terminó graceful en ${{_w}}s"
+          fi
         else
           echo "[NKR-{label}] REL_OD: proceso Odoo no encontrado (skip)"
         fi
