@@ -1696,6 +1696,41 @@ fn read_forward_lines(path: &str, start: u64, max_lines: usize, max_bytes: usize
 // Module install / upgrade / uninstall — vía Odoo JSON-RPC
 // =============================================================================
 
+/// Reemplaza ocurrencias de `secret` (case-sensitive) dentro de cualquier
+/// string del JSON `v` por `***REDACTED***`. Útil para sanitizar tracebacks
+/// de Odoo antes de devolverlos al panel — Odoo a veces incluye los args
+/// de la llamada XMLRPC (incluido admin_password) en el `traceback` del
+/// `error` JSON-RPC. Auditoría 2026-05-15.
+///
+/// Caminamos recursivamente por todo el árbol JSON. No mutamos el original
+/// — devolvemos una copia limpia. Si el secret está vacío o demasiado corto
+/// (<4 chars), no hacemos nada para evitar falsos positivos masivos.
+fn scrub_secret(v: &serde_json::Value, secret: &str) -> serde_json::Value {
+    if secret.len() < 4 {
+        return v.clone();
+    }
+    match v {
+        serde_json::Value::String(s) => {
+            if s.contains(secret) {
+                serde_json::Value::String(s.replace(secret, "***REDACTED***"))
+            } else {
+                v.clone()
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(|e| scrub_secret(e, secret)).collect())
+        }
+        serde_json::Value::Object(obj) => {
+            let mut new_obj = serde_json::Map::new();
+            for (k, val) in obj {
+                new_obj.insert(k.clone(), scrub_secret(val, secret));
+            }
+            serde_json::Value::Object(new_obj)
+        }
+        _ => v.clone(),
+    }
+}
+
 pub fn handle_modules_action(
     nkr_name: &str,
     op: &str,
@@ -1815,7 +1850,7 @@ pub fn handle_modules_action(
     if let Some(err) = search_val.get("error") {
         return IpcResponse::json(502, serde_json::json!({
             "error": "odoo_search_rpc_error",
-            "detail": err,
+            "detail": scrub_secret(err, admin_password),
         }));
     }
     let found = search_val.get("result").and_then(|r| r.as_array())
@@ -1884,7 +1919,7 @@ pub fn handle_modules_action(
         return IpcResponse::json(500, serde_json::json!({
             "error": format!("odoo_{}_failed", op),
             "elapsed_ms": elapsed_ms,
-            "detail": err,
+            "detail": scrub_secret(err, admin_password),
             "modules": modules,
         }));
     }
@@ -2039,6 +2074,23 @@ pub fn handle_create_dns(nkr_name: &str, dns: &str, enable_ws: bool) -> IpcRespo
     if !is_safe_dns(dns) {
         return IpcResponse::error(400, "invalid_dns", None);
     }
+
+    // Inflight protection (audit 2026-05-15): el flow toma certbot (~30s) +
+    // nginx reload. Sin lock, dos POST /dns concurrentes para el mismo
+    // tenant podían pisar el vhost (race en `nginx -t` y certbot rollback
+    // borrando el symlink del otro). Key específico de DNS para no
+    // colisionar con start/stop/etc.
+    let inflight_key = format!("dns:{}", nkr_name);
+    let _guard = {
+        let mut set = match inflight_actions().lock() {
+            Ok(s) => s, Err(p) => p.into_inner(),
+        };
+        if !set.insert(inflight_key.clone()) {
+            return IpcResponse::error(409, "dns_in_progress",
+                Some("Ya hay un POST /dns en vuelo para este tenant — reintente cuando termine"));
+        }
+        InflightActionGuard(inflight_key)
+    };
 
     let info = match get_instance_info(nkr_name) {
         Ok(i) => i,
@@ -2319,6 +2371,22 @@ pub fn handle_init_db(
         || admin_password.bytes().any(|b| matches!(b, b'\n' | b'\r' | 0)) {
         return IpcResponse::error(400, "invalid_admin_password", None);
     }
+
+    // Inflight protection (audit 2026-05-15): /web/database/create de Odoo
+    // toma ~30-60s. Sin lock, dos POST /init-db concurrentes podían disparar
+    // dos creates paralelos al mismo DB → race en `database already exists`
+    // + estado del status file no determinista.
+    let inflight_key = format!("init_db:{}", nkr_name);
+    let _guard = {
+        let mut set = match inflight_actions().lock() {
+            Ok(s) => s, Err(p) => p.into_inner(),
+        };
+        if !set.insert(inflight_key.clone()) {
+            return IpcResponse::error(409, "init_db_in_progress",
+                Some("Ya hay un init-db en vuelo para este tenant — pollee GET ../init-db-status"));
+        }
+        InflightActionGuard(inflight_key)
+    };
 
     let info = match get_instance_info(nkr_name) {
         Ok(i) => i,
@@ -3178,14 +3246,20 @@ fn reject_psql_query(q: &str) -> Option<&'static str> {
     None
 }
 
-fn audit_psql(nkr_name: &str, db_name: &str, query: &str) {
+/// Loguea una entrada del audit log de `/api/v1/.../psql`. Formato TSV:
+///   `<unix_ts>\t<nkr_name>\t<db_name>\t<status>\t<query_truncado>`
+/// `status` es "ACCEPT" para queries que pasaron el filtro o "REJECT:<razón>"
+/// para los bloqueados. Hardenización 2026-05-15: antes sólo se logueaban
+/// las queries aceptadas → ataques a través de queries rechazadas eran
+/// invisibles en el audit log. Ahora ambas categorías quedan persistidas.
+fn audit_psql(nkr_name: &str, db_name: &str, query: &str, status: &str) {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs()).unwrap_or(0);
     let truncated: String = query.chars().take(1024).collect();
-    let line = format!("{t}\t{nkr_name}\t{db_name}\t{}\n",
+    let line = format!("{t}\t{nkr_name}\t{db_name}\t{status}\t{}\n",
         truncated.replace('\n', " ").replace('\t', " "));
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true).append(true)
@@ -3201,6 +3275,10 @@ pub fn handle_psql(nkr_name: &str, query: &str, max_rows: usize) -> IpcResponse 
         return IpcResponse::error(400, "invalid_nkr_name", None);
     }
     if let Some(reason) = reject_psql_query(query) {
+        // Loguear el intento rechazado al audit log (db_name vacío porque
+        // no resolvimos el tenant aún — pero queremos rastrear quién está
+        // probando queries maliciosas).
+        audit_psql(nkr_name, "", query, &format!("REJECT:{reason}"));
         return IpcResponse::error(400, reason, None);
     }
     // Cap de filas: default 1000, max 10000.
@@ -3217,7 +3295,7 @@ pub fn handle_psql(nkr_name: &str, query: &str, max_rows: usize) -> IpcResponse 
     };
     let pg_ip = format!("10.0.{}.2", cell_id);
 
-    audit_psql(nkr_name, &info.db_name, query);
+    audit_psql(nkr_name, &info.db_name, query, "ACCEPT");
 
     // Ejecutar psql con:
     //   -h <pg_ip> -U odoo -d db-<tenant>
@@ -3446,7 +3524,11 @@ pub fn handle_sso(nkr_name: &str, user: &str) -> IpcResponse {
         Err(e) => return IpcResponse::error(500, "conf_read_failed",
             Some(&format!("{}: {}", info.config_path, e))),
     };
-    let sso_secret = parse_conf_value(&conf, "secret")
+    // `secret` se busca DENTRO de la sección [nkr_sso] (config v1.6.4+). El
+    // fallback legacy `nkr_sso_secret` vive en [options] o sin sección. La
+    // distinción de sección importa: un futuro `secret` en otra sección
+    // (p.ej. [database]) NO debe colisionar con el HMAC SSO.
+    let sso_secret = parse_conf_value_in_section(&conf, "nkr_sso", "secret")
         .or_else(|| parse_conf_value(&conf, "nkr_sso_secret"))
         .unwrap_or_default();
     if sso_secret.is_empty() {
@@ -3491,10 +3573,13 @@ pub fn handle_sso(nkr_name: &str, user: &str) -> IpcResponse {
     }))
 }
 
+/// Lee una clave del odoo.conf ignorando secciones — útil para keys legacy
+/// en `[options]` o sin sección. Para keys que viven en una sección
+/// específica, usar `parse_conf_value_in_section`.
 fn parse_conf_value(conf: &str, key: &str) -> Option<String> {
     for line in conf.lines() {
         let t = line.trim_start();
-        if t.starts_with('#') || t.starts_with(';') {
+        if t.starts_with('#') || t.starts_with(';') || t.starts_with('[') {
             continue;
         }
         if let Some(rest) = t.strip_prefix(key) {
@@ -3508,6 +3593,89 @@ fn parse_conf_value(conf: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Lee una clave dentro de una sección específica `[section]` del odoo.conf.
+/// Hardenización 2026-05-15 post-audit: antes `parse_conf_value` matcheaba
+/// cualquier `key = …` sin importar la sección — riesgo latente de leer
+/// cross-section si un futuro odoo.conf tuviera `secret = X` en `[database]`
+/// además de `[nkr_sso] secret`. Ahora el HMAC SSO lookup es estrictamente
+/// section-scoped.
+///
+/// La cabecera de sección es `[name]` (whitespace adelante permitido,
+/// comentarios `#`/`;` ignorados). El valor se devuelve hasta encontrar
+/// otra cabecera o fin del archivo.
+fn parse_conf_value_in_section(conf: &str, section: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
+    let target = format!("[{}]", section);
+    for line in conf.lines() {
+        let t = line.trim_start();
+        if t.starts_with('#') || t.starts_with(';') {
+            continue;
+        }
+        // Cabecera de sección: [name]
+        if t.starts_with('[') && t.contains(']') {
+            in_section = t.trim_end() == target;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix(key) {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let v = rest.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod conf_parser_tests {
+    use super::*;
+
+    #[test]
+    fn section_aware_finds_in_correct_section() {
+        let conf = "\
+[options]
+admin_passwd = master-pwd
+[nkr_sso]
+secret = aabbcc
+";
+        assert_eq!(parse_conf_value_in_section(conf, "nkr_sso", "secret"),
+                   Some("aabbcc".to_string()));
+        assert_eq!(parse_conf_value_in_section(conf, "options", "admin_passwd"),
+                   Some("master-pwd".to_string()));
+    }
+
+    #[test]
+    fn section_aware_ignores_other_sections() {
+        let conf = "\
+[options]
+secret = wrong-one
+[nkr_sso]
+secret = aabbcc
+";
+        assert_eq!(parse_conf_value_in_section(conf, "nkr_sso", "secret"),
+                   Some("aabbcc".to_string()));
+    }
+
+    #[test]
+    fn section_aware_returns_none_when_section_absent() {
+        let conf = "[options]\nfoo = bar\n";
+        assert_eq!(parse_conf_value_in_section(conf, "nkr_sso", "secret"), None);
+    }
+
+    #[test]
+    fn legacy_parse_skips_section_headers() {
+        let conf = "[options]\nfoo = bar\n[other]\nfoo = baz\n";
+        // legacy parse no debe matchear cabeceras como si fueran keys
+        assert_eq!(parse_conf_value(conf, "foo"), Some("bar".to_string()));
+    }
 }
 
 #[allow(dead_code)]

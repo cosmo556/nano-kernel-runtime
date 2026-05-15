@@ -718,16 +718,14 @@ echo "[NKR-{label}] DNS configurado: $NKR_DNS_LIST"
   _dbg "/dev/hvc0 listo (tras ${{_wct}}*100ms) — entrando al loop while-true"
   _dbg "/dev/hvc0 stat: $(/bin/busybox ls -la /dev/hvc0 2>&1)"
   _nkr_cmd=""
-  # Loop hvc0 con dispatch: el watcher era single-shot (un read → SHUTDOWN
-  # → poweroff). Ahora soporta múltiples comandos:
-  #   SHUTDOWN  → apagado limpio + poweroff (terminal, rompe el loop)
-  #   REL_OD    → recarga Odoo con código fresh del disco según el modo:
-  #               workers>0 (prefork)  → SIGHUP al master (respawnea workers)
-  #               workers=0 (threaded) → SIGTERM al proceso (supervisor loop
-  #               de nkr-start.sh lo relanza). NO termina el loop, sigue
-  #               escuchando hvc0 para próximos comandos.
-  # NKR daemon (host) inyecta REL_OD vía SIGUSR1 al proceso de la VM tras
-  # un addons/git exitoso o cuando el panel llama POST /reload.
+  # Loop hvc0 con dispatch: SHUTDOWN/REL_OD.
+  # NOTA (audit 2026-05-15): probamos `exec 3< /dev/hvc0` + `read <&3` para
+  # mantener el fd persistente — DESCARTADO porque rompía reloads (read no
+  # devolvía con virtio-console + busybox sh + fd persistente). Volvimos al
+  # `read -r ... < /dev/hvc0` per iteración. La rara race del segundo reload
+  # consecutivo (observada 1×/sesión) queda cubierta por el watchdog como
+  # safety net mientras investigamos una mejor solución (futuro: posiblemente
+  # cambiar busybox sh por un binario Rust dedicado para el watcher).
   _iter=0
   while true; do
     _iter=$((_iter+1))

@@ -2569,7 +2569,7 @@ fn run_vcpu_loop(
                 // 1. VirtIO-Net network (0xD0000000)
                 if addr >= 0xD0000000 && addr < 0xD0001000 {
                     let offset = addr - 0xD0000000;
-                    let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap()) } else { 0 };
+                    let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap_or([0;4])) } else { 0 };
                     let sel = net_dev.queue_sel as usize;
                     match offset {
                         0x014 => { net_dev.device_features_sel = val; }
@@ -2627,7 +2627,7 @@ fn run_vcpu_loop(
                         let dev_base = base_block + (i as u64 * 0x1000);
                         if addr >= dev_base && addr < dev_base + 0x1000 {
                             let offset = addr - dev_base;
-                            let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap()) } else { 0 };
+                            let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap_or([0;4])) } else { 0 };
 
                             match offset {
                                 0x014 => { block_dev.device_features_sel = val; }
@@ -2687,7 +2687,7 @@ fn run_vcpu_loop(
                     if addr >= PMEM_MMIO_ADDR && addr < PMEM_MMIO_ADDR + 0x1000 {
                         if let Some(ref mut pmem) = pmem_dev {
                             let offset = addr - PMEM_MMIO_ADDR;
-                            let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap()) } else { 0 };
+                            let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap_or([0;4])) } else { 0 };
                             match offset {
                                 0x014 => { pmem.device_features_sel = val; }
                                 0x020 => {
@@ -2725,7 +2725,7 @@ fn run_vcpu_loop(
                         let dev_base = fs_dev.mmio_addr;
                         if addr >= dev_base && addr < dev_base + 0x1000 {
                             let offset = addr - dev_base;
-                            let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap()) } else { 0 };
+                            let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap_or([0;4])) } else { 0 };
                             let qi = fs_dev.queue_sel.min(1) as usize;
                             match offset {
                                 0x014 => { fs_dev.device_features_sel = val; }
@@ -2772,7 +2772,7 @@ fn run_vcpu_loop(
                     // 7. VirtIO-Balloon (0xD0040000) — MmioWrite (v1.3)
                     if addr >= BALLOON_MMIO_ADDR && addr < BALLOON_MMIO_ADDR + 0x1000 {
                         let offset = addr - BALLOON_MMIO_ADDR;
-                        let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap()) } else { 0 };
+                        let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap_or([0;4])) } else { 0 };
                         let qi = balloon_dev.queue_sel as usize;
                         match offset {
                             0x014 => { balloon_dev.device_features_sel = val; }
@@ -2821,7 +2821,7 @@ fn run_vcpu_loop(
                     // 8. VirtIO-Console (0xD0050000) — MmioWrite
                     if addr >= CONSOLE_MMIO_ADDR && addr < CONSOLE_MMIO_ADDR + 0x1000 {
                         let offset = addr - CONSOLE_MMIO_ADDR;
-                        let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap()) } else { 0 };
+                        let val = if data.len() == 4 { u32::from_le_bytes(data.try_into().unwrap_or([0;4])) } else { 0 };
                         let qi = console_dev.queue_sel as usize;
                         match offset {
                             0x014 => { console_dev.device_features_sel = val; }
