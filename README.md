@@ -78,7 +78,7 @@ cargo build --release
 
 # Install system-wide
 sudo install -m 755 target/release/nkr /usr/local/bin/nkr
-nkr --version   # → nkr 1.3.0
+nkr --version   # → nkr 1.6.9
 
 # Place the nanolinux kernel
 sudo mkdir -p /mnt/nkr/kernel
@@ -345,22 +345,20 @@ All mutating endpoints require `Authorization: Bearer $NKR_API_TOKEN` when the t
 
 ### Example: provision a new tenant (main flow)
 
-A new customer wants a fresh Odoo 17.0. The panel doesn't need to know which cell has room — NKR picks the least-full cell matching the requested version.
+A new customer wants a fresh Odoo 19. The panel doesn't need to know which cell has room — NKR picks the cell with **most free RAM** matching the requested version (version matching is tolerant: `"19"` matches `19.0`).
 
 ```bash
+# API contract v2 (2026-05-15+): minimum body. NKR derives workers/RAM/chrs from tier.
 curl -s -X POST http://localhost:9090/api/v1/instances \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "nkr_name": "customer-42",
-    "mode": "dev",
-    "odoo_version": "17.0",
-    "dns": "customer-42.example.com",
-    "edition": "community",
-    "workers": 2,
-    "list_db": false,
-    "limit_memory_soft": 2147483648,
-    "limit_memory_hard": 2684354560
+    "odoo_version": "19",
+    "tier": "dev",
+    "enterprise": false,
+    "admin_passwd": "16-chars-min-max-128-...",
+    "dns": "customer-42.example.com"
   }'
 ```
 

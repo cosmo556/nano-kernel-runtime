@@ -1,7 +1,7 @@
-# NKR vs Docker — comparativo real (actualizado 2026-05-14, v1.6.5)
+# NKR vs Docker — comparativo real (actualizado 2026-05-15, v1.6.9+)
 
 Comparación medida sobre el host actual (`nkr-master`, Xeon E-2176G 6c/12t, 62 GiB RAM)
-con **21 NKRs vivos** (2 cells de infra + 1 tenant productivo + 18 tenants de testing
+con **22 NKRs vivos** (2 cells de infra + 1 tenant productivo + 19 tenants de testing
 del sprint security/audit-sprint1) vs lo que costaría el mismo stack en Docker
 (`postgres:16`, `edoburu/pgbouncer`, `odoo:17/19` oficial), sin tunning de imagen.
 
@@ -52,9 +52,9 @@ Otros datos del stack hoy:
 
 | Métrica                   | Valor    | Comentario |
 |---------------------------|---------:|------------|
-| Procesos VMM (`nkr run`)  | 23       | 1 por VM (incluye 2 que ya están en stale stop-pending) |
-| `virtiofsd`               | 117      | ~5 por Odoo (rootfs + 4-5 shares: addons, logs, pylibs, overrides, systemouts-addons, enterprise opt) |
-| Compose supervisors       | 23       | 1 por VM, escriben a log per-invocación (Phase 1, v1.6.5) |
+| Procesos VMM (`nkr run`)  | 22       | 1 por VM, todos con **PPid=1 (init)** tras el fix de compose detach |
+| `virtiofsd`               | 122      | ~5 por Odoo (rootfs + 4-5 shares: addons, logs, pylibs, overrides, systemouts-addons, enterprise opt) |
+| Compose supervisors       | **0**    | Tras v1.6.9+ el `nkr compose up -d` sale limpio; antes dejaba 1 proceso colgado por VM (22 supervisors viviendo 12 h sosteniendo pipes — bug crítico de cascada de muerte) |
 | Free disk en `/mnt/nkr`   | 755 GB / 795 GB | btrfs reflink hace clones O(1) en disco |
 | `free -h` total used      | ~8.4 GB  | incluye host services (VS Code Remote, fail2ban, journald, etc.) |
 
@@ -268,7 +268,7 @@ expone `docker logs <container>` (mezcla stdout/stderr de PID 1).
 
 ---
 
-## 6. Avances v1.4 → v1.6.5 (~3 semanas)
+## 6. Avances v1.4 → v1.6.9+ (~3 semanas)
 
 | Versión | Hito principal |
 |---------|----------------|
@@ -280,21 +280,50 @@ expone `docker logs <container>` (mezcla stdout/stderr de PID 1).
 | v1.6.2  | `dev_mode=reload` removido (Bug INOTIFY documentado y cerrado) |
 | v1.6.3  | `dev_mode` vacío forzado en cell.rs::rewrite_odoo_conf_full |
 | v1.6.4  | SSO HMAC + systemouts-addons + async create + guest metrics + balloon stats vq |
-| **v1.6.5** | SLA create ≤60s + multi-cell vm_id safety + KSM legacy cleanup + per-cell enterprise template + TIER column en nkr ps |
+| v1.6.5  | SLA create ≤60s + multi-cell vm_id safety + KSM legacy cleanup + per-cell enterprise template + TIER column en nkr ps |
+| v1.6.6  | balloon device SIEMPRE advertised (fix `guest_mem: null` en tier=production — el panel ya ve la RAM interna real del guest) |
+| v1.6.7  | seccomp whitelist + clone3 / openat2 / faccessat2 / epoll_pwait2 / fchmodat2 (fix crash silencioso de VMs con glibc 2.34+: `audit syscall=435 sig=31`) |
+| v1.6.8  | watchdog threshold 60s → 120s + grace REL_OD-aware 180s (elimina falsos restarts durante deploy de commits con sesiones activas) |
+| **v1.6.9+** | REL_OD via PID file + SIGKILL directo (`commit→reload ~7s` consistente) + `nkr compose up -d` con detach correcto (0 supervisors colgados, todas las VMs `PPid=1`) + contrato API v2 (panel envía body mínimo: `version`+`tier`+`enterprise:bool`, NKR auto-elige cell por RAM libre) |
 
-Cambios v1.6.5 más relevantes para la comparación con Docker:
+Cambios recientes más relevantes para la comparación con Docker:
 
-- **SLA create explícito 10–20 s** documentado en el contrato API.
-- **Per-cell enterprise template**: enterprise tiene el mismo SLA que community
-  (el theme viene pre-sembrado, no se instala runtime).
-- **Per-invocation compose log** elimina el bug de `nkr-compose.log` compartido
-  con sparse holes y overlap de orphan supervisors.
-- **Multi-cell `vm_id` collision fix**: `find_vm`/`stop_vm`/`unregister_vm` ahora
-  scope a `(cell_id, vm_id)`. Antes, `nkr stop <name>` podía matar la VM
-  equivocada en otra cell por colisión de `vm_id`. Bug crítico cerrado.
-- **`nkr ps` con columna `TIER`** (prd/stg/dev) por convención.
-- **KSM legacy removido**: NKR nunca usó realmente KSM (memfd+MAP_SHARED rechaza
-  MADV_MERGEABLE). El CLI `nkr ksm` + métrica + ~150 LOC limpiados.
+- **`commit → reload` en ~7 s consistente.** Antes el ciclo "panel hace git
+  push → NKR rsynkea addons → REL_OD inyectado por hvc0 → Odoo recarga código
+  fresh" tardaba ~3 s en condiciones ideales pero se colgaba 180+ s cuando
+  había websocket activo + cron corriendo (graceful shutdown de Odoo nunca
+  completaba). Fix combinado (PID file escrito por el supervisor + SIGKILL
+  directo del watcher hvc0) lo deja en **5–8 s consistente** bajo cualquier
+  carga. Docker `restart` del contenedor lleva siempre el doble (~15–25 s)
+  porque cae con el master prefork y rearma worker pool de cero.
+- **Compose detach correcto** (zero supervisors colgados): el `nkr compose
+  up -d` ahora sale limpio tras los health checks; las VMs hacen `setsid()`
+  y escriben stdout/stderr **directo al boot log file** (sin pipes al
+  padre). Si systemd reinicia el daemon o algún operador hace `pkill -f
+  'nkr compose'`, las 22 VMs sobreviven (antes era cascada de muerte:
+  matar 1 compose-up → 22 tenants caen).
+- **Contrato API v2 — el panel envía body mínimo:**
+  `{nkr_name, version: "19", tier: "dev", enterprise: false, admin_passwd}`.
+  NKR auto-elige la cell con **más RAM libre** (sum committed ASC), tolera
+  matching major-only (`"19"` ≡ `"19.0"`), ignora `workers` (deriva del
+  tier). Docker no tiene equivalente operativo — cada `docker compose up`
+  es un YAML de mantención por cliente.
+- **Watcher REL_OD instrumentado**: cada paso del watcher hvc0 dentro del
+  guest se logguea a `<instance>/logs/nkr-watcher.log` (virtio-fs share
+  RW), visible desde el host con `tail -f`. Permite diagnosticar el
+  100 % de los reload futuros sin shell al guest. Equivalente Docker:
+  `docker exec -it ... bash` + lectura de PID files manuales.
+- **seccomp clone3 fix (v1.6.7)**: glibc 2.34+ usa `clone3` para thread
+  spawn. El filtro seccomp del NKR daemon no la tenía → `SIGSYS` mataba
+  el daemon silenciosamente bajo carga (incidente intech-devp 2026-05-15,
+  fix retroactivo). Whitelist ampliada para syscalls modernas
+  (`openat2`/`faccessat2`/`epoll_pwait2`/`fchmodat2`).
+- **balloon SIEMPRE advertised (v1.6.6)**: tier=production tenía
+  `guest_mem: null` en el endpoint per-instancia porque el balloon device
+  no se anunciaba cuando `balloon_mb=0 && balloon_idle_mb=0` → el driver
+  del guest no se cargaba → STATS_VQ vacío. Cambio mínimo (ahora siempre
+  advertised, cero costo si no infla) restauró visibilidad de MEMFREE/
+  MEMAVAIL/CACHED del guest. El panel ya muestra "RAM usada" real.
 
 ---
 
@@ -321,28 +350,33 @@ matters** (saas de Odoo, multi-tenant Postgres, ERPs replicados, etc.).
 
 ## 8. Resumen ejecutivo
 
-| Métrica                                | NKR v1.6.5 (real) | Docker (proyectado) |  Ratio   |
+| Métrica                                | NKR v1.6.9+ (real) | Docker (proyectado) |  Ratio   |
 |----------------------------------------|------------------:|--------------------:|---------:|
-| RAM total 21 VMs (configurado)         |       26.6 GB     |     ~32 GB          |    -17%  |
-| RAM total 21 VMs (real, post-balloon+DAX) |    **5.7 GB**  |      ~25 GB         |    -77%  |
+| RAM total 22 VMs (configurado)         |       26.6 GB     |     ~32 GB          |    -17%  |
+| RAM total 22 VMs (real, post-balloon+DAX) |    **5.7 GB**  |      ~25 GB         |    -77%  |
 | **Boot a HTTP-200 (compose up full)**  |        **5 s**    |      30–60 s        |   10–15× |
 | **POST /instances community**          |         **13 s**  |        ~90 s        |     ~7×  |
 | **POST /instances enterprise**         |       **17.6 s**  |  imposible auto     |     —    |
+| **`commit → reload` (panel deploy)**   |        **~7 s**   |      15–25 s        |    ~3×   |
 | Disco rootfs por instancia             |         0 B       |    ~300 MB          |    ∞     |
 | Aislamiento por tenant                 |    VM (KVM)       |  container (NS)     |   ↑      |
 | SLA documentado al cliente             |   10–20 s contractual | ad-hoc          |   ↑      |
 | Densidad proyectada (100 Odoos)        |     40–80 GB      |    160–220 GB       |   -55%   |
-| LoC del orquestador (daemon)           |  19.9 k Rust      |    ~5M+ (Docker+containerd+runc) | —    |
+| LoC del orquestador (daemon)           |  ~20 k Rust       |    ~5M+ (Docker+containerd+runc) | —    |
+| Contrato API (body crear instancia)    |   5 campos        |   YAML per cliente  |   ↑      |
+| Procesos supervisores por VM           |   **0** (PPid=1)  |   1 (containerd-shim) |    —   |
 
-**TL;DR:** para el caso Odoo SaaS multi-tenant, NKR v1.6.5 usa **~1/5 la RAM
+**TL;DR:** para el caso Odoo SaaS multi-tenant, NKR v1.6.9+ usa **~1/5 la RAM
 real**, **~1/7 el tiempo de aprovisionar un tenant**, ofrece un SLA explícito
-de creación (10–20 s contractual, independiente de tier/edition), y agrega
-aislamiento de kernel real — al costo de mantener un orquestador KVM custom
-(~20 k LoC Rust) y un kernel propio. Docker es mejor opción si el workload no
-es replicable o si el equipo no puede operar el stack KVM.
+de creación (10–20 s contractual, independiente de tier/edition), un **deploy
+de commit en ~7 s consistente bajo cualquier carga**, contrato API minimalista
+(5 campos) que el panel maneja sin lógica de orquestación, y aislamiento de
+kernel real — al costo de mantener un orquestador KVM custom (~20 k LoC Rust)
+y un kernel propio. Docker es mejor opción si el workload no es replicable o
+si el equipo no puede operar el stack KVM.
 
 > **Tamaño del orquestador NKR (medido):**
-> - `src/*.rs` (sin bin) → **19 889 líneas** de Rust.
-> - `src/bin/nkr_api_server.rs` → 2 621 líneas adicionales (proxy HTTP unprivileged).
-> - Binario `nkr` (release): 2.5 MB. Binario `nkr-api-server`: 663 KB.
+> - `src/*.rs` (sin bin) → **~20 k líneas** de Rust.
+> - `src/bin/nkr_api_server.rs` → ~2.6 k líneas adicionales (proxy HTTP unprivileged).
+> - Binario `nkr` (release): ~2.5 MB. Binario `nkr-api-server`: ~660 KB.
 > - Sin dependencias C externas — todo userspace en busybox dentro del initramfs.

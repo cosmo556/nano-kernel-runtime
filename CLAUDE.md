@@ -15,7 +15,8 @@ Eres un ingeniero de infraestructura harto de la abstracción innecesaria. Odias
 
 ### 3. El Hachazo de Procesos (Runtime)
 - **10s para SIGTERM:** Cortesía máxima para morir. Si no muere, **SIGKILL**. El tiempo de arranque neto debe ser <15s.
-- **REL_OD vía HVC0:** Único camino para recargar código. **`dev_mode` debe ir vacío** — no `reload` (agota inotify, no funciona en virtio-fs), no `qweb,xml` (activa watchdog interno de Odoo que recompila templates en cada request → CPU spike + cuelgues, lección 2026-05-11). En tier=dev/staging, `cell.rs::rewrite_odoo_conf_full` fuerza `dev_mode =` vacío.
+- **REL_OD vía HVC0 (v1.6.9+):** Único camino para recargar código. **`dev_mode` debe ir vacío** — no `reload` (agota inotify, no funciona en virtio-fs), no `qweb,xml` (activa watchdog interno de Odoo que recompila templates en cada request → CPU spike + cuelgues, lección 2026-05-11). En tier=dev/staging, `cell.rs::rewrite_odoo_conf_full` fuerza `dev_mode =` vacío. **Mecánica del kill (v1.6.9 fix):** el supervisor en `initramfs::generate_init_script` lanza Odoo con `su -c 'echo \$\$ > /tmp/odoo.pid; exec /usr/bin/python3 -u /usr/bin/odoo …'` — el inner shell escribe su PID (= el del python3 tras `exec`) a `/tmp/odoo.pid`. El watcher hvc0 lee `/newroot/tmp/odoo.pid` (el watcher corre fuera del chroot) y hace `kill -KILL $pid` directo, sin `pkill -f` ni grace SIGTERM. SIGKILL es seguro en threaded (no hay master prefork que preservar). Tiempo total commit→reload: **~7 s consistente** (medido bajo carga real con websocket + cron). Diagnóstico vivo: cada paso del watcher se loguea a `<instance>/logs/nkr-watcher.log` (virtio-fs share visible desde host).
+- **`nkr compose up -d` con detach correcto (v1.6.9+):** las VMs spawned hacen `setsid()` y escriben stdout/stderr **directo al boot log file** (Stdio::from(File), no pipes). El compose process sale limpio tras los health checks → todas las VMs quedan con `PPid=1` (init). Antes (bug pre-v1.6.9) cada `nkr compose up -d` quedaba colgado para siempre en `child.wait()` sosteniendo pipes; un `pkill -f 'nkr compose'` mataba TODAS las VMs en cascada. Verificación: `for p in $(pgrep -f 'nkr run'); do awk '/^PPid:/ {print $2}' /proc/$p/status; done | grep -c '^1$'` debe igualar el número de VMs activas.
 
 ## 🚀 Git & Addons: Plan C — Replace per-módulo + trash sibling (v2.10)
 
@@ -57,12 +58,14 @@ Eres un ingeniero de infraestructura harto de la abstracción innecesaria. Odias
 | POST | `/api/v1/cells/{cell}/instances/{name}/sso` | Emite URL HMAC TTL 30s. Body: `{"user": "<login>"}` (default `admin`). |
 | GET/POST | `/api/v1/cells/{cell}/instances/{name}/diag` | Captura HOST-side stacks/wchan/cpu de threads del proceso `nkr` del tenant (text/plain, ~50ms, idempotente). Usado pre-restart para forensics. |
 
-## 🛡️ Watchdog (v1.6.3+) — **actualmente DESHABILITADO**
+## 🛡️ Watchdog (v1.6.3+, REL_OD-aware desde v1.6.8) — **ACTIVO**
 
-`src/watchdog.rs` — thread del daemon. Cada 15s sondea TCP `:8069` por tenant `running`. Tras `HUNG_THRESHOLD_SECS=60` consecutivos sin respuesta, dispara `restart` automático vía `api::handle_action`. Bypass: env var `NKR_WATCHDOG_DISABLED=1`.
+`src/watchdog.rs` — thread del daemon. Cada `PROBE_INTERVAL_SECS=15` sondea TCP `:8069` por tenant `running`. Tras `HUNG_THRESHOLD_SECS=120` consecutivos sin respuesta, dispara `restart` automático vía `api::handle_action`. Bypass: env var `NKR_WATCHDOG_DISABLED=1`.
 
-- **Estado actual (2026-05-12): DESHABILITADO** — `Environment=NKR_WATCHDOG_DISABLED=1` en `/etc/systemd/system/nkr.service` (a pedido, mientras el panel pushea cambios activamente y los auto-restart interferían). Para re-habilitarlo: borrar esa línea + `systemctl daemon-reload && systemctl restart nkr`. **Con el watchdog off, un cuelgue de tenant a las 3am no se auto-recupera** — queda para el operador/panel.
-- Diseñado para correr 24/7. Costo: una probe TCP per running tenant cada 15s, negligible. Cubre cuelgues residuales (workers Odoo, kernel D-state, etc.). Probado 2026-05-11: detección 0s, restart auto a 68s. Funciona como diseñado.
+- **Estado actual (2026-05-15): HABILITADO**. Threshold subido 60s → 120s en v1.6.8 tras observar falsos positivos durante deploys legítimos (REL_OD con websockets activos + cron en curso podía tardar 60+s en Odoo "Initiating shutdown" en v1.6.4 antes del fix de SIGKILL directo).
+- **Grace REL_OD-aware (v1.6.8)**: `api::handle_reload_workers` llama a `watchdog::note_reload(nkr_name)` justo después de inyectar SIGUSR1. Durante los siguientes `RELOAD_GRACE_SECS=240`, el threshold efectivo sube a `RELOAD_THRESHOLD_SECS=180` (en vez de 120) — cubre el peor caso del deploy sin retrasar detección de cuelgues reales en VMs ociosas.
+- **Combinado con el fix de v1.6.9** (REL_OD via `/tmp/odoo.pid` escrito por supervisor + SIGKILL directo del watcher hvc0, ver §Gestión de Procesos), un commit deploy completa el ciclo en ~7s consistente — MUY por debajo del threshold de 120s/180s. El watchdog solo dispara en cuelgues reales (Odoo D-state, kernel deadlock, etc.).
+- Costo: una probe TCP per running tenant cada 15s, negligible.
 
 ## 🩺 Boot console por instancia (v1.6.4)
 
