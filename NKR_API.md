@@ -237,22 +237,35 @@ El panel lo usa para: (a) discovery inicial, (b) decidir si hace falta crear una
 
 ### 4.4 `POST /api/v1/instances` — Crear con auto-selección de cell
 
-El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la cell menos llena que matchee.
+El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la cell con **más RAM libre** que matchee la versión.
 
-**Body:**
+> **Contrato v2 (2026-05-15+).** El panel ahora puede mandar el body mínimo:
+> ```json
+> {
+>   "nkr_name": "cliente-42",
+>   "odoo_version": "19",
+>   "tier": "dev",
+>   "enterprise": false,
+>   "admin_passwd": "16-chars-min-...-128-max"
+> }
+> ```
+> NKR deriva todo lo demás del `tier` (workers, RAM, chrs, balloon, soft/hard limits — ver matriz en §7.0). El campo **`workers` ya NO debe mandarse**: si llega, se ignora silenciosamente (transición compatible con paneles legacy). Y `enterprise: bool` es el atajo para `edition: "enterprise"|"community"`.
+>
+> El contrato viejo (`POST /api/v1/cells/{cell}/instances` con `cell` + `workers` + `edition` en body) **sigue funcionando** por ahora — coexisten hasta que el panel migre. Cuando confirmen migración completa, el viejo pasará a 410 Gone.
+
+**Body completo (todos los campos disponibles, mostrados para referencia):**
 ```json
 {
   "nkr_name": "cliente-42",
   "tier": "production",
-  "odoo_version": "17.0",
+  "odoo_version": "19",
   "admin_passwd": "panel-lo-genera-y-guarda-encriptado-16-a-128-chars",
-  "workers": 2,
+  "enterprise": false,
   "dns": "cliente-42.systemouts.com",
-  "edition": "community",
-  "mode": "production",
+  "admin_user_password": null,
+  "auto_start": null,
   "proxy_mode": null,
   "source": null,
-  "cell": null,
   "addons_path": null,
   "pg_version": null,
   "python_libs": [],
@@ -260,7 +273,9 @@ El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la 
 }
 ```
 
-**Campos obligatorios:** `nkr_name`, `odoo_version`, `admin_passwd`. Todo lo demás es opcional.
+**Campos obligatorios:** `nkr_name`, `odoo_version`, `admin_passwd`. Todo lo demás es opcional. **NO incluir** `cell`, `workers`, `edition` en el contrato v2 (cell se auto-selecciona, workers se deriva del tier, edition se mapea desde `enterprise`).
+
+**Auto-selección de cell (v1.6.10+):** ordenamos por **RAM committed ASC** (suma de `ram_mb` de las VMs ya registradas en la cell), tie-break por `cell_id` ASC. Cuando hay mix de tiers (10 prod@2GB vs 15 dev@1.3GB), gana la que pesa menos en RAM real, no la que tiene menos tenants. **Version matching es tolerante a major/minor**: panel manda `"19"` y matchea cell con `odoo_version: "19.0"`. Si todas las cells de la versión están llenas (≥ 20 Odoos), → 409 `no_cell_available`.
 
 **`tier` vs `mode` — orden de prioridad:**
 - Si mandás **`tier`** (recomendado, ver §7.0): NKR ignora `mode` y aplica las reglas del tier:
@@ -284,15 +299,16 @@ El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la 
 | `tier` | `"dev"` | **Perfil fijo**: workers=0 (threaded), chrs=5, RAM **1300 MB**, `limit_memory_soft/hard` = **800 / 1000 MB**, balloon boot(ACTIVE)=0 / IDLE=256, `limit_time_cpu/real`=600/1200s, `dev_mode` vacío, `list_db=True`, sin rate-limit/cache nginx. Standalone — DB del template (sin source). Source PROHIBIDO (rejected con 409). Las dev no son clonables. Ideal para módulos nuevos desde cero. Ver §7.0. |
 | `mode` | `"production"` (default, **opcional** si mandás `tier`) | **Legacy / back-compat.** Cuando `tier=production`: tenant fresh con DB del template, sin source. NKR fuerza `source = <cell>-odoo-template`. Cuando se manda `tier=staging`/`tier=dev`, este campo se ignora. |
 | `mode` | `"dev"` (**opcional**) | **Legacy / back-compat.** Cuando `tier=production`: clone de un tenant existente — `source` obligatorio. Para el caso "clonar de producción para testing" usar `tier=staging` (más explícito y aplica config dev). |
-| `cell` | `null` | Auto-selecciona la cell con `odoo_version` match y menos `used_odoos`. |
-| `cell` | `"foo"` | Fuerza esa cell; 409 si versión no matchea o está llena. |
+| `cell` | `null` (recomendado, contrato v2) | Auto-selecciona la cell con `odoo_version` match (matching tolerante major/minor) y **más RAM libre** (= menor sum de `ram_mb` de las VMs en la cell). Tie-break por `cell_id` ASC. |
+| `cell` | `"foo"` (legacy) | Fuerza esa cell. 409 si versión no matchea o está llena. Mandar `cell` activa el contrato viejo donde `workers` SÍ se respeta. |
+| `enterprise` | `bool` \| `null` (v1.6.10+) | **Atajo del contrato v2.** `true` → equivale a `edition: "enterprise"`. `false` → `edition: "community"`. Tiene precedencia sobre `edition` si ambos vienen. |
 | `source` | `null` (con `mode=production`) | NKR resuelve **automáticamente** según `edition`: community → `<cell>-odoo-template`, enterprise → `<cell>-odoo-template-enterprise` (v1.6.5+, ver §"Sembrar template enterprise"). **No mandar source en mode=production**: si lo mandás, 409 `source_not_allowed_in_production`. Si el template requerido no existe → 409 `cell_template_missing` (community) o `enterprise_template_missing` (enterprise). |
 | `source` | `"<tenant>"` (con `mode=dev`) | **Obligatorio.** Tenant a clonar (mismo cell). Si falta en `mode=dev` → 400 `source_required`. |
 | `edition` | `"enterprise"` \| `"community"` \| `null` | **v1.6.5+ semántica:** determina cuál template usar como source default. `enterprise` → `<cell>-odoo-template-enterprise` (con `web_enterprise` pre-instalado). `community` o `null` → `<cell>-odoo-template`. La activación del theme **NO se hace runtime** (eliminada en v1.6.5) — viene horneada en el template. Para clones-from-tenant (`mode=dev`/`tier=staging`), `edition` no aplica (el clone hereda del source). |
 | `admin_user_password` | string `[A-Za-z0-9._-]{8,128}` \| `null` | **OPCIONAL — pero las reglas cambiaron en v1.6.5:**<br>• **Source es template del cell** (community o enterprise): si se manda, NKR rota admin/admin → admin/`<tu_pwd>` post-boot (compose up + JSON-RPC login + `res.users.change_password`). Implícitamente activa `auto_start`. Si se omite: tenant queda cold-prepared (admin/admin remains — el panel debe rotar vía UI/JSON-RPC antes de exponer).<br>• **Source es otro tenant** (clone-from-tenant): **PROHIBIDO** — 400 `admin_user_password_not_applicable_for_clone`. El clone hereda `res_users.password` del source vía `CREATE DATABASE TEMPLATE`; intentar rotar con admin/admin falla porque ya no es esa la pwd. Si querés arrancar el clone, usá `auto_start: true`. El panel ya conoce la pwd del source (la generó él mismo). |
 | `auto_start` | `bool` \| `null` (v1.6.5+) | **Default:** `admin_user_password.is_some()` (back-compat). Si `true`, NKR arranca la VM al final del create (compose up + wait :8069). Si `false` o ausente sin pwd, el create se queda cold-prepared (`disabled: true` en el bloque del compose) hasta que el panel haga `POST /actions {start}`. Usar `auto_start: true` explícito en clones-from-tenant donde `admin_user_password` está prohibido. |
 | `python_libs` | `[]` | Si no vacío: 500 hoy (requiere rebuild del master ext4 — pendiente). |
-| `workers` | int `1..=16` \| `null` | **Solo aplica a `tier=production`** (en staging/dev se ignora — workers se fuerza a 0). Default `2` si null. NKR deriva chrs+ram+balloon (compose) y limit_memory_soft/hard (odoo.conf) de este valor — ver tabla abajo. |
+| `workers` | int `1..=16` \| `null` | **Contrato v2 (sin cell):** ignorado silenciosamente — NKR deriva workers del `tier` (prod=2, staging/dev=0). El panel **no debe mandarlo**. **Contrato viejo (con cell):** sigue respetándose como override de tier=production. Default `2`. |
 | `balloon_mb` | int `0..` \| `null` | **OPCIONAL.** Override del VirtIO-Balloon. Si `null` (recomendado), NKR aplica el default derivado de `workers` (ver tabla). Si se manda valor explícito, ese valor reemplaza al default. `0` desactiva el balloon (no recomendado para Odoo en cells densas). Subirlo más allá del default agresivo (40 % de la RAM) puede provocar OOM-killer del guest bajo picos de carga (imports, generación de PDF, install/upgrade de módulos). |
 | `admin_passwd` | string `[A-Za-z0-9._-]{16,128}` | **OBLIGATORIO.** Master password del Odoo del tenant. El panel es única fuente — lo genera, lo guarda encriptado, y lo manda en este body. NKR nunca lo genera ni lo devuelve. Se persiste sólo en `odoo.conf` del tenant. Si se omite → `400 admin_passwd_required`. |
 | `proxy_mode` | `true` (default) \| `false` | Productivo SIEMPRE `true`. `false` sólo para tests locales sin nginx. |

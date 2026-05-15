@@ -2552,17 +2552,43 @@ pub fn count_odoo_instances(cell_name: &str) -> usize {
     }
 }
 
-/// Selects the first cell with matching `odoo_version` and at least 1 free slot.
-/// Sorts by ascending cell_id (deterministic). Returns error if none matches
-/// or all are full.
+/// Suma de RAM committed (sum `ram_mb` de todas las VMs registradas) en una
+/// cell. Métrica de "cuánto pesa esta cell hoy" — útil para auto-select
+/// balanceando carga real (no solo conteo de tenants).
+pub fn sum_committed_ram_in_cell(cell_id: u8) -> u32 {
+    crate::state::list_vms().iter()
+        .filter(|v| v.cell_id == cell_id)
+        .map(|v| v.ram_mb)
+        .sum()
+}
+
+/// Selects the cell with the MOST RAM libre (= menor RAM commitida) entre
+/// todas las cells de la versión pedida con al menos 1 slot libre. Métrica
+/// más precisa que "menos tenants" cuando hay mezcla de tiers (un cell con
+/// 10 prod@2GB pesa más que uno con 15 dev@1.3GB aunque el conteo sea menor).
+///
+/// Cambio 2026-05-15 (panel API v2): antes se ordenaba por conteo de tenants
+/// (`used`) → re-balanceaba bien para tenants homogéneos pero degradaba en
+/// cells mixtas. Ahora ordena por `ram_committed_mb` ASC, breaks de empate
+/// por `cell_id` ASC.
 pub fn select_cell_for_version(
     odoo_version: &str,
 ) -> Result<CellConfig, Box<dyn std::error::Error>> {
-    let candidates: Vec<(CellConfig, usize)> = list_cells().into_iter()
-        .filter(|c| c.odoo_version.as_deref() == Some(odoo_version))
+    // Matching tolerante a "major" vs "major.minor": el panel API v2 manda
+    // sólo "19" pero cell.yml suele tener "19.0". Normalizamos a "major"
+    // (string antes del primer punto) para comparar — "19" matchea "19.0"
+    // y vice-versa. Si el panel viejo manda "19.0" también funciona.
+    let want_major = odoo_version.split('.').next().unwrap_or(odoo_version);
+    let candidates: Vec<(CellConfig, usize, u32)> = list_cells().into_iter()
+        .filter(|c| {
+            let cell_major = c.odoo_version.as_deref()
+                .and_then(|v| v.split('.').next());
+            cell_major == Some(want_major)
+        })
         .map(|c| {
             let used = count_odoo_instances(&c.name);
-            (c, used)
+            let ram_committed = sum_committed_ram_in_cell(c.cell_id);
+            (c, used, ram_committed)
         })
         .collect();
 
@@ -2576,14 +2602,15 @@ pub fn select_cell_for_version(
         ).into());
     }
 
-    // Prefer the LEAST full cell: balances load without panel intervention.
+    // Filter cells con al menos 1 slot libre, luego sort por RAM commitida ASC
+    // (= "más RAM libre" primero), tie-break por cell_id ASC.
     let mut with_slots: Vec<_> = candidates.into_iter()
-        .filter(|(_, used)| *used < MAX_ODOOS_PER_CELL)
+        .filter(|(_, used, _)| *used < MAX_ODOOS_PER_CELL)
         .collect();
-    with_slots.sort_by_key(|(c, used)| (*used, c.cell_id));
+    with_slots.sort_by_key(|(c, _, ram_committed)| (*ram_committed, c.cell_id));
 
     with_slots.into_iter().next()
-        .map(|(c, _)| c)
+        .map(|(c, _, _)| c)
         .ok_or_else(|| format!(
             "Todas las cells con odoo_version={} están llenas ({}/{} Odoos)",
             odoo_version, MAX_ODOOS_PER_CELL, MAX_ODOOS_PER_CELL

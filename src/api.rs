@@ -67,6 +67,13 @@ pub struct CreateInstanceReq {
     pub dns: Option<String>,
     #[serde(default)]
     pub edition: Option<Edition>,
+    /// **Atajo del panel (API v2, 2026-05-15+).** Si se manda, mapea a `edition`:
+    /// `true` → Enterprise, `false` → Community. Tiene precedencia sobre
+    /// `edition` si ambos vienen — el contrato nuevo es "el panel manda
+    /// `enterprise:bool`" y se acabó. Si se omite, se respeta `edition` (o
+    /// default Community).
+    #[serde(default)]
+    pub enterprise: Option<bool>,
     #[serde(default)]
     pub pg_version: Option<String>,
     /// Sole resource input: NKR deriva chrs, ram_mb (compose) y limit_memory_soft/hard
@@ -376,7 +383,7 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
     if body_json.len() > 64 * 1024 {
         return IpcResponse::error(413, "body_too_large", None);
     }
-    let req: CreateInstanceReq = match serde_json::from_str(body_json) {
+    let mut req: CreateInstanceReq = match serde_json::from_str(body_json) {
         Ok(r) => r,
         Err(_) => {
             return IpcResponse::error(
@@ -386,6 +393,27 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
             )
         }
     };
+
+    // ── Normalización contrato v2 (2026-05-15) ──────────────────────────────
+    // El panel ahora puede mandar `enterprise: bool` en lugar de `edition`.
+    // Mapeamos a edition (precedencia: enterprise > edition).
+    if let Some(ent) = req.enterprise {
+        req.edition = Some(if ent { crate::cell::Edition::Enterprise } else { crate::cell::Edition::Community });
+    }
+
+    // Detección "contrato nuevo": ni URL trae cell ni body trae cell →
+    // significa que el panel quiere auto-pick + tier-defaults. En ese caso,
+    // ignoramos cualquier `workers` que venga (no rechazamos por compat;
+    // sólo NO lo usamos). En contrato viejo (cell explícita) seguimos
+    // respetando workers para no romper integraciones existentes.
+    let is_v2_contract = cell_hint.is_none() && req.cell.is_none();
+    if is_v2_contract && req.workers.is_some() {
+        eprintln!("[API] create({}): contrato v2 — ignorando workers={:?} \
+                   (los recursos se derivan de tier)",
+            req.nkr_name, req.workers);
+        req.workers = None;
+    }
+    let req = req; // re-shadow as immutable from here
 
     if !is_safe_identifier(&req.nkr_name) {
         return IpcResponse::error(
