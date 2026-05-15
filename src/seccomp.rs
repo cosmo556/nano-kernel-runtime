@@ -52,7 +52,21 @@ struct SockFprog {
 /// having them on the allowlist is harmless if unused.
 /// 57=fork, 58=vfork, 59=execve, 322=execveat: needed for Command::new()
 /// in post-shutdown cleanup (iptables, ip, ebtables, cgroup rmdir).
-const ALLOWED_SYSCALLS: &[u32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 186, 202, 217, 218, 228, 231, 232, 233, 257, 258, 263, 289, 290, 291, 293, 302, 318, 322, 332, 334, 425, 426, 427];
+///
+/// **Modern glibc additions (v1.6.7, fix 2026-05-15)**:
+///   435=clone3       — glibc 2.34+ uses clone3 internally for thread spawn.
+///                      Bug observado: el VMM PID 812313 (intech-devp) murió por
+///                      SECCOMP_RET_KILL_PROCESS al hacer clone3 → la VM se cayó
+///                      silenciosamente y arrastró el tap nkr-c2-tap4. Sin
+///                      whitelist no hay manera segura de spawnear threads en
+///                      sistemas modernos. Confirmado por audit log:
+///                      `audit: pid=812313 comm="nkr" syscall=435 sig=31 code=0x80000000`
+///   437=openat2       — glibc 2.33+ open() puede usar openat2 (RESOLVE_BENEATH etc.)
+///   439=faccessat2    — glibc usa faccessat2 cuando está disponible
+///   441=epoll_pwait2  — alternativa moderna a epoll_pwait
+///   447=memfd_secret  — eventual; no se usa hoy pero futuro-proof
+///   452=fchmodat2     — glibc nueva
+const ALLOWED_SYSCALLS: &[u32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 186, 202, 217, 218, 228, 231, 232, 233, 257, 258, 263, 289, 290, 291, 293, 302, 318, 322, 332, 334, 425, 426, 427, 435, 437, 439, 441, 452];
 
 /// Builds and installs the seccomp filter using raw BPF.
 /// Returns Ok(()) if installed, Err if not possible (silent degradation).
