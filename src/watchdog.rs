@@ -176,8 +176,44 @@ fn sweep() {
 
 /// Dispara `nkr_action(restart)` en background. Reusa el flow de
 /// `api::handle_action` que ya hace start-action async.
+///
+/// **Coordination guard (audit 2026-05-15, fix C6):** antes de disparar,
+/// intenta `InstanceLock::try_acquire` para detectar si hay otra operación
+/// del operador/panel ya en vuelo sobre esta misma instancia (delete, start
+/// manual, restart manual). Si no se puede obtener el lock → otro proceso
+/// ya está actuando → el watchdog NO compite (skip). Esto cierra el race:
+///   operador hace `nkr stop X` ↔ stop_vm está en su loop de 90s ↔ :8069
+///   cae ↔ watchdog detecta colgado ↔ ANTES disparaba restart en paralelo
+///   con el stop del operador → caos. Ahora el watchdog ve el lock tomado
+///   y se hace a un lado.
+///
+/// Lo soltamos antes del thread::spawn porque el handle_action toma sus
+/// propios guards internos (inflight_actions) — no queremos doble-lock.
 fn trigger_restart(nkr_name: &str) {
     let name = nkr_name.to_string();
+    // Resolver cell para construir el lock path. Si no encontramos la cell,
+    // omitimos el guard (best-effort) y procedemos como antes.
+    let cell_opt = crate::state::list_vms().into_iter()
+        .find(|v| v.name == nkr_name)
+        .map(|v| v.cell_id)
+        .and_then(crate::cell::lookup_cell_name);
+    if let Some(cell) = cell_opt.as_deref() {
+        match crate::inst_lock::InstanceLock::try_acquire(cell, nkr_name) {
+            Ok(Some(_lock)) => {
+                // OK, libre — soltamos inmediatamente (handle_action toma
+                // sus propios guards). El _lock vive solo en este scope.
+            }
+            Ok(None) => {
+                eprintln!("[NKR-WATCHDOG] {} skip restart — instance lock tomado \
+                          (operador/panel está haciendo algo)", nkr_name);
+                return;
+            }
+            Err(e) => {
+                eprintln!("[NKR-WATCHDOG] {} lock check error: {} — procediendo igual",
+                    nkr_name, e);
+            }
+        }
+    }
     std::thread::Builder::new()
         .name(format!("nkr-watchdog-restart-{}", nkr_name))
         .spawn(move || {

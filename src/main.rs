@@ -40,6 +40,7 @@ mod console;
 mod cell;
 mod fsutil;
 mod netlock;
+mod inst_lock;
 mod api;
 mod api_http;
 mod ipc;

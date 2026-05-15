@@ -1443,11 +1443,31 @@ pub fn handle_action(nkr_name: &str, action_str: &str) -> IpcResponse {
     // y medio por VM era inviable. El panel debe polear
     // GET /api/v1/cells/{cell}/instances/{name} → nkr_status.port_8069_up
     // para detectar readiness.
+    // Resolver cell para el InstanceLock cross-process (audit 2026-05-15).
+    // El lock vive en el thread spawned junto al InflightActionGuard. Mientras
+    // está tomado, watchdog::trigger_restart vía try_acquire ve "ocupado" y
+    // skip-ea su restart auto — cierra C6 del audit. Usamos info_snapshot
+    // (info ya fue movido por info.ok() arriba).
+    let lock_cell = info_snapshot.as_ref().map(|i| i.cell.clone());
+
     let nkr_name_owned = nkr_name.to_string();
     let spawn_result = std::thread::Builder::new()
         .name(format!("nkr-action-{}", nkr_name))
         .spawn(move || {
             let _guard = InflightActionGuard(nkr_name_owned.clone());
+            // InstanceLock para coordinación cross-process. Best-effort: si
+            // no podemos obtener el lock por algún error de IO, procedemos
+            // (inflight_actions ya garantiza serialización in-process).
+            let _inst_lock = lock_cell.as_deref().and_then(|c| {
+                match crate::inst_lock::InstanceLock::acquire(c, &nkr_name_owned) {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        eprintln!("[API] action({}): InstanceLock acquire warning: {} — \
+                                   procediendo con inflight_actions solo", nkr_name_owned, e);
+                        None
+                    }
+                }
+            });
             let started = std::time::Instant::now();
             let result = match action {
                 ActionKind::Start => start_instance(&nkr_name_owned, cell_dir.as_deref()),
