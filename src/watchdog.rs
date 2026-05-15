@@ -35,8 +35,19 @@ const PROBE_INTERVAL_SECS: u64 = 15;
 
 /// Cuánto tiempo de :8069 unreachable antes de disparar restart. Conservador:
 /// un Odoo cargando módulos pesados o procesando un import grande puede
-/// tardar 30-50s en responder. 60s deja margen sin ser demasiado paciente.
-const HUNG_THRESHOLD_SECS: u64 = 60;
+/// tardar 30-50s en responder. 120s deja margen amplio sin ser excesivo
+/// (subido de 60→120 el 2026-05-15: REL_OD legítimo con 72 módulos custom
+/// en intech-devp tardó 90s post-shutdown, el watchdog disparó restart
+/// innecesario y duplicó el downtime de ~30s → ~150s).
+const HUNG_THRESHOLD_SECS: u64 = 120;
+
+/// Grace window post-REL_OD. Cuando `api::handle_reload_workers` mete un
+/// SIGUSR1, llama a `note_reload(nkr_name)` que registra el timestamp acá.
+/// Mientras `now - last_reload < RELOAD_GRACE_SECS`, el threshold efectivo
+/// es `RELOAD_THRESHOLD_SECS` (180s) en vez de 120s, porque un reload con
+/// muchos módulos puede legítimamente tener :8069 down durante 90-150s.
+const RELOAD_GRACE_SECS: u64 = 240;
+const RELOAD_THRESHOLD_SECS: u64 = 180;
 
 /// Timeout de la probe TCP. Bajo: si la VM está colgada no nos colgamos
 /// nosotros. Si la VM está lenta (no colgada), 2s da margen suficiente.
@@ -48,6 +59,32 @@ const PROBE_TIMEOUT_MS: u64 = 2000;
 /// probe encontrará el puerto down esperando boot — eso es OK y NO debe
 /// contar como nuevo cuelgue).
 static HUNG_SINCE: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// Estado in-memory: nkr_name → unix_ts del último REL_OD inyectado.
+/// Lo escribe `api::handle_reload_workers` vía `note_reload()`. Lo lee
+/// `sweep()` para extender el threshold si el reload es reciente.
+static LAST_RELOAD: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// Llamado por `api::handle_reload_workers` justo después de SIGUSR1. Permite
+/// al watchdog dar grace adicional durante el ciclo natural de REL_OD (que
+/// con muchos módulos puede tener :8069 down 90-150s).
+pub fn note_reload(nkr_name: &str) {
+    let mut guard = LAST_RELOAD.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.insert(nkr_name.to_string(), now_secs());
+}
+
+fn effective_threshold(nkr_name: &str, now: u64) -> u64 {
+    let guard = LAST_RELOAD.lock().unwrap();
+    if let Some(map) = guard.as_ref() {
+        if let Some(&ts) = map.get(nkr_name) {
+            if now.saturating_sub(ts) < RELOAD_GRACE_SECS {
+                return RELOAD_THRESHOLD_SECS;
+            }
+        }
+    }
+    HUNG_THRESHOLD_SECS
+}
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -73,10 +110,11 @@ pub fn run_loop() {
         eprintln!("[NKR-WATCHDOG] deshabilitado por NKR_WATCHDOG_DISABLED");
         return;
     }
-    eprintln!("[NKR-WATCHDOG] iniciado (probe={}s, threshold={}s)",
-        PROBE_INTERVAL_SECS, HUNG_THRESHOLD_SECS);
-    // Inicializar mapa (Mutex<Option> para const-construct + lazy init).
+    eprintln!("[NKR-WATCHDOG] iniciado (probe={}s, threshold={}s, reload_grace={}s/{}s)",
+        PROBE_INTERVAL_SECS, HUNG_THRESHOLD_SECS, RELOAD_GRACE_SECS, RELOAD_THRESHOLD_SECS);
+    // Inicializar mapas (Mutex<Option> para const-construct + lazy init).
     *HUNG_SINCE.lock().unwrap() = Some(HashMap::new());
+    *LAST_RELOAD.lock().unwrap() = Some(HashMap::new());
     // Grace period inicial para no pisar el boot del daemon.
     std::thread::sleep(Duration::from_secs(30));
     loop {
@@ -112,11 +150,12 @@ fn sweep() {
         // threshold.
         let hung_since = *map.entry(vm.name.clone()).or_insert(now);
         let elapsed = now.saturating_sub(hung_since);
-        if elapsed < HUNG_THRESHOLD_SECS {
+        let threshold = effective_threshold(&vm.name, now);
+        if elapsed < threshold {
             // Aún dentro del margen — sólo log a cada 30s para no llenar journal
             if elapsed % 30 == 0 {
                 eprintln!("[NKR-WATCHDOG] {} :8069 down hace {}s (threshold {}s)",
-                    vm.name, elapsed, HUNG_THRESHOLD_SECS);
+                    vm.name, elapsed, threshold);
             }
             continue;
         }

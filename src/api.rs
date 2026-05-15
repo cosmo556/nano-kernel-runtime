@@ -3694,6 +3694,10 @@ pub fn handle_reload_workers(nkr_name: &str) -> IpcResponse {
             Some(&format!("kill PID {}: {}", pid, err)));
     }
     eprintln!("[API] reload_workers({}): SIGUSR1 → PID {} OK", nkr_name, pid);
+    // Avisar al watchdog: durante los próximos RELOAD_GRACE_SECS no contar
+    // :8069 down como cuelgue real (un reload con muchos módulos custom
+    // puede tener el puerto down 90-150s legítimamente).
+    crate::watchdog::note_reload(nkr_name);
     // El guest (watcher hvc0 del initramfs) diferencia por modo Odoo:
     //   workers>0 (prefork)  → SIGHUP al master → respawnea workers (master vivo)
     //   workers=0 (threaded) → SIGTERM al proceso → supervisor loop lo relanza
