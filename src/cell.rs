@@ -45,6 +45,35 @@ struct CellRegistry {
     entries: HashMap<String, u8>,
 }
 
+/// RAII lock para el cell registry. Toma `flock(LOCK_EX)` sobre el archivo
+/// del registry — serializa lectores+escritores cross-process (panel haciendo
+/// create + operator CLI haciendo nkr cell create concurrente). Sin esto,
+/// dos `create_cell` paralelos podían asignar el MISMO `cell_id` (auditoría
+/// 2026-05-15).
+struct CellRegistryLock {
+    _file: fs::File,
+}
+
+impl CellRegistryLock {
+    fn acquire() -> Result<Self, Box<dyn std::error::Error>> {
+        let path = cell_registry_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true).read(true).write(true).truncate(false)
+            .open(&path)?;
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(format!("flock {} falló: {}", path.display(),
+                std::io::Error::last_os_error()).into());
+        }
+        Ok(Self { _file: file })
+    }
+}
+// Drop unlocks automáticamente via close(2).
+
 impl CellRegistry {
     fn load() -> Self {
         let path = cell_registry_path();
@@ -58,13 +87,25 @@ impl CellRegistry {
         CellRegistry::default()
     }
 
+    /// Persiste el registry de forma atómica: escribe en `<path>.tmp` y
+    /// hace rename(2) — los lectores ven el contenido viejo o el nuevo,
+    /// nunca uno parcial. Hardenización 2026-05-15 post-audit: antes
+    /// usábamos `fs::write` directo → un crash mid-write dejaba `cells.json`
+    /// truncado y `load()` devolvía `Default` (pérdida de mapeo TOTAL).
     fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let path = cell_registry_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(&path, json)?;
+        let tmp = path.with_extension("json.tmp");
+        {
+            use std::io::Write as _;
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(json.as_bytes())?;
+            f.sync_data().ok();
+        }
+        fs::rename(&tmp, &path)?;
         Ok(())
     }
 
@@ -129,6 +170,11 @@ pub fn create_cell(name: &str, odoo_version: Option<&str>) -> Result<CellConfig,
         return Err("El nombre de la célula no puede estar vacío".into());
     }
 
+    // Toma flock EXCLUSIVO antes de read+modify+write — sin esto, dos
+    // create_cell concurrentes (panel + CLI, p.ej.) leían el mismo
+    // next_free_id y asignaban el MISMO cell_id a nombres distintos.
+    // El lock se libera al final del scope (Drop = close → flock unlock).
+    let _reg_lock = CellRegistryLock::acquire()?;
     let mut reg = CellRegistry::load();
 
     // Check if it already exists
@@ -347,6 +393,8 @@ pub fn lookup_cell_name(cell_id: u8) -> Option<String> {
 /// Removes a cell from the registry (does not delete disk data)
 pub fn destroy_cell(name: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let key = name.trim().to_lowercase();
+    // Lock para serializar con create_cell concurrente.
+    let _reg_lock = CellRegistryLock::acquire()?;
     let mut reg = CellRegistry::load();
 
     let cell_id = match reg.entries.remove(&key) {

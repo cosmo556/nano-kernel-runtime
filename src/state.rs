@@ -60,14 +60,28 @@ pub struct VmState {
     pub guest_mem_cached_bytes: u64,
 }
 
+/// Writes `json` to `path` atomically: escribe en `<path>.tmp` y `rename(tmp, path)`.
+/// El rename(2) en el mismo filesystem es atómico — los lectores (list_vms, watchdog,
+/// nkr ps) ven el contenido viejo o el nuevo, nunca uno truncado a mitad.
+/// Hardenización 2026-05-15 tras audit: antes usábamos `fs::write` directo
+/// → ventana donde un `read_to_string` concurrente podía parsear JSON parcial.
+fn atomic_write_json(path: &Path, json: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_data().ok(); // best-effort fsync — state es tmpfs típicamente
+    }
+    fs::rename(&tmp, path)
+}
+
 /// Registers an active VM by writing its state to disk.
 /// Filename includes cell_id so two cells sharing vm_ids don't overwrite each other.
 pub fn register_vm(state: &VmState) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(STATE_DIR)?;
     let path = state_path_scoped(state.cell_id, state.vm_id);
     let json = serde_json::to_string_pretty(state)?;
-    let mut file = fs::File::create(&path)?;
-    file.write_all(json.as_bytes())?;
+    atomic_write_json(&path, &json)?;
     eprintln!("[NKR] VM {}/{} registrada en {}", state.cell_id, state.vm_id, path.display());
     Ok(())
 }
@@ -78,6 +92,7 @@ pub fn register_vm(state: &VmState) -> Result<(), Box<dyn std::error::Error>> {
 /// actual (no el de boot). Best-effort: si el file no existe o no parsea,
 /// no hace nada (la VM puede estar en teardown). Race con otras escrituras
 /// del state es benigna — el peor caso es un balloon_mb stale por un instante.
+/// Atomic via tmp+rename (post-audit 2026-05-15).
 pub fn update_balloon_mb(cell_id: u8, vm_id: u8, balloon_mb: u32) {
     let path = state_path_scoped(cell_id, vm_id);
     let Ok(content) = fs::read_to_string(&path) else { return };
@@ -85,13 +100,14 @@ pub fn update_balloon_mb(cell_id: u8, vm_id: u8, balloon_mb: u32) {
     if state.balloon_mb == balloon_mb { return; }
     state.balloon_mb = balloon_mb;
     if let Ok(json) = serde_json::to_string_pretty(&state) {
-        let _ = fs::write(&path, json);
+        let _ = atomic_write_json(&path, &json);
     }
 }
 
 /// Updates the guest-memory stats in a VM's state file (same best-effort
 /// pattern as `update_balloon_mb`). Called by the vmm when it consumes a
 /// fresh buffer off the virtio-balloon stats virtqueue (~every 30s).
+/// Atomic via tmp+rename (post-audit 2026-05-15).
 pub fn update_guest_mem(cell_id: u8, vm_id: u8, total: u64, free: u64, avail: u64, cached: u64) {
     let path = state_path_scoped(cell_id, vm_id);
     let Ok(content) = fs::read_to_string(&path) else { return };
@@ -105,7 +121,7 @@ pub fn update_guest_mem(cell_id: u8, vm_id: u8, total: u64, free: u64, avail: u6
     state.guest_mem_available_bytes = avail;
     state.guest_mem_cached_bytes = cached;
     if let Ok(json) = serde_json::to_string_pretty(&state) {
-        let _ = fs::write(&path, json);
+        let _ = atomic_write_json(&path, &json);
     }
 }
 

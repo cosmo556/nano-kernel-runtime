@@ -1686,8 +1686,14 @@ fn teardown_cgroup(vm_name: &str) {
     // (zombies, threads del vmm que no hicieron exit limpio), enviamos SIGKILL
     // y esperamos hasta 500ms para que el kernel los retire. Después rmdir.
     if let Ok(content) = std::fs::read_to_string(format!("{}/cgroup.procs", base)) {
+        // Filtramos pids <= 1 explícitamente. `kill(0, …)` envía la señal a
+        // TODO el process group del caller → en NKR daemon eso incluye al
+        // propio daemon. `kill(1, …)` apunta a init. Ambos serían catastrófico.
+        // El parse a i32 ya rechaza valores no-numéricos pero podría leer
+        // un "0" transient por una race con cgroup churn (auditoría 2026-05-15).
         let pids: Vec<i32> = content.lines()
             .filter_map(|s| s.trim().parse::<i32>().ok())
+            .filter(|&p| p > 1)
             .collect();
         if !pids.is_empty() {
             eprintln!("[NKR-CGROUP] cgroup '{}' tiene {} proc(s) pegados, SIGKILL...",

@@ -3691,6 +3691,22 @@ fn uptime_secs() -> u64 {
 /// eventos del host al guest (limitación FUSE), entonces `dev_mode=reload`
 /// del Odoo no detecta cambios. Trigger explícito desde el host vía SIGUSR1
 /// es la solución arquitectónicamente correcta.
+
+/// Verifica que `pid` siga siendo un proceso `nkr run` (VMM). Cierra la
+/// race donde el PID registrado en state file fue reusado por un proceso
+/// completamente ajeno tras la muerte de la VM original. Si PID inválido
+/// o cmdline no matchea, retorna false → el caller debe NO mandar la señal.
+/// Lee /proc/<pid>/comm (no cmdline porque comm es el nombre del exec,
+/// ~16 bytes max → match cheap y robusto).
+/// Audit 2026-05-15.
+fn pid_is_nkr_vmm(pid: u32) -> bool {
+    let comm_path = format!("/proc/{}/comm", pid);
+    match std::fs::read_to_string(&comm_path) {
+        Ok(s) => s.trim() == "nkr",
+        Err(_) => false, // PID muerto o /proc no accesible
+    }
+}
+
 pub fn handle_reload_workers(nkr_name: &str) -> IpcResponse {
     if !is_safe_identifier(nkr_name) {
         return IpcResponse::error(400, "invalid_nkr_name", None);
@@ -3713,6 +3729,16 @@ pub fn handle_reload_workers(nkr_name: &str) -> IpcResponse {
 
     // SIGUSR1 al PID. El handler de vmm.rs setea RELOAD_REQUESTED, el vcpu
     // loop consume la flag e inyecta "REL_OD\n" por hvc0 al guest.
+    // Guard pre-kill: leer /proc/<pid>/comm y verificar que sea "nkr". Si el
+    // PID fue reusado por otro proceso (rare race entre state read y kill),
+    // SIGUSR1 a un proceso ajeno = comportamiento default (terminate). Esta
+    // verificación cierra el race (audit 2026-05-15).
+    if !pid_is_nkr_vmm(pid) {
+        eprintln!("[API] reload_workers({}): PID {} ya no es un nkr run — skip",
+            nkr_name, pid);
+        return IpcResponse::error(409, "pid_reused",
+            Some("El PID registrado ya no corresponde al VMM (probablemente murió y otro proceso lo reusó). Pollee GET /instances/{name} para estado actual."));
+    }
     let r = unsafe { libc::kill(pid as i32, libc::SIGUSR1) };
     if r != 0 {
         let err = std::io::Error::last_os_error();
@@ -3797,6 +3823,15 @@ pub fn handle_balloon_active(nkr_name: &str) -> IpcResponse {
         }));
     }
 
+    // Guard pre-kill (audit 2026-05-15): SIGUSR2 a un proceso ajeno con
+    // disposición default = terminate. Si PID fue reusado, podríamos matar
+    // un servicio random del host.
+    if !pid_is_nkr_vmm(pid) {
+        eprintln!("[API] balloon_active({}): PID {} ya no es un nkr run — skip",
+            nkr_name, pid);
+        return IpcResponse::error(409, "pid_reused",
+            Some("El PID registrado ya no corresponde al VMM."));
+    }
     let r = unsafe { libc::kill(pid as i32, libc::SIGUSR2) };
     if r != 0 {
         let err = std::io::Error::last_os_error();
