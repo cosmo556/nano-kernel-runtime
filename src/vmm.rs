@@ -592,6 +592,93 @@ fn cleanup_orphan_loops(first_disk: &str) {
     }
 }
 
+/// RAII guard que limpia recursos del VMM en caso de panic durante el setup.
+/// Audit 2026-05-16 (V3): el setup path entre `setup_cgroup` y `run_vcpu_loop`
+/// contiene ~13 `panic!`/`expect()` (irqfd/ioeventfd registers, kernel load,
+/// initramfs load, etc.). Con `panic = "unwind"` (también cambiado 2026-05-16),
+/// el unwind permite que `Drop` corra y limpie recursos parcialmente
+/// adquiridos: cgroup, TAP, port forwards, state file. Sin esto, un panic en
+/// setup dejaba TAPs huérfanos en el bridge, cgroups en `/sys/fs/cgroup/nkr/`
+/// y entries fantasma en `/tmp/nkr-vms/` que `nkr ps` mostraría como activos.
+///
+/// Uso: crear arrancando, popular fields con `set_*` a medida que se
+/// adquieren los recursos, llamar `defuse()` justo antes del cleanup normal
+/// post-vcpu_loop (sino se cleanea dos veces).
+struct VmCleanupGuard {
+    armed: bool,
+    cell_id: u8,
+    vm_id: u8,
+    vm_name: String,
+    chrs: u32,
+    cgroup_done: bool,
+    tap_name: Option<String>,
+    tap_mac: [u8; 6],
+    guest_ip: String,
+    forwarding_rules: Vec<(u16, u16)>,
+    state_registered: bool,
+}
+
+impl VmCleanupGuard {
+    fn new(cell_id: u8, vm_id: u8, vm_name: String, chrs: u32) -> Self {
+        Self {
+            armed: true,
+            cell_id, vm_id, vm_name, chrs,
+            cgroup_done: false,
+            tap_name: None,
+            tap_mac: [0;6],
+            guest_ip: String::new(),
+            forwarding_rules: Vec::new(),
+            state_registered: false,
+        }
+    }
+    fn mark_cgroup_done(&mut self) { self.cgroup_done = true; }
+    fn set_tap(&mut self, name: String, mac: [u8;6], ip: String) {
+        self.tap_name = Some(name);
+        self.tap_mac = mac;
+        self.guest_ip = ip;
+    }
+    fn set_forwarding_rules(&mut self, rules: Vec<(u16, u16)>) {
+        self.forwarding_rules = rules;
+    }
+    fn mark_state_registered(&mut self) { self.state_registered = true; }
+    fn defuse(&mut self) { self.armed = false; }
+}
+
+impl Drop for VmCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed { return; }
+        eprintln!("[NKR-CLEANUP-GUARD] panic detected — limpiando recursos parciales \
+                   (cell={}/vm={}, name={})", self.cell_id, self.vm_id, self.vm_name);
+        // Orden inverso al de adquisición:
+        // 1. state file (sino `nkr ps` muestra VM fantasma)
+        if self.state_registered {
+            state::unregister_vm(self.cell_id, self.vm_id);
+        }
+        // 2. port forwards
+        if !self.forwarding_rules.is_empty() {
+            cleanup_port_forwarding(&self.forwarding_rules, &self.guest_ip);
+        }
+        // 3. TAP + ebtables (bajo netlock)
+        if let Some(tap) = &self.tap_name {
+            let _netlock = crate::netlock::NetLock::acquire("panic-cleanup-tap");
+            teardown_tap_isolation(tap, &self.tap_mac, &self.guest_ip);
+            let _ = std::process::Command::new("timeout")
+                .args(["5", "ip", "link", "delete", tap])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            eprintln!("[NKR-CLEANUP-GUARD] TAP {} eliminado", tap);
+        }
+        // 4. cgroup (rmdir solo funciona si vacío; teardown_cgroup hace
+        //    SIGKILL a procesos restantes primero — ya filtra pid<=1).
+        if self.cgroup_done && self.chrs > 0 {
+            teardown_cgroup(&self.vm_name);
+        }
+        eprintln!("[NKR-CLEANUP-GUARD] cleanup completo");
+    }
+}
+
 /// Runs a micro-VM with the given configuration
 pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
     let ram_bytes = config.ram_mb as usize * 1024 * 1024;
@@ -659,8 +746,15 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
     // --- CPU Pinning: Assign chrs to physical cores (NUMA locality) ---
     pin_cpu_chrs(config.chrs)?;
 
+    // RAII cleanup guard (audit V3). Captura recursos a medida que los
+    // creamos; en panic durante setup, su Drop limpia todo. defuse() antes
+    // del cleanup normal post-vcpu_loop.
+    let mut cleanup_guard = VmCleanupGuard::new(
+        config.cell_id, config.vm_id, config.name.clone(), config.chrs);
+
     // --- cgroupv2: CPU bursting + I/O throttling + memory.max (Features 2 and 4B) ---
     setup_cgroup(&config.name, config.chrs, config.ram_mb, std::process::id(), &config.disks, config.burst);
+    cleanup_guard.mark_cgroup_done();
 
     // --- Bridge auto-setup (per-cell) ---
     ensure_bridge(config.cell_id)?;
@@ -1036,6 +1130,8 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
         // Install L2 isolation via tc/ebtables (under the same netlock)
         setup_tap_isolation(&tap_name, &mac, &guest_ip);
         eprintln!("[NKR] Auto-TAP: {} (bridge {})", tap_name, bridge_name);
+        // Registrar en el cleanup guard ahora que el TAP existe.
+        cleanup_guard.set_tap(tap_name.clone(), mac, guest_ip.clone());
         Some(tap_name)
     } else { None };
 
@@ -1237,6 +1333,7 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     // Port forwarding
     let forwarding_rules = setup_port_forwarding(&config.port_forwards, &guest_ip);
+    cleanup_guard.set_forwarding_rules(forwarding_rules.clone());
 
     // Register VM in global state
     let effective_tap_str = config.tap_name.as_deref()
@@ -1277,6 +1374,8 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Err(e) = state::register_vm(&vm_state) {
         eprintln!("[NKR] ERROR: No se pudo registrar VM en estado — 'nkr ps' no mostrará esta VM: {e}");
+    } else {
+        cleanup_guard.mark_state_registered();
     }
 
     eprintln!("════════════════════════════════════════════════════════════════");
@@ -1344,6 +1443,10 @@ pub fn run(mut config: VmConfig) -> Result<(), Box<dyn std::error::Error>> {
     // and cgroup teardown, leaving orphaned resources.
     let loop_result = run_vcpu_loop(&mut vcpu, &mut block_devs, &mut net_dev, &mut fs_devs, &mut balloon_dev, &mut console_dev, pmem_dev_opt.as_mut(), &serial_irqfd, config.cell_id, config.vm_id);
     eprintln!("[NKR-DBG] vcpu_loop salió — iniciando cleanup");
+    // Defuse el cleanup_guard — desde acá hacemos el cleanup explícito abajo.
+    // Si vcpu_loop hubiera panic'eado, este defuse no se ejecuta → Drop del
+    // guard limpia los recursos parciales.
+    cleanup_guard.defuse();
 
     // Clean up shutdown sentinel from VirtIO-FS rootfs (if it existed)
     if let Some(rootfs_path) = SHUTDOWN_ROOTFS_PATH.get() {

@@ -61,4 +61,7 @@ opt-level = 3
 lto = true          # Link-Time Optimization — binario más pequeño y rápido
 strip = true        # Eliminar símbolos de debug del binario final
 codegen-units = 1   # Máxima optimización (sacrifica tiempo de compilación)
-panic = "abort"     # Sin stack unwinding — reduce tamaño del binario
+panic = "unwind"    # Permite que Drop corra en panic (CleanupGuard de vmm.rs).
+                    # ~50KB extra en binario vs abort; vale la pena por
+                    # cleanup garantizado de TAP/cgroup/state file si algo
+                    # explota durante init de KVM. Audit 2026-05-16.
