@@ -44,7 +44,7 @@ export TOK="Authorization: Bearer $NKR_API_TOKEN"
   3. `POST /addons/git` / `PUT /pylibs` — opcional, con VM apagada.
   4. `POST /actions {action:"start"}` — devuelve `202` en <50 ms (async desde v1.5.1). El boot real tarda ~30-60 s (PROD prefork más); el panel **debe polear** `GET /instances/{name}` → `nkr_status.phase` hasta `loading|ready`. (Si mandaste `admin_user_password` en el paso 1, el tenant ya quedó arrancado — verificá con el `create-status` que `running=true`.)
   5. Updates posteriores — **la estrategia depende del tier** (ver §7.0):
-     - **`tier=staging` o `tier=dev`**: `POST /addons/git` con `auto_reload=true` (default). NKR dispara `REL_OD` vía HVC0 al PID de la VM y el supervisor loop respawnea Odoo con el código nuevo en ~3 s. **No llamar restart NI upgrade** — `auto_reload` ya lo cubre. NO depende de `dev_mode` (NKR ya no lo setea en staging/dev desde v1.6.3 por incompatibilidad con virtio-fs + presión runtime del watcher; ver §7.0).
+     - **`tier=staging` o `tier=dev`**: `POST /addons/git` con `auto_reload=true` (default). NKR dispara `REL_OD` vía HVC0 al PID de la VM y el supervisor loop respawnea Odoo con el código nuevo en **~5–8 s consistente** (v1.6.9+ hardened — antes era inconsistente bajo carga, ver §4.17.1). **No llamar restart NI upgrade** — `auto_reload` ya lo cubre. NO depende de `dev_mode` (NKR ya no lo setea en staging/dev desde v1.6.3 por incompatibilidad con virtio-fs + presión runtime del watcher; ver §7.0).
      - **`tier=production`, módulo NUEVO**: `POST /addons/git` y listo. Visible para Install desde Apps (UI). No requiere restart.
      - **`tier=production`, módulo ya instalado que cambió código**: `POST /addons/git` + `POST /actions {action:"restart"}`. **NO usar `POST /modules/upgrade` automático en multi-worker** — solo refresca código en el worker que procesa el upgrade, los demás siguen con código viejo (gotcha conocido de Odoo en `workers≥2`). El restart es la opción correcta para garantizar que TODOS los workers cargan el código nuevo. Tiempo: ~15-25s de downtime con el initramfs v1.6.1+ (timer drain reducido a 5s). En workflows con CI/CD apuntando a prod, el restart automático tras git push es válido — solo asegurate de que el panel polee `nkr_status.port_8069_up` para no servir tráfico mid-restart.
      - **Cambio de pip libs / odoo.conf / kernel** (cualquier tier): requiere `POST /actions {action:"restart"}`.
@@ -275,7 +275,7 @@ El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la 
 
 **Campos obligatorios:** `nkr_name`, `odoo_version`, `admin_passwd`. Todo lo demás es opcional. **NO incluir** `cell`, `workers`, `edition` en el contrato v2 (cell se auto-selecciona, workers se deriva del tier, edition se mapea desde `enterprise`).
 
-**Auto-selección de cell (v1.6.10+):** ordenamos por **RAM committed ASC** (suma de `ram_mb` de las VMs ya registradas en la cell), tie-break por `cell_id` ASC. Cuando hay mix de tiers (10 prod@2GB vs 15 dev@1.3GB), gana la que pesa menos en RAM real, no la que tiene menos tenants. **Version matching es tolerante a major/minor**: panel manda `"19"` y matchea cell con `odoo_version: "19.0"`. Si todas las cells de la versión están llenas (≥ 20 Odoos), → 409 `no_cell_available`.
+**Auto-selección de cell (API v2, 2026-05-15+):** ordenamos por **RAM committed ASC** (suma de `ram_mb` de las VMs ya registradas en la cell), tie-break por `cell_id` ASC. Cuando hay mix de tiers (10 prod@2GB vs 15 dev@1.3GB), gana la que pesa menos en RAM real, no la que tiene menos tenants. **Version matching es tolerante a major/minor**: panel manda `"19"` y matchea cell con `odoo_version: "19.0"`. Si todas las cells de la versión están llenas (≥ 20 Odoos), → 409 `no_cell_available`.
 
 **`tier` vs `mode` — orden de prioridad:**
 - Si mandás **`tier`** (recomendado, ver §7.0): NKR ignora `mode` y aplica las reglas del tier:
@@ -301,7 +301,7 @@ El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la 
 | `mode` | `"dev"` (**opcional**) | **Legacy / back-compat.** Cuando `tier=production`: clone de un tenant existente — `source` obligatorio. Para el caso "clonar de producción para testing" usar `tier=staging` (más explícito y aplica config dev). |
 | `cell` | `null` (recomendado, contrato v2) | Auto-selecciona la cell con `odoo_version` match (matching tolerante major/minor) y **más RAM libre** (= menor sum de `ram_mb` de las VMs en la cell). Tie-break por `cell_id` ASC. |
 | `cell` | `"foo"` (legacy) | Fuerza esa cell. 409 si versión no matchea o está llena. Mandar `cell` activa el contrato viejo donde `workers` SÍ se respeta. |
-| `enterprise` | `bool` \| `null` (v1.6.10+) | **Atajo del contrato v2.** `true` → equivale a `edition: "enterprise"`. `false` → `edition: "community"`. Tiene precedencia sobre `edition` si ambos vienen. |
+| `enterprise` | `bool` \| `null` (API v2, 2026-05-15+) | **Atajo del contrato v2.** `true` → equivale a `edition: "enterprise"`. `false` → `edition: "community"`. Tiene precedencia sobre `edition` si ambos vienen. |
 | `source` | `null` (con `mode=production`) | NKR resuelve **automáticamente** según `edition`: community → `<cell>-odoo-template`, enterprise → `<cell>-odoo-template-enterprise` (v1.6.5+, ver §"Sembrar template enterprise"). **No mandar source en mode=production**: si lo mandás, 409 `source_not_allowed_in_production`. Si el template requerido no existe → 409 `cell_template_missing` (community) o `enterprise_template_missing` (enterprise). |
 | `source` | `"<tenant>"` (con `mode=dev`) | **Obligatorio.** Tenant a clonar (mismo cell). Si falta en `mode=dev` → 400 `source_required`. |
 | `edition` | `"enterprise"` \| `"community"` \| `null` | **v1.6.5+ semántica:** determina cuál template usar como source default. `enterprise` → `<cell>-odoo-template-enterprise` (con `web_enterprise` pre-instalado). `community` o `null` → `<cell>-odoo-template`. La activación del theme **NO se hace runtime** (eliminada en v1.6.5) — viene horneada en el template. Para clones-from-tenant (`mode=dev`/`tier=staging`), `edition` no aplica (el clone hereda del source). |
@@ -818,7 +818,7 @@ NKR mantiene un slot por `nkr_name` mientras la acción está en vuelo (evita ra
 Total: ~5-7 segundos. Cero llamadas extra al API.
 ```
 
-**Por qué reemplaza al "no hacer nada" + inotify**: virtio-fs no propaga eventos inotify del host al guest (limitación FUSE). El reload explícito vía SIGUSR1 → hvc0 → SIGHUP es 0% CPU en idle y latencia ~3s. Ver §4.17.1.
+**Por qué reemplaza al "no hacer nada" + inotify**: virtio-fs no propaga eventos inotify del host al guest (limitación FUSE). El reload explícito vía SIGUSR1 → hvc0 → SIGKILL (threaded) o SIGHUP (prefork) es 0 % CPU en idle y latencia **~5–8 s consistente** (v1.6.9+). Ver §4.17.1.
 
 **Sobre `POST /modules/upgrade`** (NO se recomienda automatizar tras git push):
 - En multi-worker, solo refresca código en el worker que procesa el upgrade. Los demás siguen con código viejo en `sys.modules` (gotcha conocido de Odoo). Bug silencioso — el usuario que pega un worker "no upgradeado" ve comportamiento viejo sin error visible.
@@ -1348,7 +1348,7 @@ El panel mira el diff del commit recién pusheado y decide:
 
 | Qué tocó el commit | Pasos del panel |
 |---|---|
-| **Sólo código de módulos** (`.py`, `.xml`, `.csv`, assets, etc.) | `POST /addons/git` con `auto_reload: true` → REL_OD vía HVC0, Odoo respawnea con código fresh en ~3s. **Nada más.** Sin `PUT /pylibs`, sin restart completo. |
+| **Sólo código de módulos** (`.py`, `.xml`, `.csv`, assets, etc.) | `POST /addons/git` con `auto_reload: true` → REL_OD vía HVC0, Odoo respawnea con código fresh en **~5–8 s consistente** (v1.6.9+). **Nada más.** Sin `PUT /pylibs`, sin restart completo. |
 | **`requirements.txt`** (de cualquier módulo) — solo o junto con código | 1. `POST /addons/git` con `auto_reload: false` (no reloadear todavía). 2. `PUT /pylibs` con el `requirements.txt` consolidado del repo (concatená los `*/requirements.txt` de todos los módulos). **Esperá el `200`.** 3. (Opcional pero recomendado) leé el `pip_log_tail` del `200`: si dice `Requirement already satisfied` para todo ⇒ nada cambió realmente ⇒ **podés saltarte el restart** y hacer solo un `POST /reload`. Si dice `Successfully installed ...` ⇒ seguí al paso 4. 4. `POST /actions {action:"restart"}`. 5. `GET /instances/{name}` → poll hasta `nkr_status.phase == "ready"`. |
 | **Varios cambios a la vez** (código + requirements + quizá config) | Batchealos: `POST /addons/git auto_reload:false` → `PUT /pylibs` (esperá 200) → `PATCH /config` si aplica → **UN solo `POST /actions {restart}`** → poll `phase == "ready"`. Un restart al final recoge todo. |
 | **`odoo.conf` / workers / SMTP** (no viene en un git commit — es `PATCH /config`) | `PATCH /config` → restart **sólo si** la respuesta trae `restart_required: true` (workers/memory lo requieren; SMTP no). Ver §4.15. |
@@ -1856,7 +1856,7 @@ curl -s -X POST -H "$TOK" -H "Content-Type: application/json" \
 
 ### 4.17.1 `POST /api/v1/cells/{cell}/instances/{nkr_name}/reload` — Reload de workers Odoo (sin reiniciar VM)
 
-**Disponible desde v1.6.2.** Recicla los workers HTTP de Odoo del tenant **sin reiniciar la VM ni el master**, garantizando que el código nuevo en disco se cargue. ~3 segundos, **sin downtime de la VM**.
+**Disponible desde v1.6.2, hardened en v1.6.9.** Recicla los workers HTTP de Odoo del tenant **sin reiniciar la VM ni el master prefork**, garantizando que el código nuevo en disco se cargue. **~5–8 segundos consistente** bajo cualquier carga (sesiones activas, crons en curso), **sin downtime de la VM**.
 
 **Por qué existe** (background técnico):
 
@@ -1903,7 +1903,11 @@ Soluciones consideradas y descartadas:
 - En **threaded** (workers=0), el reload mata el proceso entero — el supervisor loop de `nkr-start.sh` (`while true; do exec odoo; sleep 1; done`) lo respawnea inmediato. Estado en memoria se pierde (no hay master).
 - En **prefork** (workers>0), el master Odoo NUNCA se reinicia — solo los workers. Master mantiene caches, conexiones IAP, etc.
 
-> ✅ **Arreglado (v1.6.4):** el watcher hvc0 del initramfs ahora detecta el modo (`workers = N` del `odoo.conf` del guest) y manda `pkill -TERM` cuando es threaded (workers=0) / `pkill -HUP` cuando es prefork. En workers=0 el supervisor loop de `nkr-start.sh` respawnea limpio. Verificado 2026-05-12 en `intech-devp` (workers=0): `POST /reload` → `:8069` vuelve en ~3s, sin necesidad del workaround `POST /actions {restart}`. (Para que un tenant ya corriendo recoja el fix: un `POST /actions {restart}` regenera su initramfs con la versión nueva.)
+> ✅ **Arreglado (v1.6.4) + hardened (v1.6.9):**
+> - **v1.6.4** introdujo el dispatch del watcher hvc0 (lee `workers = N` del `odoo.conf` y elige rama). SIGTERM en threaded, SIGHUP master en prefork.
+> - **v1.6.9** sustituyó el SIGTERM-y-esperar por **SIGKILL directo al PID exacto** (el supervisor escribe `echo \$\$ > /tmp/odoo.pid` antes del exec a python3, el watcher lo lee y hace `kill -KILL $pid`). Razón: con sesiones activas (websocket abierto, cron en curso) el handler SIGTERM de Odoo entraba en "Initiating shutdown" indefinidamente — bug observado 2026-05-15 (commit deploy colgaba 180s+). SIGKILL en threaded es seguro (no hay master que preservar) y el supervisor respawnea con código fresh en ~1s. **Prefork sigue con SIGHUP master**, sin cambios (graceful, master vivo). Verificado: `POST /reload` → `:8069` vuelve en **~5-8s consistente** bajo cualquier carga.
+> - Diagnóstico vivo: cada paso del watcher se loguea a `<instance>/logs/nkr-watcher.log` (virtio-fs share visible desde host, `tail -f`-able). Útil para diagnosticar reloads lentos sin shell al guest.
+> - Para que un tenant ya corriendo recoja el fix: un `POST /actions {restart}` regenera su initramfs con la versión nueva del binario NKR.
 
 **Body**: vacío.
 
@@ -1912,8 +1916,8 @@ Soluciones consideradas y descartadas:
 {
   "nkr_name": "company_client-cliente-42",
   "status": "accepted",
-  "mechanism": "SIGUSR1 → vmm → hvc0 REL_OD → guest reload Odoo (SIGHUP master si prefork, SIGTERM+respawn si threaded)",
-  "estimated_seconds": 3,
+  "mechanism": "SIGUSR1 → vmm → hvc0 REL_OD → guest reload Odoo (SIGHUP master si prefork, SIGKILL al PID exacto del python3 si threaded, supervisor respawnea)",
+  "estimated_seconds": 7,
   "note": "Odoo recarga con código fresh del disco. Sin downtime de la VM."
 }
 ```
@@ -1963,7 +1967,7 @@ La response indica `"reloaded": false, "reload_skipped_reason": "auto_reload=fal
 
 | Estrategia | Tiempo | Downtime VM | Downtime master Odoo | Refresca TODOS los workers |
 |------------|--------|-------------|----------------------|----------------------------|
-| `POST /reload` (NUEVO) | **~3 s** | NO | NO | ✅ |
+| `POST /reload` (recomendado) | **~5–8 s** consistente | NO | NO (sólo workers, master vivo en prefork) | ✅ |
 | `POST /modules/upgrade` (multi-worker) | 10-15 s | NO | NO | ❌ (solo el worker upgrader) |
 | `POST /actions {restart}` (tier=dev) | ~13 s | sí (~10s) | sí | ✅ |
 | `POST /actions {restart}` (tier=production) | ~20-30 s | sí (~25s) | sí | ✅ |
@@ -2431,7 +2435,7 @@ NKR diferencia 3 tiers para que **dev iteración no pague el costo del rate-limi
 | **Cloneable como `source`?** | sí | no | **no** (instancias dev son standalone) |
 | **Requiere `source` en POST /instances** | opcional (default = template de cell) | **REQUERIDO** (debe ser tier=production) | **PROHIBIDO** (rejected con 409) |
 | **DB inicial** | template_DB de la cell (vacío bootstrap) | clone de la DB del source production | template_DB de la cell |
-| **Reflejo de cambio de código Python** | requiere full restart de VM (~25s post-v1.6.1) | `POST /addons/git` (auto_reload) ó `POST /reload` → REL_OD vía HVC0 → ~3 s | idem staging |
+| **Reflejo de cambio de código Python** | requiere full restart de VM (~25s post-v1.6.1) | `POST /addons/git` (auto_reload) ó `POST /reload` → REL_OD vía HVC0 → **~5–8 s consistente** (v1.6.9+) | idem staging |
 
 ### REL_OD vía HVC0 + supervisor loop — el game changer
 
@@ -2450,7 +2454,7 @@ git push (modules) → webhook → panel → POST /addons/git (auto_reload=true)
                                        ↓
                                   guest pkill -TERM odoo → supervisor respawn
                                        ↓
-                                  ~3s después: código nuevo vivo
+                                  ~5–8 s después: código nuevo vivo
 ```
 
 El supervisor del initramfs respawnea Odoo con el código fresh desde disco → mismo efecto que `dev_mode=reload` original pero **sin watchdog/inotify** y **sin recompile constante**. `qweb,xml` se elimina porque su valor era marginal frente al costo runtime.
@@ -2701,7 +2705,7 @@ Environment=NKR_WATCHDOG_DISABLED=1
 | `GET /logs/download` | hasta 5 s | **30 s** | Cap 64 MiB; SSD local. |
 | **`POST /init-db`** | **<500 ms** (async) | 10 s | **Asíncrono** — devuelve 202 inmediato; el panel poll `GET /instances/{name}`. |
 | `POST /modules/{install,upgrade,uninstall}` | 10-300 s (síncrono) | **600 s** | Bloquea hasta completar la transacción de Odoo. |
-| `POST /reload` | <50 ms (async, ~3s en el guest) | 5 s | REL_OD vía HVC0 — reload de workers Odoo sin reiniciar la VM. Idempotente. Ver §4.17.1. |
+| `POST /reload` | <50 ms (async, ~5–8 s en el guest) | 5 s | REL_OD vía HVC0 — reload de workers Odoo sin reiniciar la VM. Idempotente. Ver §4.17.1. |
 | `POST /balloon` | <50 ms (async) | 5 s | Marca la VM ACTIVE en el ballooning dinámico (renueva el TS). Ver §4.17.2. |
 | `POST /sso` | 200-800 ms | 5 s | Pre-auth interno + firma HMAC. Devuelve URL TTL 30s. Ver §4.18. |
 | `GET\|POST /diag` | ~50-200 ms | 5 s | Captura stacks/wchan/cpu host-side de los threads del proc nkr. Idempotente. Ver §4.19. |
@@ -2904,7 +2908,7 @@ curl -s -X POST -H "$TOK" -H "Content-Type: application/json" \
   -d '{"action":"restart"}' \
   $NKR_API_BASE/api/v1/cells/$CELL/instances/$NAME/actions
 
-# Reload de workers Odoo SIN reiniciar la VM (~3s) — tras un addons/git manual
+# Reload de workers Odoo SIN reiniciar la VM (~5–8 s, v1.6.9+) — tras un addons/git manual
 curl -s -X POST -H "$TOK" $NKR_API_BASE/api/v1/cells/$CELL/instances/$NAME/reload
 
 # Métricas de la instancia (JSON snapshot — pestaña Métricas del panel; pollear ~2s)
