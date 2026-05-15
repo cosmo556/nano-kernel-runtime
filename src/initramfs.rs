@@ -693,14 +693,30 @@ fi
 echo "[NKR-{label}] DNS configurado: $NKR_DNS_LIST"
 
 # Clean-shutdown watcher — runs in the init context (has /bin/busybox)
-( echo "[NKR-{label}-WATCHER] esperando /dev/hvc0..."
+( # ─── Diagnostic logging to /var/log/odoo/nkr-watcher.log ──────────────
+  # Visible desde el HOST en <instance>/logs/nkr-watcher.log (virtio-fs share
+  # RW). Útil para diagnosticar por qué el watcher subshell no reacciona a
+  # REL_OD (observado 2026-05-15 en intech-devp: stdout del subshell no
+  # aparecía en boot log post-init, hipótesis varias). Cero overhead si nada
+  # llega por hvc0.
+  _WLOG=/newroot/var/log/odoo/nkr-watcher.log
+  /bin/busybox mkdir -p /newroot/var/log/odoo 2>/dev/null
+  _dbg() {{ echo "[$(/bin/busybox date '+%Y-%m-%dT%H:%M:%S')] [$$] $*" >> "$_WLOG" 2>/dev/null; }}
+  _dbg "watcher iniciado (subshell PID=$$, parent=$PPID)"
+  _dbg "fd 1 status: $(/bin/busybox ls -la /proc/self/fd/1 2>&1 | head -1)"
+
+  echo "[NKR-{label}-WATCHER] esperando /dev/hvc0..."
+  _dbg "esperando /dev/hvc0..."
   _wct=0
   while [ ! -e /dev/hvc0 ] && [ $_wct -lt 600 ]; do sleep 0.1; _wct=$((_wct+1)); done
   if [ ! -e /dev/hvc0 ]; then
     echo "[NKR-{label}-WATCHER] ERROR: /dev/hvc0 no apareció tras 60s — watcher abortado"
+    _dbg "ERROR: /dev/hvc0 no apareció tras 60s — abortando"
     exit 1
   fi
   echo "[NKR-{label}-WATCHER] /dev/hvc0 listo (tras ${{_wct}}*100ms) — bloqueado leyendo..."
+  _dbg "/dev/hvc0 listo (tras ${{_wct}}*100ms) — entrando al loop while-true"
+  _dbg "/dev/hvc0 stat: $(/bin/busybox ls -la /dev/hvc0 2>&1)"
   _nkr_cmd=""
   # Loop hvc0 con dispatch: el watcher era single-shot (un read → SHUTDOWN
   # → poweroff). Ahora soporta múltiples comandos:
@@ -712,11 +728,20 @@ echo "[NKR-{label}] DNS configurado: $NKR_DNS_LIST"
   #               escuchando hvc0 para próximos comandos.
   # NKR daemon (host) inyecta REL_OD vía SIGUSR1 al proceso de la VM tras
   # un addons/git exitoso o cuando el panel llama POST /reload.
+  _iter=0
   while true; do
+    _iter=$((_iter+1))
     _nkr_cmd=""
-    read -r _nkr_cmd < /dev/hvc0 || break
-    [ -z "$_nkr_cmd" ] && continue
+    _dbg "iter=$_iter: bloqueando en read -r _nkr_cmd < /dev/hvc0"
+    if ! read -r _nkr_cmd < /dev/hvc0; then
+      _rc=$?
+      _dbg "iter=$_iter: read RETORNÓ ERROR rc=$_rc → BREAK del while (subshell exit)"
+      break
+    fi
+    _dbg "iter=$_iter: read OK, _nkr_cmd='$_nkr_cmd' (len=${{#_nkr_cmd}})"
+    [ -z "$_nkr_cmd" ] && {{ _dbg "iter=$_iter: cmd vacío, continue"; continue; }}
     echo "[NKR-{label}] hvc0 cmd='$_nkr_cmd'"
+    _dbg "iter=$_iter: dispatch '$_nkr_cmd'"
 
     # ─── REL_OD: reload de workers Odoo (sin matar la VM) ──────────────
     if [ "$_nkr_cmd" = "REL_OD" ]; then
@@ -734,27 +759,45 @@ echo "[NKR-{label}] DNS configurado: $NKR_DNS_LIST"
                /newroot/etc/odoo/odoo.conf 2>/dev/null \
                | /bin/busybox awk -F= '{{gsub(/[[:space:]]/, "", $2); print $2}}' \
                | /bin/busybox head -n1)
+      _dbg "REL_OD: workers detectados='$_NKR_W'"
       if [ -z "$_NKR_W" ] || [ "$_NKR_W" = "0" ]; then
-        # Threaded: SIGTERM + grace 5s + SIGKILL fallback → supervisor respawn.
-        # Bug 2026-05-15 en intech-devp: con usuario logueado (websocket activo)
-        # + cron en curso, Odoo entró en "Initiating shutdown" y nunca completó
-        # el exit graceful → REL_OD colgado >60s → watchdog mataba la VM entera.
-        # Fix: si SIGTERM no surte efecto en 5s, escalamos a SIGKILL. El
-        # supervisor loop respawnea con código fresh en ~1s.
-        if /bin/busybox pkill -TERM -f '/usr/bin/odoo' 2>/dev/null; then
-          echo "[NKR-{label}] REL_OD (workers=0/threaded): SIGTERM → esperando 5s"
-          _w=0
-          while /bin/busybox pgrep -f '/usr/bin/odoo' >/dev/null 2>&1 && [ $_w -lt 5 ]; do
-            sleep 1; _w=$((_w+1))
-          done
-          if /bin/busybox pgrep -f '/usr/bin/odoo' >/dev/null 2>&1; then
-            /bin/busybox pkill -KILL -f '/usr/bin/odoo' 2>/dev/null
-            echo "[NKR-{label}] REL_OD: SIGKILL fallback tras 5s (Odoo no respondió a SIGTERM)"
-          else
-            echo "[NKR-{label}] REL_OD: Odoo terminó graceful en ${{_w}}s"
-          fi
+        _dbg "REL_OD: rama threaded (workers=0)"
+        # Threaded (workers=0): SIGKILL al PID directo (leído de /tmp/odoo.pid
+        # que el supervisor wrote ANTES del exec a python3). NO usamos
+        # pkill -f '/usr/bin/odoo' porque bajo carga (websocket activo + cron
+        # en curso) bash + busybox tienen comportamiento inconsistente al
+        # matchear cmdline desde un subshell post-chroot — el watcher
+        # subshell silenciosamente no enviaba la señal (probado 2026-05-15
+        # en intech-devp: 3 commits seguidos colgaron 180s c/u). Con PID
+        # directo via kill(2), cero ambigüedad.
+        #
+        # En threaded NO hay master que preservar (UN solo proceso Python
+        # werkzeug). SIGKILL es seguro: PostgreSQL recicla conexiones idle,
+        # browsers reconectan websocket automáticamente, crons no-completados
+        # quedan en state=pending y vuelven a correr. PROD (workers>0) sí
+        # usa SIGHUP master → cleanup graceful (rama else).
+        # OJO: el watcher corre en el initramfs OUTER (no chrooteado), así
+        # que /tmp/odoo.pid del watcher es /newroot/tmp/odoo.pid desde el
+        # supervisor (chrooteado). Por eso leemos /newroot/tmp/odoo.pid.
+        _odoo_pid=$(/bin/busybox cat /newroot/tmp/odoo.pid 2>/dev/null)
+        _dbg "REL_OD: leyendo /newroot/tmp/odoo.pid → '$_odoo_pid'"
+        if [ -n "$_odoo_pid" ] && /bin/busybox kill -0 "$_odoo_pid" 2>/dev/null; then
+          _dbg "REL_OD: PID $_odoo_pid vivo, enviando SIGKILL"
+          /bin/busybox kill -KILL "$_odoo_pid" 2>/dev/null
+          _kc=$?
+          _dbg "REL_OD: kill -KILL rc=$_kc"
+          echo "[NKR-{label}] REL_OD (workers=0/threaded): SIGKILL PID $_odoo_pid → supervisor respawn"
         else
-          echo "[NKR-{label}] REL_OD: proceso Odoo no encontrado (skip)"
+          _dbg "REL_OD: PID file ausente/stale (val='$_odoo_pid'), fallback a pkill -f"
+          # Fallback: /tmp/odoo.pid ausente o stale → matching cmdline
+          /bin/busybox pkill -KILL -f '/usr/bin/odoo' 2>/dev/null
+          _pc=$?
+          _dbg "REL_OD: pkill -KILL -f rc=$_pc (0=mató al menos uno, 1=no match)"
+          if [ $_pc -eq 0 ]; then
+            echo "[NKR-{label}] REL_OD (workers=0/threaded): SIGKILL via pkill -f (fallback, sin PID file)"
+          else
+            echo "[NKR-{label}] REL_OD: proceso Odoo no encontrado (skip)"
+          fi
         fi
       else
         # Prefork: SIGHUP master → handler respawnea workers
@@ -961,16 +1004,24 @@ if [ "$COMMAND" = "/entrypoint.sh" ] || [ "$COMMAND" = "/docker-entrypoint.sh" ]
         # DB_* already come exported from the nkr-env loaded above; here we just
         # ensure the child process sees them.
         export DB_HOST DB_PORT DB_USER DB_PASSWORD ODOO_RC PYTHONUNBUFFERED PYTHONPATH XDG_CACHE_HOME FONTCONFIG_PATH
+        # Privilege-drop wrapper. Cada path envuelve `$_ODOO_CMD` en
+        # `sh -c 'echo \$\$ > /tmp/odoo.pid; exec ...'` para que el PID del
+        # proceso Odoo final quede grabado en /tmp/odoo.pid ANTES del exec.
+        # El watcher hvc0 lee ese PID y manda SIGKILL directo en REL_OD —
+        # sin pgrep/pkill -f matching (que era poco confiable bajo carga
+        # con shutdown graceful colgado de Odoo, ver §REL_OD en initramfs).
+        # El `$$` se escapa con `\$\$` para que NO lo expanda la outer shell
+        # del supervisor sino la inner /bin/sh spawneada por su/gosu/su-exec.
         if [ -x "/usr/local/bin/gosu" ] || [ -x "/usr/sbin/gosu" ] || [ -x "/usr/bin/gosu" ]; then
-            COMMAND="gosu odoo $_ODOO_CMD"
+            COMMAND="gosu odoo /bin/sh -c 'echo \$\$ > /tmp/odoo.pid; exec $_ODOO_CMD'"
         elif [ -x "/usr/local/sbin/su-exec" ] || [ -x "/sbin/su-exec" ]; then
-            COMMAND="su-exec odoo $_ODOO_CMD"
+            COMMAND="su-exec odoo /bin/sh -c 'echo \$\$ > /tmp/odoo.pid; exec $_ODOO_CMD'"
         else
             # su -p (--preserve-environment) inherits DB_*, ODOO_RC. We do NOT
             # interpolate values into the command string — that would open
             # injection if DB_PASSWORD contained ';' or '$(...)'. The inner
             # shell sees the vars via inherited env (su -p).
-            COMMAND="su -p -s /bin/sh odoo -c 'exec $_ODOO_CMD'"
+            COMMAND="su -p -s /bin/sh odoo -c 'echo \$\$ > /tmp/odoo.pid; exec $_ODOO_CMD'"
         fi
     elif [ -d "/var/lib/postgresql" ] || [ -x "/usr/local/bin/postgres" ]; then
         # Initialize PGDATA if empty (first boot)
@@ -1074,6 +1125,11 @@ echo "[NKR-{label}] Ejecutando comando final: $COMMAND"
 # tienen su propia mecánica (single exec, WAL replay en boot).
 if [ -n "$_ODOO_CMD" ]; then
     while true; do
+        # Limpia /tmp/odoo.pid stale antes de cada launch — el inner shell
+        # (gosu/su-exec/su) escribirá el PID nuevo via `echo \$\$` antes del
+        # exec. Si Odoo crashea ANTES de escribirlo, el watcher cae al
+        # fallback `pkill -f` en el siguiente REL_OD.
+        rm -f /tmp/odoo.pid
         echo "[NKR-{label}] Lanzando Odoo (supervisor): $COMMAND"
         eval "$COMMAND"
         _RC=$?

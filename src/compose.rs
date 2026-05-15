@@ -1283,9 +1283,58 @@ except Exception:\n    \
             cmd.arg("--balloon-decay-secs").arg(config.balloon_decay_secs.to_string());
         }
 
-        // Redirect stdout and stderr to add per-service prefix
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        // Redirect stdout/stderr DIRECT al boot log per-instancia (file, no pipe).
+        // v1.6.10 (fix zombie compose up): antes usábamos Stdio::piped() + dos
+        // threads de lectura BufReader que se quedaban vivos mientras los pipes
+        // estuvieran abiertos → el compose process nunca terminaba y dejaba
+        // 22 procesos colgados durante 12+ h cada uno (uno por VM levantada).
+        // Riesgo crítico: cada VM era PPID-hija de un compose colgado → si
+        // alguien mataba esos compose, las 22 VMs caían en cascada.
+        // Ahora: la VM escribe DIRECTO al archivo, sin parent ownership del
+        // pipe, y el compose puede salir limpio tras health checks → las VMs
+        // se re-parentan a init (PID 1) automáticamente, supervivencia
+        // independiente del daemon NKR. Plus: el child hace setsid() para
+        // ser session leader (immune a SIGHUP de parent death / terminal close).
+        // Bonus: `pre_exec` también pone PR_SET_PDEATHSIG=0 (default), para
+        // que el child NO muera si su parent muere (default kernel behavior
+        // pero explicitamos por defensa).
+        let boot_log_path_pre: Option<PathBuf> = config.disks.first()
+            .and_then(|d| Path::new(d).parent())
+            .map(|dir| dir.join(format!(".{}-vm-boot.log", config_name)));
+        if let Some(ref p) = boot_log_path_pre {
+            // Truncate al inicio de cada boot — historial previo se descarta.
+            let _ = fs::File::create(p);
+        }
+        if let Some(p) = boot_log_path_pre.as_ref() {
+            match fs::OpenOptions::new().write(true).append(true).open(p) {
+                Ok(f) => {
+                    let f2 = f.try_clone().unwrap_or_else(|_| fs::File::create("/dev/null").expect("/dev/null"));
+                    cmd.stdout(Stdio::from(f));
+                    cmd.stderr(Stdio::from(f2));
+                }
+                Err(e) => {
+                    eprintln!("[NKR-COMPOSE] WARN: no pude abrir boot log '{}' ({}), usando /dev/null",
+                        p.display(), e);
+                    cmd.stdout(Stdio::null());
+                    cmd.stderr(Stdio::null());
+                }
+            }
+        } else {
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+        }
+        // setsid() en el child → nuevo session leader, desacoplado del process
+        // group del compose. Si el compose muere por SIGHUP/SIGTERM (terminal
+        // cerrada, systemd stop, etc.), el child NO recibe esas señales.
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         // Pre-write nkr-env in share dirs before launching the child process.
         // vmm.rs rewrites it, but the early write guarantees virtiofsd starts
@@ -1305,72 +1354,21 @@ except Exception:\n    \
             }
         }
 
-        let mut child = cmd.spawn().expect("Fallo al ejecutar nkr run");
+        let child = cmd.spawn().expect("Fallo al ejecutar nkr run");
 
         eprintln!("[NKR-COMPOSE] VM '{}' iniciada (PID {})", name, child.id());
 
-        // Per-instance VM boot log: captura el serial console del guest (stdout
-        // de `nkr run`, donde van los echos del initramfs + el dmesg del guest)
-        // y los logs del propio VMM (stderr). Hasta ahora todo eso se mezclaba
-        // en `nkr-compose.log` (compartido + rotado) — esto deja un archivo
-        // dedicado por instancia, útil para diagnosticar mounts virtio-fs,
-        // panics del guest, etc. Vive junto al disco de la instancia
-        // (`<instance_dir>/.<name>-vm-boot.log`), fuera de los shares virtio-fs
-        // (no aparece dentro del guest). Se trunca en cada arranque.
-        let boot_log_path: Option<PathBuf> = config.disks.first()
-            .and_then(|d| Path::new(d).parent())
-            .map(|dir| dir.join(format!(".{}-vm-boot.log", config_name)));
-        if let Some(ref p) = boot_log_path {
-            let _ = fs::File::create(p); // truncate
-        }
-
-        // Thread to prefix stdout (guest serial) + service-ready detection
-        let svc_name_out = name.clone();
-        let boot_log_out = boot_log_path.clone();
-        if let Some(stdout) = child.stdout.take() {
-            thread::spawn(move || {
-                let mut blog = boot_log_out.as_ref()
-                    .and_then(|p| fs::OpenOptions::new().create(true).append(true).open(p).ok());
-                let reader = BufReader::new(stdout);
-                let mut ready_announced = false;
-                for line in reader.lines() {
-                    if let Ok(line) = line {
-                        eprintln!("[{}] {}", svc_name_out, line);
-                        if let Some(f) = blog.as_mut() { let _ = writeln!(f, "{}", line); }
-                        if !ready_announced {
-                            if line.contains("database system is ready to accept connections")
-                                || line.contains("listening on")
-                                || line.contains("HTTP service")
-                                || line.contains("Listening on")
-                                || line.contains("process up")
-                                || line.contains("Bus READY")
-                            {
-                                eprintln!("[NKR-COMPOSE] servicio '{}' listo", svc_name_out);
-                                ready_announced = true;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        // Thread to prefix stderr (NKR logs)
-        let svc_name_err = name.clone();
-        let boot_log_err = boot_log_path.clone();
-        if let Some(stderr) = child.stderr.take() {
-            thread::spawn(move || {
-                let mut blog = boot_log_err.as_ref()
-                    .and_then(|p| fs::OpenOptions::new().create(true).append(true).open(p).ok());
-                let reader = BufReader::new(stderr);
-                for line in reader.lines() {
-                    if let Ok(line) = line {
-                        eprintln!("[{}] {}", svc_name_err, line);
-                        if let Some(f) = blog.as_mut() { let _ = writeln!(f, "{}", line); }
-                    }
-                }
-            });
-        }
-
+        // NOTA (v1.6.10): los reader threads de stdout/stderr fueron eliminados.
+        // Antes spawneábamos 2 threads por VM con BufReader::lines() que
+        // (a) escribían cada línea al boot log file (ahora redundante: la VM
+        // escribe direct al file via Stdio::from), y (b) detectaban "HTTP
+        // service" / "Bus READY" en stdout para anunciar "[NKR-COMPOSE]
+        // servicio X listo" — pero el path autoritativo de readiness es
+        // run_health_check (TCP probe). Cada thread mantenía vivo un pipe
+        // → compose se atascaba en `child.wait()` al final → 22 procesos
+        // colgados 12 h cada uno. Eliminando los threads + el `child.wait()`
+        // posterior, compose puede salir limpio tras health checks y las
+        // VMs sobreviven como procesos session-leader hijos de init.
         handles.push((name.clone(), vm_id, guest_ip.clone(), svc.healthcheck.clone(), child, config_name.clone(), svc.skip_warmup));
 
         // No sleep between launches: the real netlink/iptables serialization
@@ -1422,14 +1420,25 @@ except Exception:\n    \
         }
     }
 
-    // Wait for all processes to finish
+    // v1.6.10 fix zombie compose: NO esperamos a las VMs reales. Eran tenants
+    // long-running que nunca mueren → child.wait() colgaba el compose para
+    // siempre. Ahora reapeamos solo los placeholders `true` (de skip_launch
+    // en VMs ya activas) con try_wait — si están vivos los abandonamos
+    // (raros y short-lived). Las VMs reales hicieron setsid() y escriben
+    // a archivo (no pipe), así que cuando compose retorne van a re-parentar
+    // a init (PID 1) y sobrevivir limpio.
     for (_name, _, _, _, mut child, _, _) in handles {
-        let _ = child.wait();
+        // try_wait NO-BLOCKING. Los dummies `true` ya murieron → se reapean
+        // acá. Las VMs reales devuelven Ok(None) y dropean (sin reap, pero
+        // el kernel se encarga via reparent a init).
+        let _ = child.try_wait();
     }
 
-    // Clean up PID file
-    let _ = fs::remove_file(PID_FILE);
-    eprintln!("[NKR-COMPOSE] Stack finalizado.");
+    // NO removemos PID_FILE acá — sigue siendo la lista canónica de VMs
+    // levantadas para `nkr compose down` y diagnostico. Se limpia explícito
+    // en `compose down` o cuando se vuelve a lanzar `compose up` y el flow
+    // de detección de active_vm_names hace skip.
+    eprintln!("[NKR-COMPOSE] Stack levantado — compose saliendo (VMs corren independientes vía setsid/init).");
     Ok(())
 }
 
