@@ -205,6 +205,48 @@ fn route(
 
         ("POST", ["api", "v1", "cells", cell, "instances"]) => handle_create_http(Some(cell), body),
 
+        // **API v3 (2026-05-16):** Capacity de UNA cell. Panel pregunta antes
+        // de crear ("¿cabe un proyecto más en odoo-v19?"). Idempotente, sólo lectura.
+        ("GET", ["api", "v1", "cells", cell, "capacity"]) => {
+            if !is_safe_identifier(cell) {
+                return HttpResponse::error(400, "invalid_cell_name", None);
+            }
+            ipc_to_http(ipc_call(&IpcRequest::CellCapacity {
+                cell: (*cell).to_string(),
+            }))
+        }
+
+        // **API v3:** lookup de project_id → cell + instancias. Panel construye
+        // su UI a partir de esto. Si project_id no se encuentra → 404.
+        ("GET", ["api", "v1", "projects", project_id]) => {
+            if !is_safe_identifier(project_id) {
+                return HttpResponse::error(400, "invalid_project_id", None);
+            }
+            ipc_to_http(ipc_call(&IpcRequest::ProjectLookup {
+                project_id: (*project_id).to_string(),
+            }))
+        }
+
+        // **API v3:** adoptar una instancia legacy (sin project_id en meta).
+        // PATCH semantics: asigna project_id + env opcional. Idempotente.
+        ("PATCH", ["api", "v1", "cells", _cell, "instances", name]) => {
+            if !is_safe_identifier(name) {
+                return HttpResponse::error(400, "invalid_nkr_name", None);
+            }
+            #[derive(serde::Deserialize)]
+            struct AdoptBody { project_id: String, #[serde(default)] env: Option<String> }
+            let b: AdoptBody = match serde_json::from_slice(body) {
+                Ok(b) => b,
+                Err(_) => return HttpResponse::error(400, "invalid_json",
+                    Some("body debe ser { project_id, env? }")),
+            };
+            ipc_to_http(ipc_call(&IpcRequest::AdoptInstance {
+                nkr_name: (*name).to_string(),
+                project_id: b.project_id,
+                env: b.env,
+            }))
+        }
+
         ("GET", ["api", "v1", "cells", _cell, "instances", name]) => {
             if !is_safe_identifier(name) {
                 return HttpResponse::error(400, "invalid_nkr_name", None);

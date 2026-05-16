@@ -1488,6 +1488,8 @@ pub fn clone_instance_with_opts(
         limit_memory_hard: opts.limit_memory_hard,
         addons_path: opts.addons_path.clone(),
         tier: opts.tier,
+        project_id: opts.project_id.clone(),
+        env: opts.env.clone(),
         created_at: now_unix_secs(),
     };
     save_instance_meta(&dst_dir, &meta)?;
@@ -1619,6 +1621,13 @@ pub struct CloneOptions {
     /// Tier del tenant (production/staging/dev). Se propaga a meta.json,
     /// odoo.conf (dev_mode/log_level) y vhost (rate-limit/cache off).
     pub tier: Tier,
+    /// **API v3 (2026-05-16):** id inmutable del proyecto del panel. Persiste
+    /// en meta.json para que NKR pueda agrupar instancias del mismo proyecto
+    /// en la misma cell (cell-affinity por proyecto). Opcional para back-compat.
+    pub project_id: Option<String>,
+    /// **API v3:** rol del tenant ("prod"|"staging"|"dev"). Persiste en
+    /// meta.json. Opcional para back-compat.
+    pub env: Option<String>,
     /// Si `true`, el bloque del compose se escribe con `disabled: true`
     /// → la VM no arranca cuando alguien corre `nkr compose up -d`.
     /// La API lo setea para clones COLD-PREPARED (sin admin_user_password).
@@ -1661,6 +1670,17 @@ pub struct InstanceMeta {
     /// Default Production cuando ausente (back-compat para meta.json viejos).
     #[serde(default)]
     pub tier: Tier,
+    /// **API v3 (2026-05-16):** identificador inmutable del proyecto del panel.
+    /// Las cells se agrupan por project_id (no por nkr_name, que puede cambiar
+    /// si el panel renombra el cliente). Default None para back-compat con
+    /// meta.json legacy — en ese caso el fallback es treat-nkr_name-as-id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// **API v3:** rol de la instancia en su proyecto. "prod" | "staging" | "dev".
+    /// Distinto a `tier` (tier es sizing). Aquí marcamos semántica (clone source
+    /// vs nuevo, cell affinity, etc.). Default None para legacy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
     pub created_at: u64,
 }
 
@@ -2588,7 +2608,20 @@ fn remove_compose_block(cell: &CellConfig, nkr_name: &str) -> Result<(), Box<dyn
 
 /// Fixed limit of Odoos per cell (NKR convention). 20 Odoos + 1 PG + 1 PgB = 22 VMs
 /// per cell, max 5 cells in 32 GB RAM = 110 VMs.
-pub const MAX_ODOOS_PER_CELL: usize = 20;
+pub const MAX_ODOOS_PER_CELL: usize = 21;
+
+/// **API v3 (2026-05-16):** límite de proyectos únicos por cell. 7 proyectos × 3
+/// envs (prod+staging+dev) = 21 Odoos = MAX_ODOOS_PER_CELL. La cuenta de
+/// proyectos es lo que matters para el modelo de negocio (cada cliente = 1
+/// proyecto). Override via env `NKR_MAX_PROJECTS_PER_CELL` para admin manual.
+pub const DEFAULT_MAX_PROJECTS_PER_CELL: usize = 7;
+
+pub fn max_projects_per_cell() -> usize {
+    std::env::var("NKR_MAX_PROJECTS_PER_CELL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_PROJECTS_PER_CELL)
+}
 
 /// Counts Odoo instances under `cells/<cell>/instances/*` (PG and pgbouncer
 /// don't live there, so any dir counts as a deployed Odoo).
@@ -2598,6 +2631,48 @@ pub fn count_odoo_instances(cell_name: &str) -> usize {
         Ok(it) => it.flatten().filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false)).count(),
         Err(_) => 0,
     }
+}
+
+/// Lee `meta.json` de cada instancia de la cell y retorna el set de
+/// `project_id` únicos. Para meta.json legacy sin project_id usamos el
+/// nkr_name como fallback (= un project_id "virtual" por instance).
+/// **API v3 (2026-05-16):** base de la cell-selection por proyectos.
+pub fn list_unique_projects_in_cell(cell_name: &str) -> std::collections::HashSet<String> {
+    let dir = cells_dir().join(cell_name).join("instances");
+    let mut projects = std::collections::HashSet::new();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+            let inst_name = entry.file_name().to_string_lossy().to_string();
+            let meta_path = entry.path().join("meta.json");
+            // Si tiene project_id, usarlo. Sino fallback al nkr_name.
+            let pid = if let Ok(s) = fs::read_to_string(&meta_path) {
+                serde_json::from_str::<serde_json::Value>(&s).ok()
+                    .and_then(|v| v.get("project_id")
+                        .and_then(|p| p.as_str())
+                        .map(|s| s.to_string()))
+                    .unwrap_or_else(|| inst_name.clone())
+            } else {
+                inst_name.clone()
+            };
+            projects.insert(pid);
+        }
+    }
+    projects
+}
+
+/// Busca en qué cell vive una instancia dada por nkr_name. Scanea
+/// `cells/<*>/instances/<nkr_name>/`. Retorna el cell_name si existe.
+/// **API v3 (2026-05-16):** usado para cell-affinity de staging/dev clones.
+pub fn find_cell_by_nkr_name(nkr_name: &str) -> Option<String> {
+    let cells = list_cells();
+    for c in cells {
+        let dir = cells_dir().join(&c.name).join("instances").join(nkr_name);
+        if dir.exists() {
+            return Some(c.name);
+        }
+    }
+    None
 }
 
 /// Suma de RAM committed (sum `ram_mb` de todas las VMs registradas) en una
@@ -2662,6 +2737,93 @@ pub fn select_cell_for_version(
         .ok_or_else(|| format!(
             "Todas las cells con odoo_version={} están llenas ({}/{} Odoos)",
             odoo_version, MAX_ODOOS_PER_CELL, MAX_ODOOS_PER_CELL
+        ).into())
+}
+
+/// **API v3 (2026-05-16):** cell selection consciente de proyectos.
+/// Reglas:
+///   - Si `parent_nkr_name` está set → forzar la cell del parent. Si esa cell
+///     ya alcanzó MAX_ODOOS_PER_CELL → error explícito.
+///   - Si parent es None (env=prod, proyecto nuevo) → elegir cell con menos
+///     project_id únicos. Tie-break por ram_committed_mb ASC, después por
+///     cell_id ASC.
+/// El cap por proyectos (`max_projects_per_cell()`) solo aplica a creates
+/// de proyectos NUEVOS — para staging/dev de un proyecto ya existente en una
+/// cell, siempre se le permite entrar a esa cell (cabe en el límite de 21
+/// instancias o falla).
+pub fn select_cell_v3(
+    odoo_version: &str,
+    parent_nkr_name: Option<&str>,
+) -> Result<CellConfig, Box<dyn std::error::Error>> {
+    let want_major = odoo_version.split('.').next().unwrap_or(odoo_version);
+
+    // Caso clone-from-parent: cell affinity forzada
+    if let Some(parent) = parent_nkr_name {
+        let parent_cell_name = find_cell_by_nkr_name(parent)
+            .ok_or_else(|| format!(
+                "parent_not_found: no encontré el tenant '{}' en ninguna cell",
+                parent))?;
+        let parent_cell = load_cell(&parent_cell_name)
+            .map_err(|e| format!("cell_load_failed: {}", e))?;
+        // Validar versión
+        let cell_major = parent_cell.odoo_version.as_deref()
+            .and_then(|v| v.split('.').next());
+        if cell_major != Some(want_major) {
+            return Err(format!(
+                "parent_version_mismatch: parent '{}' está en cell '{}' con version={:?}, \
+                 panel pidió version={}",
+                parent, parent_cell_name, parent_cell.odoo_version, odoo_version
+            ).into());
+        }
+        // Capacidad: si la cell del parent ya está full → error claro
+        let used = count_odoo_instances(&parent_cell.name);
+        if used >= MAX_ODOOS_PER_CELL {
+            return Err(format!(
+                "parent_cell_full: la cell '{}' (donde vive el parent '{}') ya tiene {}/{} \
+                 instancias. Staging/dev DEBE ir en la misma cell que su parent → no se puede crear. \
+                 Opción 1: borrar instancias staging/dev viejas. \
+                 Opción 2: panel decide migrar el proyecto a otra cell (mover prod + clones).",
+                parent_cell.name, parent, used, MAX_ODOOS_PER_CELL
+            ).into());
+        }
+        return Ok(parent_cell);
+    }
+
+    // Caso proyecto nuevo (env=prod sin parent): elegir cell con menos proyectos
+    let max_projects = max_projects_per_cell();
+    let candidates: Vec<(CellConfig, usize, u32)> = list_cells().into_iter()
+        .filter(|c| {
+            let cell_major = c.odoo_version.as_deref()
+                .and_then(|v| v.split('.').next());
+            cell_major == Some(want_major)
+        })
+        .map(|c| {
+            let projects = list_unique_projects_in_cell(&c.name).len();
+            let ram_committed = sum_committed_ram_in_cell(c.cell_id);
+            (c, projects, ram_committed)
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Err(format!(
+            "no_cell_available: no hay cells con odoo_version={}. Cells: {:?}",
+            odoo_version,
+            list_cells().iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        ).into());
+    }
+
+    let mut with_slots: Vec<_> = candidates.into_iter()
+        .filter(|(_, projects, _)| *projects < max_projects)
+        .collect();
+    with_slots.sort_by_key(|(c, projects, ram_committed)|
+        (*projects, *ram_committed, c.cell_id));
+
+    with_slots.into_iter().next()
+        .map(|(c, _, _)| c)
+        .ok_or_else(|| format!(
+            "all_cells_full: todas las cells con odoo_version={} están en su límite \
+             de proyectos ({}). Crear cell nueva o subir NKR_MAX_PROJECTS_PER_CELL.",
+            odoo_version, max_projects
         ).into())
 }
 
@@ -2806,6 +2968,8 @@ pub fn get_instance_info(nkr_name: &str) -> Result<InstanceInfo, Box<dyn std::er
             limit_memory_hard: None,
             addons_path: None,
             tier: Tier::default(),
+            project_id: None,
+            env: None,
             created_at: 0,
         }
     });

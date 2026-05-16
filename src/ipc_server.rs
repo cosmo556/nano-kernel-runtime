@@ -206,6 +206,11 @@ fn dispatch(req: IpcRequest) -> IpcResponse {
     match req {
         IpcRequest::Health => api::handle_health(),
         IpcRequest::ListCells => api::handle_list_cells(),
+        IpcRequest::CellCapacity { cell } => api::handle_cell_capacity(&cell),
+        IpcRequest::ProjectLookup { project_id } => api::handle_project_lookup(&project_id),
+        IpcRequest::AdoptInstance { nkr_name, project_id, env } => {
+            api::handle_adopt_instance(&nkr_name, &project_id, env.as_deref())
+        },
         IpcRequest::RenderMetrics => {
             let body = crate::metrics::render_prometheus_metrics();
             IpcResponse::text(200, "text/plain; version=0.0.4; charset=utf-8", body)

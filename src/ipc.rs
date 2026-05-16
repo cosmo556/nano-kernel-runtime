@@ -55,6 +55,17 @@ pub fn socket_path() -> PathBuf {
 pub enum IpcRequest {
     Health,
     ListCells,
+    /// **API v3 (2026-05-16):** capacidad detallada de una cell para que el
+    /// panel pueda evaluar ANTES de crear si tiene espacio.
+    CellCapacity { cell: String },
+    /// **API v3:** lookup de proyecto → cell + lista de instancias del mismo
+    /// proyecto. Usa project_id (inmutable). Si project_id es legacy nkr_name,
+    /// también lo encuentra (fallback).
+    ProjectLookup { project_id: String },
+    /// **API v3:** asocia un project_id a una instancia ya existente.
+    /// Usado para migrar tenants legacy (creados pre-v3) al modelo nuevo
+    /// sin re-crearlos. Idempotente: si ya tiene un project_id, lo sobreescribe.
+    AdoptInstance { nkr_name: String, project_id: String, env: Option<String> },
     RenderMetrics,
     /// Per-VM metrics snapshot as JSON (the panel's per-instance Metrics tab).
     /// Cached server-side ~30s; the disk `du` cached longer. 404 if unknown.

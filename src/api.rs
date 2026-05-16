@@ -31,7 +31,7 @@ use crate::api_http::{is_safe_addons_path, is_safe_dns, is_safe_identifier};
 use crate::cell::{
     clone_instance_with_opts, count_odoo_instances, delete_instance,
     ensure_cell_prefix, get_instance_info, load_cell, lookup_cell_id,
-    patch_odoo_conf, select_cell_for_version, CloneOptions, Edition, InstanceMode, Tier,
+    patch_odoo_conf, select_cell_for_version, select_cell_v3, CloneOptions, Edition, InstanceMode, Tier,
     MAX_ODOOS_PER_CELL,
 };
 use crate::ipc::IpcResponse;
@@ -74,6 +74,21 @@ pub struct CreateInstanceReq {
     /// default Community).
     #[serde(default)]
     pub enterprise: Option<bool>,
+    /// **API v3 (2026-05-16):** identificador inmutable del proyecto del panel.
+    /// Si presente, NKR persiste en meta.json y agrupa cells por project_id.
+    /// Si ausente, fallback a usar nkr_name como id (back-compat).
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// **API v3:** rol de la instancia. "prod" | "staging" | "dev".
+    /// Si != "prod", `parent_nkr_name` es OBLIGATORIO (NKR fuerza cell affinity
+    /// al parent). Si == "prod", se ignora parent (NKR auto-elige cell).
+    /// Si ausente, fallback a `tier` (legacy mapping).
+    #[serde(default)]
+    pub env: Option<String>,
+    /// **API v3:** nkr_name del tenant PROD parent para staging/dev clones.
+    /// Forzar misma cell. Si parent no existe o ya está en cell llena → 4xx.
+    #[serde(default)]
+    pub parent_nkr_name: Option<String>,
     #[serde(default)]
     pub pg_version: Option<String>,
     /// Sole resource input: NKR deriva chrs, ram_mb (compose) y limit_memory_soft/hard
@@ -354,11 +369,16 @@ pub fn handle_health() -> IpcResponse {
 }
 
 pub fn handle_list_cells() -> IpcResponse {
+    let max_projects = crate::cell::max_projects_per_cell();
     let cells: Vec<serde_json::Value> = crate::cell::list_cells()
         .into_iter()
         .map(|c| {
             let used = crate::cell::count_odoo_instances(&c.name);
             let free = MAX_ODOOS_PER_CELL.saturating_sub(used);
+            let projects = crate::cell::list_unique_projects_in_cell(&c.name);
+            let projects_used = projects.len();
+            let projects_free = max_projects.saturating_sub(projects_used);
+            let ram_committed = crate::cell::sum_committed_ram_in_cell(c.cell_id);
             serde_json::json!({
                 "name": c.name,
                 "cell_id": c.cell_id,
@@ -366,6 +386,11 @@ pub fn handle_list_cells() -> IpcResponse {
                 "used_odoos": used,
                 "max_odoos": MAX_ODOOS_PER_CELL,
                 "free_slots": free,
+                // v3 fields:
+                "projects_used": projects_used,
+                "max_projects": max_projects,
+                "projects_free": projects_free,
+                "ram_committed_mb": ram_committed,
             })
         })
         .collect();
@@ -374,8 +399,150 @@ pub fn handle_list_cells() -> IpcResponse {
         serde_json::json!({
             "cells": cells,
             "max_odoos_per_cell": MAX_ODOOS_PER_CELL,
+            "max_projects_per_cell": max_projects,
         }),
     )
+}
+
+/// **API v3 (2026-05-16):** capacidad detallada de UNA cell + lista de proyectos.
+/// El panel lo usa para decidir si tiene espacio antes de crear, y para mapear
+/// project_id ↔ instancias.
+pub fn handle_cell_capacity(cell_name: &str) -> IpcResponse {
+    if !is_safe_identifier(cell_name) {
+        return IpcResponse::error(400, "invalid_cell_name", None);
+    }
+    let cell = match crate::cell::load_cell(cell_name) {
+        Ok(c) => c,
+        Err(_) => return IpcResponse::error(404, "cell_not_found", None),
+    };
+    let used = crate::cell::count_odoo_instances(&cell.name);
+    let max_projects = crate::cell::max_projects_per_cell();
+    let projects = crate::cell::list_unique_projects_in_cell(&cell.name);
+    let ram_committed = crate::cell::sum_committed_ram_in_cell(cell.cell_id);
+    IpcResponse::json(200, serde_json::json!({
+        "cell": cell.name,
+        "cell_id": cell.cell_id,
+        "odoo_version": cell.odoo_version,
+        "instances_used": used,
+        "instances_max": MAX_ODOOS_PER_CELL,
+        "instances_free": MAX_ODOOS_PER_CELL.saturating_sub(used),
+        "projects_used": projects.len(),
+        "projects_max": max_projects,
+        "projects_free": max_projects.saturating_sub(projects.len()),
+        "projects": projects.iter().collect::<Vec<_>>(),
+        "ram_committed_mb": ram_committed,
+    }))
+}
+
+/// **API v3:** lookup por project_id. Lista todas las instancias del proyecto,
+/// con su cell, env y running state. El panel lo usa para construir su UI
+/// "este proyecto tiene prod en cell X, staging running, dev parado".
+pub fn handle_project_lookup(project_id: &str) -> IpcResponse {
+    if !is_safe_identifier(project_id) {
+        return IpcResponse::error(400, "invalid_project_id", None);
+    }
+    let mut found: Vec<serde_json::Value> = Vec::new();
+    let mut cell_name: Option<String> = None;
+    for c in crate::cell::list_cells() {
+        let dir = crate::cell::cells_dir().join(&c.name).join("instances");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+            let inst_name = entry.file_name().to_string_lossy().to_string();
+            let meta_path = entry.path().join("meta.json");
+            let (pid, env) = if let Ok(s) = std::fs::read_to_string(&meta_path) {
+                let v: serde_json::Value = serde_json::from_str(&s).unwrap_or_default();
+                let pid = v.get("project_id").and_then(|p| p.as_str()).map(|s| s.to_string());
+                let env = v.get("env").and_then(|e| e.as_str()).map(|s| s.to_string());
+                (pid, env)
+            } else { (None, None) };
+            // Match exacto por project_id, o fallback a nkr_name == project_id (legacy)
+            let matches = pid.as_deref() == Some(project_id)
+                || (pid.is_none() && inst_name == project_id);
+            if matches {
+                if cell_name.is_none() { cell_name = Some(c.name.clone()); }
+                let running = crate::state::list_vms().iter()
+                    .any(|v| v.name == inst_name);
+                found.push(serde_json::json!({
+                    "nkr_name": inst_name,
+                    "env": env,
+                    "running": running,
+                }));
+            }
+        }
+    }
+    if found.is_empty() {
+        return IpcResponse::json(404, serde_json::json!({
+            "error": "project_not_found",
+            "project_id": project_id,
+        }));
+    }
+    IpcResponse::json(200, serde_json::json!({
+        "project_id": project_id,
+        "cell": cell_name,
+        "instances": found,
+    }))
+}
+
+/// **API v3:** asocia (o re-asocia) un project_id a una instancia ya
+/// existente. Para migrar tenants legacy al modelo v3 sin recrearlos.
+/// Idempotente. Si `env` se manda, también se persiste.
+pub fn handle_adopt_instance(
+    nkr_name: &str,
+    project_id: &str,
+    env: Option<&str>,
+) -> IpcResponse {
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+    if !is_safe_identifier(project_id) {
+        return IpcResponse::error(400, "invalid_project_id", None);
+    }
+    if let Some(e) = env {
+        if !matches!(e, "prod" | "staging" | "dev") {
+            return IpcResponse::error(400, "invalid_env",
+                Some("debe ser 'prod', 'staging' o 'dev'"));
+        }
+    }
+    let cell_name = match crate::cell::find_cell_by_nkr_name(nkr_name) {
+        Some(c) => c,
+        None => return IpcResponse::error(404, "instance_not_found", None),
+    };
+    let dir = crate::cell::cells_dir().join(&cell_name).join("instances").join(nkr_name);
+    let meta_path = dir.join("meta.json");
+    // Lee meta.json existente, modifica los dos campos, reescribe atómico.
+    let mut v: serde_json::Value = match std::fs::read_to_string(&meta_path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
+        Err(_) => return IpcResponse::error(404, "meta_json_missing", None),
+    };
+    v["project_id"] = serde_json::Value::String(project_id.to_string());
+    if let Some(e) = env {
+        v["env"] = serde_json::Value::String(e.to_string());
+    }
+    let json = match serde_json::to_string_pretty(&v) {
+        Ok(s) => s,
+        Err(e) => return IpcResponse::error(500, "serialize_failed",
+            Some(&e.to_string())),
+    };
+    // tmp+rename atómico (mismo patrón que state.rs)
+    let tmp = meta_path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        return IpcResponse::error(500, "write_failed", Some(&e.to_string()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &meta_path) {
+        return IpcResponse::error(500, "rename_failed", Some(&e.to_string()));
+    }
+    eprintln!("[API] adopt_instance({}): project_id={}, env={:?}",
+        nkr_name, project_id, env);
+    IpcResponse::json(200, serde_json::json!({
+        "nkr_name": nkr_name,
+        "cell": cell_name,
+        "project_id": project_id,
+        "env": env,
+    }))
 }
 
 /// `cell_hint`: None for POST /instances (auto-select). Some(cell) for POST /cells/{cell}/instances.
@@ -412,6 +579,23 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
                    (los recursos se derivan de tier)",
             req.nkr_name, req.workers);
         req.workers = None;
+    }
+
+    // **API v3 (2026-05-16):** `parent_nkr_name` ES el source para el clone
+    // de staging/dev. Si el panel mandó parent_nkr_name pero no source,
+    // auto-derivamos. Si mandó ambos y son distintos → 400 (error del panel).
+    if let Some(parent) = req.parent_nkr_name.as_deref() {
+        match req.source.as_deref() {
+            None => req.source = Some(parent.to_string()),
+            Some(existing) if existing != parent => {
+                return IpcResponse::error(400, "source_parent_mismatch",
+                    Some(&format!(
+                        "Mandaste parent_nkr_name='{}' y source='{}' distintos. \
+                         En contrato v3 son el mismo concepto — usa solo parent_nkr_name.",
+                        parent, existing)));
+            }
+            Some(_) => {} // ambos iguales, OK
+        }
     }
     let req = req; // re-shadow as immutable from here
 
@@ -543,17 +727,50 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
             }
             cell
         }
-        None => match select_cell_for_version(&req.odoo_version) {
-            Ok(c) => c,
-            Err(e) => {
-                return IpcResponse::json(
-                    409,
-                    serde_json::json!({
-                        "error": "no_cell_available",
-                        "message": e.to_string(),
+        None => {
+            // **API v3 (2026-05-16):** si el panel manda `env` (prod|staging|dev)
+            // o `parent_nkr_name`, usar select_cell_v3 con cell-affinity por
+            // parent. Sino fallback al selector v2 (least-RAM por proyectos,
+            // pero contando instancias).
+            let use_v3 = req.env.is_some() || req.parent_nkr_name.is_some()
+                || req.project_id.is_some();
+            let result = if use_v3 {
+                // Validación: env != "prod" requiere parent_nkr_name
+                let env_str = req.env.as_deref().unwrap_or("prod");
+                if env_str != "prod" && req.parent_nkr_name.is_none() {
+                    return IpcResponse::json(400, serde_json::json!({
+                        "error": "parent_required_for_non_prod",
+                        "message": format!("env='{}' requiere parent_nkr_name \
+                            (el tenant PROD del mismo proyecto, para cell affinity)",
+                            env_str),
+                    }));
+                }
+                select_cell_v3(&req.odoo_version, req.parent_nkr_name.as_deref())
+            } else {
+                select_cell_for_version(&req.odoo_version)
+            };
+            match result {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = e.to_string();
+                    // Mapear códigos de error específicos del v3 al http status
+                    let (status, code) = if msg.starts_with("parent_not_found") {
+                        (404, "parent_not_found")
+                    } else if msg.starts_with("parent_cell_full") {
+                        (409, "parent_cell_full")
+                    } else if msg.starts_with("parent_version_mismatch") {
+                        (409, "parent_version_mismatch")
+                    } else if msg.starts_with("all_cells_full") {
+                        (409, "all_cells_full")
+                    } else {
+                        (409, "no_cell_available")
+                    };
+                    return IpcResponse::json(status, serde_json::json!({
+                        "error": code,
+                        "message": msg,
                         "requested_version": req.odoo_version,
-                    }),
-                )
+                    }));
+                }
             }
         },
     };
@@ -825,6 +1042,8 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
         balloon_decay_secs: Some(600),
         skip_db_clone: false,
         tier: req.tier,
+        project_id: req.project_id.clone(),
+        env: req.env.clone(),
         // Cold-prepared (v1.6.5+): bloque nace `disabled: true` cuando el
         // panel no pide auto-start. El POST /actions {start} flippea a `false`.
         // Default de auto_start: presencia de `admin_user_password` (back-compat

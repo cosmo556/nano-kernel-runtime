@@ -237,9 +237,32 @@ El panel lo usa para: (a) discovery inicial, (b) decidir si hace falta crear una
 
 ### 4.4 `POST /api/v1/instances` — Crear con auto-selección de cell
 
-El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la cell con **más RAM libre** que matchee la versión.
+El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la cell que matchee la versión.
 
-> **Contrato v2 (2026-05-15+).** El panel ahora puede mandar el body mínimo:
+> **Contrato v3 (2026-05-16+).** El modelo es por **proyectos** (cliente), no por instancias. Cada proyecto puede tener 1–N instancias (prod, staging, dev). NKR garantiza que TODAS las instancias del mismo proyecto vayan a la MISMA cell (porque el clone de DB usa `CREATE DATABASE TEMPLATE` que es intra-postgres).
+>
+> El panel manda:
+> ```json
+> {
+>   "project_id": "p-abc123",          // ID inmutable del proyecto en el panel
+>   "env": "prod" | "staging" | "dev", // rol de esta instancia
+>   "nkr_name": "intech-prod",         // panel decide el name display-friendly
+>   "version": "19",
+>   "enterprise": false,
+>   "admin_passwd": "...",
+>   "parent_nkr_name": "intech-prod",  // REQUERIDO si env != "prod"
+>   "dns": "intech-prod.example.com"
+> }
+> ```
+>
+> **Lógica de cell selection v3:**
+> - Si `env != "prod"`: `parent_nkr_name` es OBLIGATORIO. NKR busca la cell del parent y crea ahí. Si el parent no existe → 404 `parent_not_found`. Si la cell del parent está full (≥ 21 instancias) → 409 `parent_cell_full`. **El panel debe haber verificado capacidad con `GET /cells/{cell}/capacity` antes de mandar.**
+> - Si `env == "prod"`: proyecto nuevo. NKR elige la cell con menos `project_id` únicos (menos clientes), tie-break por RAM committed. Cap por defecto: **7 proyectos por cell** (configurable vía `NKR_MAX_PROJECTS_PER_CELL`). Si todas las cells de la versión están full → 409 `all_cells_full`.
+> - `parent_nkr_name` actúa como `source` automáticamente para el clone (no mandes ambos — si lo haces, 400 `source_parent_mismatch`).
+>
+> **El panel maneja la lógica de negocio**, NKR es "tonto": NKR no rechaza si un proyecto tiene >3 envs, ni valida quotas. Sólo verifica capacidad física.
+
+> **Contrato v2 (2026-05-15+).** Sigue funcionando para back-compat. El panel ahora puede mandar el body mínimo:
 > ```json
 > {
 >   "nkr_name": "cliente-42",
@@ -405,6 +428,86 @@ Fuente de verdad: `src/api.rs::derive_resources_for_tier`. Aplica **solo a `tier
 - `admin_password_setup_failed` — el clone OK pero el cambio de password del user `admin` falló. El tenant queda arrancado con `admin/admin`. `hint` en el job explica cómo recuperar.
 
 **Importante:** el panel envía `admin_passwd` en el body y es responsable de persistirlo encriptado **antes** de llamar. NKR lo escribe en `config_path/odoo.conf` y no lo devuelve en ninguna respuesta. Si el panel pierde el valor, la única forma de recuperarlo es leer `config_path/odoo.conf` vía SSH al host NKR (fuera de la API).
+
+---
+
+### 4.4.0 Endpoints v3 (capacity + project lookup + adopt) — **API v3, 2026-05-16+**
+
+Tres endpoints para que el panel orqueste el modelo de proyectos.
+
+#### `GET /api/v1/cells/{cell}/capacity` — capacidad detallada de una cell
+
+```bash
+curl -H "Authorization: Bearer $TOK" \
+  "http://nkr:9090/api/v1/cells/odoo-v19/capacity"
+```
+
+Respuesta 200:
+```json
+{
+  "cell": "odoo-v19",
+  "cell_id": 2,
+  "odoo_version": "19.0",
+  "instances_used": 20,
+  "instances_max": 21,
+  "instances_free": 1,
+  "projects_used": 5,
+  "projects_max": 7,
+  "projects_free": 2,
+  "projects": ["intech", "cliente-42", "..."],
+  "ram_committed_mb": 30464
+}
+```
+
+Uso: el panel pregunta ANTES de crear un staging para verificar que la cell del parent tenga `instances_free >= 1`. Si no, sabe que tiene que advertir al usuario o cancelar.
+
+#### `GET /api/v1/projects/{project_id}` — lookup de proyecto
+
+```bash
+curl -H "Authorization: Bearer $TOK" \
+  "http://nkr:9090/api/v1/projects/intech"
+```
+
+Respuesta 200:
+```json
+{
+  "project_id": "intech",
+  "cell": "odoo-v19",
+  "instances": [
+    { "nkr_name": "intech-prod",    "env": "prod",    "running": true },
+    { "nkr_name": "intech-staging", "env": "staging", "running": true },
+    { "nkr_name": "intech-dev",     "env": "dev",     "running": false }
+  ]
+}
+```
+
+Respuesta 404 `project_not_found` si no hay ninguna instancia con ese `project_id`.
+
+**Back-compat**: para instancias legacy sin `project_id` en meta.json, NKR usa `nkr_name` como project_id (fallback). Lookup por nkr_name funciona hasta que se adopta el proyecto con `PATCH`.
+
+#### `PATCH /api/v1/cells/{cell}/instances/{nkr_name}` — adoptar instancia legacy
+
+```bash
+curl -X PATCH -H "Authorization: Bearer $TOK" \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "intech", "env": "dev"}' \
+  "http://nkr:9090/api/v1/cells/odoo-v19/instances/intech-devp"
+```
+
+Respuesta 200:
+```json
+{
+  "nkr_name": "intech-devp",
+  "cell": "odoo-v19",
+  "project_id": "intech",
+  "env": "dev"
+}
+```
+
+Idempotente: asigna `project_id` + `env` opcional al `meta.json` de una instancia ya existente. Reescritura atómica (tmp+rename). Usado para migrar tenants pre-v3 al modelo nuevo SIN recrearlos. Errores:
+- `404 instance_not_found` — la instancia no existe
+- `404 meta_json_missing` — la instancia existe pero le falta meta.json (corrupta)
+- `400 invalid_env` — `env` debe ser `"prod"|"staging"|"dev"`
 
 ---
 
