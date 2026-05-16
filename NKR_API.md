@@ -114,7 +114,8 @@ Códigos HTTP usados:
 - **`nkr_name`, `cell`, `source`, `odoo_version`, `pg_version`**: regex `[A-Za-z0-9._-]{1,64}`.
 - **`dns`**: `[A-Za-z0-9.-]{1,253}`.
 - **`addons_path`**: rechaza `\n`, `\r`, `"`, `'`, backtick, `$`, NUL. Max 1024 chars.
-- **Máx 20 Odoos por cell** (constante `MAX_ODOOS_PER_CELL`).
+- **Máx 21 Odoos-tenant por cell** (constante `MAX_ODOOS_PER_CELL=21`, v1.6.9+ — antes era 20). Pensado para `7 proyectos × 3 envs (prod/staging/dev)`. **Los templates (`<cell>-odoo-template`, `<cell>-odoo-template-enterprise`) NO cuentan contra este cap** — viven aparte (ver §4.4.0 "Nota sobre `instances_used`"). Así una cell puede tener `21 tenants + 1 template community + 1 template enterprise = 23 dirs físicos`, pero `instances_used = 21` en la métrica.
+- **`MAX_PROJECTS_PER_CELL=7`** (configurable vía env `NKR_MAX_PROJECTS_PER_CELL`). Tope de `project_id` únicos en una cell (limita a 7 clientes, cada uno con 1–3 envs).
 - **Una sola versión de Odoo por cell** (definida en `cell.yml`).
 
 ---
@@ -250,15 +251,20 @@ El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la 
 >   "version": "19",
 >   "enterprise": false,
 >   "admin_passwd": "...",
->   "parent_nkr_name": "intech-prod",  // REQUERIDO si env != "prod"
->   "dns": "intech-prod.example.com"
+>   "parent_nkr_name": "intech-prodp", // REQUERIDO si env="staging"; OPCIONAL si env="dev"; NO aplica si env="prod"
+>   "dns": "intech-prod.example.com"   // OPCIONAL (igual que v2 — si se omite, NKR no crea vhost; el panel puede agregarlo después via POST /dns)
 > }
 > ```
 >
+> **Valores válidos de `env` (case-sensitive):** `"prod"`, `"staging"`, `"dev"`. Cualquier otro valor → 400 `invalid_env`. `"PROD"`, `"production"`, `"Prod"` **NO se aceptan en el campo `env`** — son inválidos. Para mandar el contrato v2 usa `tier="production"` (que el normalizer mapea a `env="prod"` internamente — ver "Aliases bidireccionales" abajo).
+>
 > **Lógica de cell selection v3 (corregida 2026-05-16):**
-> - **`env="staging"`**: `parent_nkr_name` es **OBLIGATORIO**. Razón física: el clone de DB usa `CREATE DATABASE … WITH TEMPLATE` que solo funciona intra-postgres → parent y staging deben compartir postgres → misma cell. Sin parent → 400 `parent_required_for_staging`.
-> - **`env="dev"`**: `parent_nkr_name` es **OPCIONAL**. Dev arranca con DB vacía del cell template (no clona del parent). Si el panel manda parent → cell affinity al parent. Si NO manda parent pero el `project_id` ya tiene instancias en alguna cell → **NKR auto-detecta y usa esa cell** (afinidad implícita por proyecto). Si project_id es nuevo (sin instancias previas) → NKR auto-elige cell con menos proyectos.
-> - **`env="prod"`**: standalone. NKR auto-elige cell con menos `project_id` únicos. Tie-break por RAM committed. Cap por defecto: **7 proyectos por cell** (configurable vía `NKR_MAX_PROJECTS_PER_CELL`).
+> - **`env="staging"`**: `parent_nkr_name` es **OBLIGATORIO**. Razón física: el clone de DB usa `CREATE DATABASE … WITH TEMPLATE` que solo funciona intra-postgres → parent y staging deben compartir postgres → misma cell. Sin parent → 400 `parent_required_for_staging`. **El parent además debe ser `env="prod"`** (v1.6.9+) — staging clona del prod para reproducir bugs con datos reales; clonar de otro staging/dev no tiene sentido. Si el parent tiene `env` declarado y no es `prod` → 409 `parent_must_be_prod`. (Backcompat: parents legacy sin `env` no disparan este check — usar PATCH adopt para etiquetar primero si lo necesitás. Otro path legacy `source_must_be_production` se basa en `tier` y suele cubrirlos igual.)
+> - **`env="dev"`**: `parent_nkr_name` es **OPCIONAL** (no se usa para clonar — dev arranca con DB vacía del cell template). Reglas de afinidad de cell:
+>   - Si el panel manda `parent_nkr_name` → cell affinity forzada al parent.
+>   - Si NO manda parent pero el `project_id` ya tiene instancias en alguna cell → **NKR auto-detecta y usa esa cell** (afinidad implícita por proyecto, garantiza misma cell para todos los envs del proyecto).
+>   - Si project_id es nuevo (sin instancias previas) → NKR auto-elige cell con menos `project_id` únicos.
+> - **`env="prod"`**: standalone. NKR auto-elige cell con menos `project_id` únicos. **Tie-break: RAM committed ASC** (cell con menos compose `ram_mb` ya comprometido). Cap por defecto: **7 proyectos por cell** (configurable vía `NKR_MAX_PROJECTS_PER_CELL`). `parent_nkr_name` se ignora en `env="prod"` (no aplica el concepto de "clone").
 >
 > **Errors específicos:**
 > - 404 `parent_not_found` — el `parent_nkr_name` no existe en ninguna cell.
@@ -266,6 +272,11 @@ El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la 
 > - 409 `parent_version_mismatch` — parent vive en cell de otra versión.
 > - 409 `parent_must_be_prod` (v1.6.9+) — `env=staging` requiere que `parent_nkr_name` apunte a una instancia con `env=prod`. Staging clona del prod para reproducir bugs con datos reales; clonar de otro staging/dev no tiene sentido en el modelo. Body: `{"parent_nkr_name", "parent_env"}`. (Backcompat: si el parent es legacy y no tiene `env` declarado en `meta.json`, el check no dispara — usar PATCH adopt antes para etiquetarlo si querés que valide).
 > - 409 `all_cells_full` — todas las cells de la version están en límite de proyectos.
+>
+> **Estado del parent (Punto 20 del reporte):** NKR valida que el parent EXISTA (que el dir `cells/<cell>/instances/<parent>/` esté presente y tenga `meta.json`) y que su versión matchee. **No valida** estado runtime del parent: si está corriendo, si su último create terminó OK, si tiene un DELETE async en curso, ni si su Odoo responde HTTP. Casos edge:
+> - **Parent siendo borrado (DELETE async en curso):** el clone puede fallar a mitad si NKR borra el rootfs del parent durante el `cp --reflink`. El error aparece en `create-status` como `clone_failed`. Recomendación: el panel no debe crear staging/dev clones mientras un DELETE del parent esté en curso (poll `GET /instances/{parent}` hasta `404` antes de garantizar consistencia).
+> - **Parent en `phase=failed` (create del parent falló):** si el parent existe en disco pero `meta.json` y la DB están en estado inconsistente, el clone podría arrancar y fallar tarde (en boot del staging). NKR no bloquea. El panel debería evitar usar parents que tuvieron `status=failed` reciente.
+> - **Parent parado (no running):** OK. El clone usa el rootfs en disco + `CREATE DATABASE … TEMPLATE`, no necesita el Odoo del parent vivo. Solo necesita que PostgreSQL de la cell esté arriba (siempre lo está).
 >
 > `parent_nkr_name` actúa como `source` automáticamente para el clone (no mandes ambos — si lo haces, 400 `source_parent_mismatch`).
 >
@@ -276,7 +287,23 @@ El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la 
 > - `tier=production` ≡ `env=prod`, `tier=staging` ≡ `env=staging`, `tier=dev` ≡ `env=dev` — mapeo bidireccional. Si solo mandas `tier`, NKR deriva `env`. Si solo mandas `env`, NKR deriva `tier`. Si mandas ambos y difieren, **gana el canónico** (`tier` para sizing, `odoo_version` para cell select).
 > - `env` solo es válido en `{"prod","staging","dev"}` (sin `"production"`); `tier` solo en `{"production","staging","dev"}`. Usar el alias incorrecto en el campo equivocado → 400 `invalid_env` / `invalid_tier`.
 >
-> **Unicidad (project_id, env) — enforcer del daemon (v1.6.9+):** NKR rechaza un create si ya existe una instancia con el mismo `(project_id, env)` (en cualquier cell del cluster) — 409 `env_already_taken` con el `nkr_name` conflictivo. Si necesitás duplicar a propósito (rare; testing del panel, etc.) mandá header `X-NKR-Allow-Duplicate-Env: true` → bypass del enforcer. El panel es quien filtra "¿este proyecto ya tiene staging?"; este enforcer es la defensa de profundidad por si se le escapa. El panel ahora puede mandar el body mínimo:
+> **Unicidad (project_id, env) — enforcer del daemon (v1.6.9+):** NKR rechaza un create si ya existe una instancia con el mismo `(project_id, env)` (en cualquier cell del cluster) — 409 `env_already_taken` con el `nkr_name` conflictivo. Si necesitás duplicar a propósito (rare; testing del panel, etc.) mandá header `X-NKR-Allow-Duplicate-Env: true` → bypass del enforcer. El panel es quien filtra "¿este proyecto ya tiene staging?"; este enforcer es la defensa de profundidad por si se le escapa.
+>
+> **Detección automática del contrato (v2 vs v3):** NKR no obliga a setear ninguna flag — decide en runtime mirando los campos del body:
+>
+> | Condición en el body                                                                                          | Path tomado |
+> |---------------------------------------------------------------------------------------------------------------|-------------|
+> | Cualquiera de `env`, `parent_nkr_name`, `project_id` presente y no-vacío                                      | **v3** (`select_cell_v3` con afinidad por parent/project) |
+> | Ninguno de los anteriores presente                                                                            | **v2** legacy (auto-pick por RAM committed, sin project model) |
+>
+> Híbridos legales y conflictos:
+> - **`tier="production"` + `env="prod"`** → coexisten sin conflicto (`tier` rige el sizing, `env` rige la afinidad de cell). Mismo valor → OK.
+> - **`tier="staging"` + `env="prod"`** (mezclados) → tras la normalización, `tier` (canónico para sizing) gana sobre `env` solo si el ingest detecta conflicto; **el panel debe evitar mezclas inconsistentes** — el resultado puede no ser el esperado. Recomendación: mandá un solo contrato (todo v2 o todo v3).
+> - **`odoo_version="19"` + `version="19"`** → OK, `version` se promueve a `odoo_version` si éste falta; si ambos vienen, gana `odoo_version` (canónico).
+> - **`source` + `parent_nkr_name` iguales** → OK, se aceptan (el normalizer los considera el mismo concepto).
+> - **`source` + `parent_nkr_name` distintos** → 400 `source_parent_mismatch`.
+>
+> **Campos comunes que siguen funcionando en v3 (heredados de v2):** `admin_passwd` (obligatorio), `admin_user_password` (opcional, rota admin/admin post-boot — solo válido cuando source es template del cell, no en clones-from-tenant), `auto_start` (default = `admin_user_password.is_some()`), `proxy_mode`, `enterprise`, `python_libs`, `balloon_mb`. Las reglas de §4.4 v2 ("Body completo") aplican igual. El panel ahora puede mandar el body mínimo:
 > ```json
 > {
 >   "nkr_name": "cliente-42",
@@ -422,16 +449,28 @@ Fuente de verdad: `src/api.rs::derive_resources_for_tier`. Aplica **solo a `tier
 // 404 — cell forzada no existe
 { "error":"cell_not_found", "cell":"foo" }
 
-// 409 — varios casos de pre-validación
+// 409 — varios casos de pre-validación (v2 + v3)
 { "error":"version_mismatch", "cell":"foo", "cell_version":"17.0", "requested_version":"16.0" }
 { "error":"no_cell_available", "message":"...", "requested_version":"19.0" }
-{ "error":"cell_full", "cell":"odoo-v17", "used":20, "max":20 }
+{ "error":"cell_full", "cell":"odoo-v17", "used":21, "max":21 }
 { "error":"cell_template_missing", "cell":"foo", "expected_template":"foo-odoo-template" }
 { "error":"source_not_allowed_in_production", "message":"..." }
 { "error":"source_required", "message":"..." }
+{ "error":"source_must_be_production", "source":"...", "source_tier":"dev" }
 { "error":"enterprise_not_provisioned", "cell":"...", "enterprise_path":"..." }
 { "error":"instance_already_exists", "nkr_name":"...", "cell":"..." }   // ya hay un tenant con ese nombre
 { "error":"create_in_progress", "nkr_name":"...", "cell":"..." }        // dos POST concurrentes del mismo nombre
+
+// 400 / 409 — errores específicos del contrato v3 (1.6.9+)
+{ "error":"parent_required_for_staging", "message":"env='staging' requiere parent_nkr_name..." }   // 400
+{ "error":"parent_not_found", "parent":"intech-prodp", "requested_version":"19.0" }                // 404
+{ "error":"parent_cell_full", "parent_cell":"odoo-v19", "used":21, "max":21 }                      // 409
+{ "error":"parent_version_mismatch", "parent_cell_version":"19.0", "requested_version":"17.0" }    // 409
+{ "error":"parent_must_be_prod", "parent_nkr_name":"intech-stg", "parent_env":"staging" }          // 409
+{ "error":"all_cells_full", "requested_version":"19.0" }                                            // 409
+{ "error":"source_parent_mismatch", "source":"a", "parent_nkr_name":"b" }                          // 400 — solo si difieren
+{ "error":"env_already_taken", "conflict_nkr_name":"intech-prodp", "project_id":"intech", "env":"prod" }  // 409 — bypass: header X-NKR-Allow-Duplicate-Env: true
+{ "error":"invalid_env", "message":"debe ser 'prod', 'staging' o 'dev'" }                          // 400 — case-sensitive
 
 // 503 — no se pudo lanzar el thread (extremadamente raro)
 { "error":"spawn_failed", "nkr_name":"...", "cell":"..." }
@@ -475,6 +514,12 @@ Respuesta 200:
 
 Uso: el panel pregunta ANTES de crear un staging para verificar que la cell del parent tenga `instances_free >= 1`. Si no, sabe que tiene que advertir al usuario o cancelar.
 
+**Semántica de los campos:**
+- `instances_used` / `instances_max` / `instances_free` — cuenta de tenants reales (templates excluidos, ver nota abajo).
+- `projects_used` / `projects_max` / `projects_free` — cuenta de `project_id` únicos en la cell. `projects_max=7` por default (`NKR_MAX_PROJECTS_PER_CELL`).
+- `projects[]` — **lista completa, no paginada**. Con `max=7` proyectos por cell, la longitud nunca supera ~10 entries (7 proyectos + algunos legacy sin adoptar = nkr_name-as-project-id). Se devuelve siempre toda la lista en una sola response.
+- `ram_committed_mb` — suma de `compose.ram` (el `ram_mb` configurado en cada `nkr-compose.yml`) de **TODAS las VMs registradas en la cell, incluyendo templates aunque estén apagados (`disabled: true`)** y VMs en estado parado. Es un valor estático de "capacidad reservada en disco" del compose, no la RAM live del KVM. Para la RAM live ver `/metrics` (`nkr_rss_mb{vm=...}` host-side) o el endpoint per-instancia (§4.1.1, `host_mem` / `guest_mem`).
+
 **Nota sobre `instances_used` (v1.6.9+):** **NO incluye templates** (`<cell>-odoo-template`, `<cell>-odoo-template-enterprise`). Solo cuenta instancias-tenant reales. Antes de v1.6.9, los templates contaban contra `instances_used` (19 tenants + 1 template = 20); ahora `instances_used` refleja exclusivamente la ocupación de tenants (`max 21 tenants`, los templates viven aparte). La detección es por sufijo del nombre — `is_template_instance(name)` en [`src/cell.rs`](src/cell.rs#L2703). Similarmente, `projects_used` y `projects` ignoran los templates.
 
 #### `GET /api/v1/projects/{project_id}` — lookup de proyecto
@@ -499,7 +544,12 @@ Respuesta 200:
 
 Respuesta 404 `project_not_found` si no hay ninguna instancia con ese `project_id`.
 
-**Back-compat**: para instancias legacy sin `project_id` en meta.json, NKR usa `nkr_name` como project_id (fallback). Lookup por nkr_name funciona hasta que se adopta el proyecto con `PATCH`.
+**Back-compat (legacy lookup, v1.6.9+):** para instancias legacy sin `project_id` en su `meta.json`, NKR las matchea cuando el `{project_id}` del GET coincide con el `nkr_name`. Comportamiento concreto:
+- `GET /projects/intech-devp` sobre una instancia legacy llamada `intech-devp` (sin `project_id` adoptado): **200 OK** con la instancia listada, `env: null` si tampoco fue adoptado (panel debe inferir o mostrar "unknown"), `running: <true|false>` reflejando el estado real.
+- `GET /projects/intech` cuando el proyecto NO tiene ninguna instancia adoptada con ese `project_id` y ninguna instancia se llama literalmente `intech`: **404 `project_not_found`**.
+- Tras `PATCH /instances/intech-devp {project_id:"intech", env:"dev"}`, el lookup empieza a responder por `project_id` (no más por nkr_name). Idempotente.
+
+**Interacción con parents legacy (Punto 10 del reporte):** si `POST /instances` v3 manda `parent_nkr_name=<legacy>` (un tenant que aún no fue adoptado), NKR igualmente acepta el parent y el clone procede. El nuevo tenant hereda `project_id` del request (no del parent — los parents legacy no tienen `project_id` declarado). Eso significa que después, si el operador **adopta** el legacy con un `project_id` distinto al que usaste en el create v3, vas a tener dos `project_id` distintos para instancias que viven en la misma cell — el modelo se degrada a "tonto" para ese cliente hasta que adoptes el legacy con el mismo `project_id` o renombrés todo. **Recomendación operativa: adoptar primero el legacy (PATCH) y después crear los envs derivados (POST).**
 
 #### `PATCH /api/v1/cells/{cell}/instances/{nkr_name}` — adoptar instancia legacy
 
@@ -622,7 +672,7 @@ Cada cell tiene **un instance reservado** llamado `<cell>-odoo-template` que NKR
 
 **Reglas:**
 - El template se crea una vez por cell, fuera de la API, por el operador. Viene listo en las cells `odoo-v17` y `odoo-v19` actuales.
-- El template **cuenta dentro del `used_odoos` de `GET /cells`**, así que los 20 slots se reparten entre 19 tenants reales + 1 template. `free_slots` lo refleja correctamente.
+- El template **NO cuenta** dentro del `used_odoos` de `GET /cells` ni dentro de `instances_used` de `GET /cells/{cell}/capacity` (v1.6.9+). Los 21 slots son puramente de tenants reales; los templates viven aparte (`<cell>-odoo-template`, `<cell>-odoo-template-enterprise`). Una cell con 21 tenants + 2 templates físicos en disco reporta `instances_used: 21, instances_free: 0`. Antes de v1.6.9 el template contaba (`20 = 19 reales + 1 template`); el cambio se hizo a propósito tras el reporte del panel team (2026-05-16) — ver §4.4.0 "Nota sobre `instances_used`".
 - **El proceso Odoo del template está apagado por default** (`disabled: true` en su bloque de `nkr-compose.yml`). No consume RAM ni CPU. Su DB sigue existiendo en PG y los archivos en disco — eso es todo lo que NKR necesita para clonar. **No hace falta que el panel lo encienda.**
 - El operador puede arrancar el template manualmente para mantenerlo (instalar/upgrade módulos pre-bakeados): editar el yaml a `disabled: false`, `nkr compose up -d`, hacer cambios, `nkr stop <cell>-odoo-template`, restaurar `disabled: true`.
 - **No intentes borrar el template** con `DELETE`. Si lo hacés, la siguiente creación en esa cell devuelve `409 cell_template_missing`. No hay recuperación vía API — el operador tiene que recrearlo.
