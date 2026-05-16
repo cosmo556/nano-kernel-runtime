@@ -54,6 +54,10 @@ pub struct CreateInstanceReq {
     pub mode: InstanceMode,
     /// Required: each cell supports a single Odoo version; the panel
     /// sends it and the backend validates the cell matches.
+    /// **API v3 alias (2026-05-16):** el body acepta también `version` como
+    /// alias — se merge a `odoo_version` ANTES del parse vía
+    /// `normalize_create_body_aliases`. Si ambos vienen y difieren, gana
+    /// `odoo_version` (más explícito).
     pub odoo_version: String,
     /// Optional: if specified, version and capacity are validated. If omitted,
     /// the backend picks the least-full cell with the matching version.
@@ -89,6 +93,15 @@ pub struct CreateInstanceReq {
     /// Forzar misma cell. Si parent no existe o ya está en cell llena → 4xx.
     #[serde(default)]
     pub parent_nkr_name: Option<String>,
+    /// **API v3 (2026-05-16):** bypass del enforce de unicidad (project_id, env).
+    /// Por default NKR rechaza con 409 `env_already_exists` si ya hay una
+    /// instancia con el mismo (project_id, env). El panel puede enviar este
+    /// flag para casos admin/manual donde se necesitan 2 staging del mismo
+    /// proyecto (poco común pero válido).
+    /// El HTTP server (nkr_api_server.rs) lo injecta automáticamente cuando
+    /// el header `X-NKR-Allow-Duplicate-Env: true` está presente.
+    #[serde(default)]
+    pub allow_duplicate_env: Option<bool>,
     #[serde(default)]
     pub pg_version: Option<String>,
     /// Sole resource input: NKR deriva chrs, ram_mb (compose) y limit_memory_soft/hard
@@ -404,6 +417,33 @@ pub fn handle_list_cells() -> IpcResponse {
     )
 }
 
+/// **API v3 (2026-05-16):** busca una instancia con el mismo `(project_id, env)`.
+/// Retorna `Some(nkr_name)` si hay match, `None` si está libre. Usado por el
+/// enforcer de unicidad en POST /instances para prevenir duplicados.
+/// Templates excluidos (no son instancias de proyecto real).
+fn find_instance_with_project_and_env(project_id: &str, env: &str) -> Option<String> {
+    for c in crate::cell::list_cells() {
+        let dir = crate::cell::cells_dir().join(&c.name).join("instances");
+        let entries = match std::fs::read_dir(&dir) { Ok(e) => e, Err(_) => continue };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+            let inst_name = entry.file_name().to_string_lossy().to_string();
+            if crate::cell::is_template_instance(&inst_name) { continue; }
+            let meta_path = entry.path().join("meta.json");
+            if let Ok(s) = std::fs::read_to_string(&meta_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                    let pid = v.get("project_id").and_then(|p| p.as_str());
+                    let ev = v.get("env").and_then(|e| e.as_str());
+                    if pid == Some(project_id) && ev == Some(env) {
+                        return Some(inst_name);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// **API v3 (2026-05-16):** busca cualquier instancia que ya pertenezca a un
 /// `project_id`. Si existe, retorna su nkr_name → caller la usa como "parent
 /// virtual" para forzar cell affinity (ej: env=dev de un proyecto que ya
@@ -540,6 +580,49 @@ pub fn handle_adopt_instance(
         Some(c) => c,
         None => return IpcResponse::error(404, "instance_not_found", None),
     };
+
+    // **API v3 PATCH validations (2026-05-16, reporte panel team):**
+    // 1. project_in_other_cell: si el project_id ya existe en OTRA cell,
+    //    rechazar — rompería la invariante del modelo (1 project = 1 cell).
+    if let Some(existing) = find_existing_instance_for_project(project_id) {
+        if let Some(existing_cell) = crate::cell::find_cell_by_nkr_name(&existing) {
+            if existing_cell != cell_name {
+                return IpcResponse::json(409, serde_json::json!({
+                    "error": "project_in_other_cell",
+                    "message": format!(
+                        "El project_id='{}' ya existe en cell='{}' (instancia '{}'). \
+                         Adoptar esta instancia con ese project_id pondría dos cells \
+                         para el mismo proyecto, rompiendo el modelo. \
+                         Solución: usar un project_id distinto o migrar todas las \
+                         instancias del proyecto a una sola cell.",
+                        project_id, existing_cell, existing),
+                    "project_id": project_id,
+                    "existing_cell": existing_cell,
+                    "this_cell": cell_name,
+                    "conflict_instance": existing,
+                }));
+            }
+        }
+    }
+    // 2. env_already_taken: si se especifica env Y ya hay otra instancia con
+    //    (project_id, env) en cualquier cell, rechazar. Override igual que en
+    //    POST: si se setea con --force, omitir.
+    if let Some(e) = env {
+        if let Some(conflict) = find_instance_with_project_and_env(project_id, e) {
+            if conflict != nkr_name {  // permitir re-PATCH del mismo (idempotencia)
+                return IpcResponse::json(409, serde_json::json!({
+                    "error": "env_already_taken",
+                    "message": format!(
+                        "Ya existe '{}' con project_id='{}' y env='{}'. \
+                         Adoptar esta instancia con el mismo (project_id, env) \
+                         crearía duplicado del modelo.",
+                        conflict, project_id, e),
+                    "conflict_nkr_name": conflict,
+                }));
+            }
+        }
+    }
+
     let dir = crate::cell::cells_dir().join(&cell_name).join("instances").join(nkr_name);
     let meta_path = dir.join("meta.json");
     // Lee meta.json existente, modifica los dos campos, reescribe atómico.
@@ -547,6 +630,27 @@ pub fn handle_adopt_instance(
         Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
         Err(_) => return IpcResponse::error(404, "meta_json_missing", None),
     };
+    // **Sizing mismatch warning (2026-05-16, reporte panel team):**
+    // El PATCH es solo meta-label, NO reconfigura la VM. Si el env nuevo
+    // implica un sizing distinto al tier real (e.g., adopt env=dev sobre
+    // una VM creada como tier=production con workers=2 + 2GB RAM), avisamos.
+    let mut sizing_warning: Option<String> = None;
+    if let Some(e) = env {
+        let current_tier = v.get("tier").and_then(|t| t.as_str()).unwrap_or("");
+        let expected_tier = match e {
+            "prod" => "production",
+            other => other,
+        };
+        if !current_tier.is_empty() && current_tier != expected_tier {
+            sizing_warning = Some(format!(
+                "env='{}' usualmente implica tier='{}', pero esta instancia \
+                 está creada como tier='{}'. El PATCH solo cambia el label de \
+                 meta.json — NO reconfigura la VM. Si quieres el sizing del env \
+                 nuevo, hay que recrear la instancia o aplicar cambios manuales \
+                 (workers, RAM, balloon).",
+                e, expected_tier, current_tier));
+        }
+    }
     v["project_id"] = serde_json::Value::String(project_id.to_string());
     if let Some(e) = env {
         v["env"] = serde_json::Value::String(e.to_string());
@@ -566,26 +670,143 @@ pub fn handle_adopt_instance(
     }
     eprintln!("[API] adopt_instance({}): project_id={}, env={:?}",
         nkr_name, project_id, env);
-    IpcResponse::json(200, serde_json::json!({
+    let mut resp = serde_json::json!({
         "nkr_name": nkr_name,
         "cell": cell_name,
         "project_id": project_id,
         "env": env,
-    }))
+    });
+    if let Some(w) = sizing_warning {
+        resp["sizing_warning"] = serde_json::Value::String(w);
+    }
+    IpcResponse::json(200, resp)
 }
 
 /// `cell_hint`: None for POST /instances (auto-select). Some(cell) for POST /cells/{cell}/instances.
+/// **API v3 aliases (2026-05-16):** pre-procesa el JSON body del create para
+/// mapear aliases del contrato v3 a los campos canónicos del CreateInstanceReq:
+///
+///   - `version` → `odoo_version` (campo canónico)
+///   - `tier=production` ↔ `env=prod` (mapeo bidireccional)
+///
+/// Reglas de conflicto: si ambos vienen y difieren, gana el campo canónico
+/// (odoo_version, tier). Esto permite que el panel migre gradualmente sin
+/// breaking changes: puede mandar tier=production (v2), env=prod (v3), o
+/// ambos. Igual con odoo_version/version.
+///
+/// Devuelve el JSON normalizado como String. Si el parse inicial falla
+/// (JSON malformado), devuelve el original para que el caller produzca el
+/// 400 invalid_json normal.
+fn normalize_create_body_aliases(body: &str) -> String {
+    let mut v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return body.to_string(),
+    };
+    if !v.is_object() { return body.to_string(); }
+    let obj = v.as_object_mut().unwrap();
+
+    // version → odoo_version (si odoo_version está ausente o vacío)
+    let need_odoo_version = obj.get("odoo_version")
+        .and_then(|x| x.as_str())
+        .map(|s| s.is_empty())
+        .unwrap_or(true);
+    if need_odoo_version {
+        if let Some(version_val) = obj.get("version").cloned() {
+            if let Some(s) = version_val.as_str() {
+                if !s.is_empty() {
+                    obj.insert("odoo_version".to_string(),
+                        serde_json::Value::String(s.to_string()));
+                }
+            }
+        }
+    }
+    // tier → env (production→prod, staging→staging, dev→dev) si env ausente
+    if !obj.contains_key("env") || obj.get("env").map(|e| e.is_null()).unwrap_or(false) {
+        if let Some(tier_val) = obj.get("tier").cloned() {
+            if let Some(t) = tier_val.as_str() {
+                let env_str = match t {
+                    "production" => Some("prod"),
+                    "staging"    => Some("staging"),
+                    "dev"        => Some("dev"),
+                    _ => None,
+                };
+                if let Some(e) = env_str {
+                    obj.insert("env".to_string(), serde_json::Value::String(e.to_string()));
+                }
+            }
+        }
+    }
+    // env → tier (prod→production) si tier ausente — permite que el panel
+    // v3 omita tier completamente. Tier es lo que determina sizing internamente.
+    if !obj.contains_key("tier") || obj.get("tier").map(|t| t.is_null()).unwrap_or(false) {
+        if let Some(env_val) = obj.get("env").cloned() {
+            if let Some(e) = env_val.as_str() {
+                let tier_str = match e {
+                    "prod"    => Some("production"),
+                    "staging" => Some("staging"),
+                    "dev"     => Some("dev"),
+                    _ => None,
+                };
+                if let Some(t) = tier_str {
+                    obj.insert("tier".to_string(), serde_json::Value::String(t.to_string()));
+                }
+            }
+        }
+    }
+
+    serde_json::to_string(&v).unwrap_or_else(|_| body.to_string())
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+    #[test]
+    fn version_promoted_to_odoo_version() {
+        let body = r#"{"version":"19","nkr_name":"x"}"#;
+        let out = normalize_create_body_aliases(body);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["odoo_version"].as_str(), Some("19"));
+    }
+    #[test]
+    fn odoo_version_wins_if_both() {
+        let body = r#"{"version":"19","odoo_version":"17","nkr_name":"x"}"#;
+        let out = normalize_create_body_aliases(body);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["odoo_version"].as_str(), Some("17"));
+    }
+    #[test]
+    fn tier_production_maps_to_env_prod() {
+        let body = r#"{"tier":"production","nkr_name":"x","odoo_version":"19"}"#;
+        let out = normalize_create_body_aliases(body);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["env"].as_str(), Some("prod"));
+    }
+    #[test]
+    fn env_prod_maps_to_tier_production() {
+        let body = r#"{"env":"prod","nkr_name":"x","odoo_version":"19"}"#;
+        let out = normalize_create_body_aliases(body);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["tier"].as_str(), Some("production"));
+    }
+}
+
 pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
     if body_json.len() > 64 * 1024 {
         return IpcResponse::error(413, "body_too_large", None);
     }
-    let mut req: CreateInstanceReq = match serde_json::from_str(body_json) {
+    // **API v3 aliases (2026-05-16):** pre-procesar JSON antes de parsear
+    // para mapear los aliases que el panel v3 puede mandar:
+    //   - `version` → `odoo_version`
+    //   - `tier=production` ↔ `env=prod` (mapeo bidireccional sin conflicto)
+    // Si ambos vienen y difieren, el campo "oficial" (odoo_version, env) gana.
+    let body_normalized = normalize_create_body_aliases(body_json);
+    let mut req: CreateInstanceReq = match serde_json::from_str(&body_normalized) {
         Ok(r) => r,
-        Err(_) => {
+        Err(e) => {
             return IpcResponse::error(
                 400,
                 "invalid_json",
-                Some("request body is not valid JSON or missing required fields"),
+                Some(&format!("request body is not valid JSON or missing required fields: {}", e)),
             )
         }
     };
@@ -624,6 +845,33 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
                         parent, existing)));
             }
             Some(_) => {} // ambos iguales, OK
+        }
+    }
+
+    // **API v3: enforcer de unicidad (project_id, env)** (2026-05-16).
+    // Por default, NKR rechaza si ya existe una instancia con el mismo
+    // (project_id, env). Esto previene corrupción del modelo cuando dos
+    // paneles concurrentes intentan crear el mismo prod del mismo proyecto.
+    // Override: `allow_duplicate_env: true` en body (o header
+    // `X-NKR-Allow-Duplicate-Env: true` que se traduce a ese campo).
+    // Skip si project_id ausente (back-compat con creates sin project).
+    let bypass_uniqueness = req.allow_duplicate_env.unwrap_or(false);
+    if !bypass_uniqueness {
+        if let (Some(pid), Some(env)) = (req.project_id.as_deref(), req.env.as_deref()) {
+            if let Some(conflict) = find_instance_with_project_and_env(pid, env) {
+                return IpcResponse::json(409, serde_json::json!({
+                    "error": "env_already_exists",
+                    "message": format!(
+                        "Ya existe una instancia con project_id='{}' y env='{}': '{}'. \
+                        Si necesitás múltiples envs del mismo tipo (caso admin), \
+                        usá el header X-NKR-Allow-Duplicate-Env: true o el campo \
+                        body allow_duplicate_env=true.",
+                        pid, env, conflict),
+                    "conflict_nkr_name": conflict,
+                    "project_id": pid,
+                    "env": env,
+                }));
+            }
         }
     }
     let req = req; // re-shadow as immutable from here
@@ -787,6 +1035,39 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
                             (clona DB del prod via CREATE DATABASE TEMPLATE, \
                             necesita postgres común → cell affinity obligatoria)",
                     }));
+                }
+                // **Code 5 (2026-05-16, reporte panel team):** si env=staging,
+                // el parent DEBE ser env=prod. Staging clona del prod (datos
+                // reales para reproducir bugs); clonar de otro staging/dev no
+                // tiene sentido en el modelo de negocio (cadenas dev→staging
+                // generan deriva de datos no representativa).
+                if env_str == "staging" {
+                    if let Some(p) = req.parent_nkr_name.as_deref() {
+                        let parent_env = crate::cell::find_cell_by_nkr_name(p)
+                            .and_then(|c| {
+                                let mp = crate::cell::cells_dir()
+                                    .join(&c).join("instances").join(p).join("meta.json");
+                                std::fs::read_to_string(&mp).ok()
+                            })
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                            .and_then(|v| v.get("env").and_then(|e| e.as_str()).map(|s| s.to_string()));
+                        // Si el parent tiene env declarado y NO es "prod", rechazar.
+                        // Si el parent NO tiene env (legacy pre-v3), aceptar
+                        // — no podemos romper backcompat de tenants sin env.
+                        if let Some(pe) = parent_env {
+                            if pe != "prod" {
+                                return IpcResponse::json(409, serde_json::json!({
+                                    "error": "parent_must_be_prod",
+                                    "message": format!(
+                                        "env='staging' requiere parent_nkr_name con env='prod', \
+                                         pero '{}' tiene env='{}'. Staging debe clonar del prod \
+                                         para reproducir bugs con datos reales.", p, pe),
+                                    "parent_nkr_name": p,
+                                    "parent_env": pe,
+                                }));
+                            }
+                        }
+                    }
                 }
                 // Si no hay parent_nkr_name pero hay project_id, buscar si el
                 // proyecto ya tiene una instancia y usar ESA cell (afinidad

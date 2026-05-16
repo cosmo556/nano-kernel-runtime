@@ -188,7 +188,7 @@ fn route(
     match (method, segs.as_slice()) {
         ("GET", ["api", "v1", "cells"]) => ipc_to_http(ipc_call(&IpcRequest::ListCells)),
 
-        ("POST", ["api", "v1", "instances"]) => handle_create_http(None, body),
+        ("POST", ["api", "v1", "instances"]) => handle_create_http(None, body, headers),
 
         ("POST", ["api", "v1", "admin", "cache", "purge"]) => {
             ipc_to_http(ipc_call(&IpcRequest::PurgeCache))
@@ -203,7 +203,7 @@ fn route(
             }))
         }
 
-        ("POST", ["api", "v1", "cells", cell, "instances"]) => handle_create_http(Some(cell), body),
+        ("POST", ["api", "v1", "cells", cell, "instances"]) => handle_create_http(Some(cell), body, headers),
 
         // **API v3 (2026-05-16):** Capacity de UNA cell. Panel pregunta antes
         // de crear ("¿cabe un proyecto más en odoo-v19?"). Idempotente, sólo lectura.
@@ -630,7 +630,7 @@ fn route(
     }
 }
 
-fn handle_create_http(cell_hint: Option<&str>, body: &[u8]) -> HttpResponse {
+fn handle_create_http(cell_hint: Option<&str>, body: &[u8], headers: &[(String, String)]) -> HttpResponse {
     if body.len() > CREATE_BODY_LIMIT {
         return HttpResponse::error(413, "body_too_large", None);
     }
@@ -638,6 +638,26 @@ fn handle_create_http(cell_hint: Option<&str>, body: &[u8]) -> HttpResponse {
         Ok(s) => s.to_string(),
         Err(_) => return HttpResponse::error(400, "invalid_utf8", None),
     };
+
+    // **API v3 (2026-05-16):** Header X-NKR-Allow-Duplicate-Env permite
+    // bypass del enforce de unicidad (project_id, env). Lo traducimos al
+    // body como `allow_duplicate_env: true` (campo del IPC). Sin esto,
+    // el daemon haría un 409 env_already_exists si ya hay match.
+    let allow_dup = headers.iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("X-NKR-Allow-Duplicate-Env")
+            && v.trim().eq_ignore_ascii_case("true"));
+    let body_str = if allow_dup {
+        match serde_json::from_str::<serde_json::Value>(&body_str) {
+            Ok(mut v) => {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("allow_duplicate_env".to_string(),
+                        serde_json::Value::Bool(true));
+                }
+                serde_json::to_string(&v).unwrap_or(body_str)
+            }
+            Err(_) => body_str,
+        }
+    } else { body_str };
 
     // Lightweight JSON validation of the fields we care about — daemon
     // re-validates with the typed schema but we sanitize early to give good

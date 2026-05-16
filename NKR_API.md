@@ -264,13 +264,19 @@ El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la 
 > - 404 `parent_not_found` — el `parent_nkr_name` no existe en ninguna cell.
 > - 409 `parent_cell_full` — la cell del parent ya tiene 21 instancias. **El panel debe haber verificado con `GET /cells/{cell}/capacity` antes.**
 > - 409 `parent_version_mismatch` — parent vive en cell de otra versión.
+> - 409 `parent_must_be_prod` (v1.6.9+) — `env=staging` requiere que `parent_nkr_name` apunte a una instancia con `env=prod`. Staging clona del prod para reproducir bugs con datos reales; clonar de otro staging/dev no tiene sentido en el modelo. Body: `{"parent_nkr_name", "parent_env"}`. (Backcompat: si el parent es legacy y no tiene `env` declarado en `meta.json`, el check no dispara — usar PATCH adopt antes para etiquetarlo si querés que valide).
 > - 409 `all_cells_full` — todas las cells de la version están en límite de proyectos.
 >
 > `parent_nkr_name` actúa como `source` automáticamente para el clone (no mandes ambos — si lo haces, 400 `source_parent_mismatch`).
 >
 > **El panel maneja la lógica de negocio**, NKR es "tonto": NKR no rechaza si un proyecto tiene >3 envs, ni valida quotas. Sólo verifica capacidad física.
-
-> **Contrato v2 (2026-05-15+).** Sigue funcionando para back-compat. El panel ahora puede mandar el body mínimo:
+>
+> **Aliases bidireccionales del contrato (v1.6.9+, 2026-05-16):** para que el panel migre v2↔v3 sin breaking changes, NKR normaliza el body en el ingest:
+> - `version` ≡ `odoo_version` (si solo mandas `version`, se promueve a `odoo_version`).
+> - `tier=production` ≡ `env=prod`, `tier=staging` ≡ `env=staging`, `tier=dev` ≡ `env=dev` — mapeo bidireccional. Si solo mandas `tier`, NKR deriva `env`. Si solo mandas `env`, NKR deriva `tier`. Si mandas ambos y difieren, **gana el canónico** (`tier` para sizing, `odoo_version` para cell select).
+> - `env` solo es válido en `{"prod","staging","dev"}` (sin `"production"`); `tier` solo en `{"production","staging","dev"}`. Usar el alias incorrecto en el campo equivocado → 400 `invalid_env` / `invalid_tier`.
+>
+> **Unicidad (project_id, env) — enforcer del daemon (v1.6.9+):** NKR rechaza un create si ya existe una instancia con el mismo `(project_id, env)` (en cualquier cell del cluster) — 409 `env_already_taken` con el `nkr_name` conflictivo. Si necesitás duplicar a propósito (rare; testing del panel, etc.) mandá header `X-NKR-Allow-Duplicate-Env: true` → bypass del enforcer. El panel es quien filtra "¿este proyecto ya tiene staging?"; este enforcer es la defensa de profundidad por si se le escapa. El panel ahora puede mandar el body mínimo:
 > ```json
 > {
 >   "nkr_name": "cliente-42",
@@ -469,6 +475,8 @@ Respuesta 200:
 
 Uso: el panel pregunta ANTES de crear un staging para verificar que la cell del parent tenga `instances_free >= 1`. Si no, sabe que tiene que advertir al usuario o cancelar.
 
+**Nota sobre `instances_used` (v1.6.9+):** **NO incluye templates** (`<cell>-odoo-template`, `<cell>-odoo-template-enterprise`). Solo cuenta instancias-tenant reales. Antes de v1.6.9, los templates contaban contra `instances_used` (19 tenants + 1 template = 20); ahora `instances_used` refleja exclusivamente la ocupación de tenants (`max 21 tenants`, los templates viven aparte). La detección es por sufijo del nombre — `is_template_instance(name)` en [`src/cell.rs`](src/cell.rs#L2703). Similarmente, `projects_used` y `projects` ignoran los templates.
+
 #### `GET /api/v1/projects/{project_id}` — lookup de proyecto
 
 ```bash
@@ -512,10 +520,29 @@ Respuesta 200:
 }
 ```
 
-Idempotente: asigna `project_id` + `env` opcional al `meta.json` de una instancia ya existente. Reescritura atómica (tmp+rename). Usado para migrar tenants pre-v3 al modelo nuevo SIN recrearlos. Errores:
+Idempotente: asigna `project_id` + `env` opcional al `meta.json` de una instancia ya existente. Reescritura atómica (tmp+rename). Usado para migrar tenants pre-v3 al modelo nuevo SIN recrearlos.
+
+**Validaciones (v1.6.9+, 2026-05-16):**
+- **409 `project_in_other_cell`** — el `project_id` ya está asociado a una instancia en OTRA cell. Adoptar acá rompería la invariante "1 proyecto = 1 cell". Body: `{"existing_cell", "this_cell", "conflict_instance", "project_id"}`. Resolución: usar otro `project_id` o migrar todas las instancias a una sola cell antes.
+- **409 `env_already_taken`** — ya existe otra instancia con el mismo `(project_id, env)` (en cualquier cell). PATCH del mismo nkr_name es idempotente y no dispara este error. Body: `{"conflict_nkr_name"}`.
+- **`sizing_warning` (campo en la 200 OK, no error)** — si `env` declarado no coincide con el `tier` real de la VM (e.g., PATCH `env=dev` sobre una VM creada como `tier=production` con workers=2 + 2GB), NKR responde 200 con el campo extra `sizing_warning: "..."` explicando que **el PATCH solo cambia el label de meta.json**, NO reconfigura la VM (workers, RAM, balloon). Si el panel quiere el sizing nuevo, debe recrear la instancia o aplicar `PATCH /config` manual.
+
+**Errores generales:**
 - `404 instance_not_found` — la instancia no existe
 - `404 meta_json_missing` — la instancia existe pero le falta meta.json (corrupta)
 - `400 invalid_env` — `env` debe ser `"prod"|"staging"|"dev"`
+- `400 invalid_project_id` — formato inválido (`[A-Za-z0-9._-]{1,64}`)
+
+**Ejemplo 200 con sizing_warning:**
+```json
+{
+  "nkr_name": "intech-prodp",
+  "cell": "odoo-v19",
+  "project_id": "intech",
+  "env": "dev",
+  "sizing_warning": "env='dev' usualmente implica tier='dev', pero esta instancia está creada como tier='production'. El PATCH solo cambia el label de meta.json — NO reconfigura la VM. Si quieres el sizing del env nuevo, hay que recrear la instancia o aplicar cambios manuales (workers, RAM, balloon)."
+}
+```
 
 ---
 

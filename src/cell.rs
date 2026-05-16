@@ -2674,14 +2674,35 @@ pub fn max_projects_per_cell() -> usize {
         .unwrap_or(DEFAULT_MAX_PROJECTS_PER_CELL)
 }
 
-/// Counts Odoo instances under `cells/<cell>/instances/*` (PG and pgbouncer
-/// don't live there, so any dir counts as a deployed Odoo).
+/// Counts Odoo TENANT instances under `cells/<cell>/instances/*`.
+///
+/// **2026-05-16:** templates (`*-odoo-template`, `*-odoo-template-enterprise`)
+/// son INFRA (no clientes) y NO se cuentan. El cap de 21 instances/cell aplica
+/// a tenants reales: 7 proyectos × 3 envs = 21. Antes el conteo incluía templates
+/// → 19 slots reales + 2 templates no cuadraban con 7 × 3 = 21. Reporte del
+/// panel team del 2026-05-16 cerró esta inconsistencia.
+///
+/// La heurística filtra por sufijo `-odoo-template` (community) o
+/// `-odoo-template-enterprise` (enterprise) — convención de naming actual.
 pub fn count_odoo_instances(cell_name: &str) -> usize {
     let dir = cells_dir().join(cell_name).join("instances");
     match fs::read_dir(&dir) {
-        Ok(it) => it.flatten().filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false)).count(),
+        Ok(it) => it.flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                !is_template_instance(&name)
+            })
+            .count(),
         Err(_) => 0,
     }
+}
+
+/// Retorna true si el nombre de instancia es un template (infra, no tenant
+/// real). Templates excluidos del cap de instances per cell.
+pub fn is_template_instance(name: &str) -> bool {
+    name.ends_with("-odoo-template")
+        || name.ends_with("-odoo-template-enterprise")
 }
 
 /// Lee `meta.json` de cada instancia de la cell y retorna el set de
@@ -2695,6 +2716,8 @@ pub fn list_unique_projects_in_cell(cell_name: &str) -> std::collections::HashSe
         for entry in entries.flatten() {
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
             let inst_name = entry.file_name().to_string_lossy().to_string();
+            // Templates (infra) no son proyectos.
+            if is_template_instance(&inst_name) { continue; }
             let meta_path = entry.path().join("meta.json");
             // Si tiene project_id, usarlo. Sino fallback al nkr_name.
             let pid = if let Ok(s) = fs::read_to_string(&meta_path) {
