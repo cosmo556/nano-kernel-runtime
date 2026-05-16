@@ -300,6 +300,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nkr-watcher"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

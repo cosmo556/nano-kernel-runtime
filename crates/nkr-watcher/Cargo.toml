@@ -1,0 +1,19 @@
+[package]
+name = "nkr-watcher"
+version = "0.1.0"
+edition = "2021"
+description = "Guest-side hvc0 watcher para NKR — reemplaza el subshell busybox del initramfs. Maneja REL_OD (reload de Odoo) y SHUTDOWN (apagado limpio). Compilado estático con musl, ~150KB. Vive en /bin/nkr-watcher del initramfs."
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "nkr-watcher"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"     # optimizar tamaño (binario chico para embedding)
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"     # binario chico, errores fatales no requieren cleanup

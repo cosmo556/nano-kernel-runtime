@@ -401,9 +401,23 @@ pub fn generate_initramfs(name: &str, disk_path: &str, docker_cmd: Option<&[Stri
     fs::write(&init_path, &init_content)?;
     Command::new("chmod").args(["+x", &init_path.to_string_lossy()]).status()?;
 
-    for dir in &["dev", "etc", "newroot", "proc", "run", "sys"] {
+    for dir in &["dev", "etc", "newroot", "proc", "run", "sys", "bin"] {
         fs::create_dir_all(work.join(dir))?;
     }
+
+    // Embeber nkr-watcher (binario Rust estático). Sustituye al subshell
+    // busybox del init script para evitar la race rara que el shell tenía
+    // con virtio-console (audit 2026-05-15). Compilado pre-build con
+    // `cargo build --release -p nkr-watcher --target=x86_64-unknown-linux-musl`.
+    // El binario va a /bin/nkr-watcher con 0755.
+    const NKR_WATCHER_BIN: &[u8] = include_bytes!(
+        concat!(env!("CARGO_MANIFEST_DIR"),
+            "/target/x86_64-unknown-linux-musl/release/nkr-watcher"));
+    let watcher_path = work.join("bin/nkr-watcher");
+    fs::write(&watcher_path, NKR_WATCHER_BIN)?;
+    Command::new("chmod").args(["0755", &watcher_path.to_string_lossy()]).status()?;
+    eprintln!("[NKR-INITRAMFS] Embebido /bin/nkr-watcher ({} bytes)",
+        NKR_WATCHER_BIN.len());
 
     // Embed env vars in /etc/nkr-env inside the initramfs (if provided).
     // This ensures immediate availability without depending on file delivery via shares.
@@ -693,6 +707,14 @@ fi
 echo "[NKR-{label}] DNS configurado: $NKR_DNS_LIST"
 
 # Clean-shutdown watcher — runs in the init context (has /bin/busybox)
+# NOTA (P4 del audit 2026-05-16): se intentó reemplazar este subshell por un
+# binario Rust estático (musl) — DESCARTADO. El binario Rust NO logra leer
+# de /dev/hvc0 confiablemente bajo virtio-console: probamos persistent fd
+# con BufReader, re-open por iteración con BufReader, y libc::open+read raw,
+# y los tres se cuelgan tras el primer mensaje. El subshell busybox sí
+# funciona (con una race rara en el N-ésimo reload consecutivo, manejada
+# por el watchdog). El binario `nkr-watcher` queda embebido en /bin/ del
+# initramfs para futuro re-uso/investigación, pero no se lanza.
 ( # ─── Diagnostic logging to /var/log/odoo/nkr-watcher.log ──────────────
   # Visible desde el HOST en <instance>/logs/nkr-watcher.log (virtio-fs share
   # RW). Útil para diagnosticar por qué el watcher subshell no reacciona a
