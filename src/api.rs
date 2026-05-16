@@ -404,6 +404,35 @@ pub fn handle_list_cells() -> IpcResponse {
     )
 }
 
+/// **API v3 (2026-05-16):** busca cualquier instancia que ya pertenezca a un
+/// `project_id`. Si existe, retorna su nkr_name → caller la usa como "parent
+/// virtual" para forzar cell affinity (ej: env=dev de un proyecto que ya
+/// tiene prod en otra cell). Útil para evitar que NKR coloque envs del mismo
+/// proyecto en cells distintas (rompería la regla del modelo de negocio).
+///
+/// Scanea meta.json de todas las instancias en todas las cells. None si
+/// project_id es desconocido (proyecto nuevo).
+fn find_existing_instance_for_project(project_id: &str) -> Option<String> {
+    for c in crate::cell::list_cells() {
+        let dir = crate::cell::cells_dir().join(&c.name).join("instances");
+        let entries = match std::fs::read_dir(&dir) { Ok(e) => e, Err(_) => continue };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+            let inst_name = entry.file_name().to_string_lossy().to_string();
+            let meta_path = entry.path().join("meta.json");
+            if let Ok(s) = std::fs::read_to_string(&meta_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                    let pid = v.get("project_id").and_then(|p| p.as_str());
+                    if pid == Some(project_id) {
+                        return Some(inst_name);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// **API v3 (2026-05-16):** capacidad detallada de UNA cell + lista de proyectos.
 /// El panel lo usa para decidir si tiene espacio antes de crear, y para mapear
 /// project_id ↔ instancias.
@@ -735,17 +764,41 @@ pub fn handle_create(cell_hint: Option<&str>, body_json: &str) -> IpcResponse {
             let use_v3 = req.env.is_some() || req.parent_nkr_name.is_some()
                 || req.project_id.is_some();
             let result = if use_v3 {
-                // Validación: env != "prod" requiere parent_nkr_name
+                // **API v3 (corregido 2026-05-16):** reglas de cell affinity
+                // por env. parent_nkr_name NO es obligatorio en todos los casos:
+                //   - env="prod": standalone. NKR auto-elige cell (proyecto nuevo).
+                //     Si el panel quiere prod en una cell específica → puede mandar
+                //     parent_nkr_name de OTRO tenant del mismo proyecto (caso raro).
+                //   - env="staging": clona DB del parent (CREATE DATABASE TEMPLATE),
+                //     requiere postgres común → cell affinity obligatoria.
+                //     parent_nkr_name OBLIGATORIO.
+                //   - env="dev": standalone (DB vacía del cell template). Si el
+                //     proyecto ya tiene instancias, usa esa cell. Si no, NKR
+                //     auto-elige. parent_nkr_name OPCIONAL (panel lo manda si
+                //     quiere forzar la cell de prod).
+                //
+                // Si parent_nkr_name está vacío PERO project_id ya tiene
+                // instancias en alguna cell → afinidad implícita a esa cell.
                 let env_str = req.env.as_deref().unwrap_or("prod");
-                if env_str != "prod" && req.parent_nkr_name.is_none() {
+                if env_str == "staging" && req.parent_nkr_name.is_none() {
                     return IpcResponse::json(400, serde_json::json!({
-                        "error": "parent_required_for_non_prod",
-                        "message": format!("env='{}' requiere parent_nkr_name \
-                            (el tenant PROD del mismo proyecto, para cell affinity)",
-                            env_str),
+                        "error": "parent_required_for_staging",
+                        "message": "env='staging' requiere parent_nkr_name \
+                            (clona DB del prod via CREATE DATABASE TEMPLATE, \
+                            necesita postgres común → cell affinity obligatoria)",
                     }));
                 }
-                select_cell_v3(&req.odoo_version, req.parent_nkr_name.as_deref())
+                // Si no hay parent_nkr_name pero hay project_id, buscar si el
+                // proyecto ya tiene una instancia y usar ESA cell (afinidad
+                // implícita).
+                let effective_parent = if req.parent_nkr_name.is_some() {
+                    req.parent_nkr_name.clone()
+                } else if let Some(pid) = req.project_id.as_deref() {
+                    find_existing_instance_for_project(pid)
+                } else {
+                    None
+                };
+                select_cell_v3(&req.odoo_version, effective_parent.as_deref())
             } else {
                 select_cell_for_version(&req.odoo_version)
             };

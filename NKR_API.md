@@ -255,10 +255,18 @@ El panel sólo conoce la versión de Odoo que el cliente necesita. NKR elige la 
 > }
 > ```
 >
-> **Lógica de cell selection v3:**
-> - Si `env != "prod"`: `parent_nkr_name` es OBLIGATORIO. NKR busca la cell del parent y crea ahí. Si el parent no existe → 404 `parent_not_found`. Si la cell del parent está full (≥ 21 instancias) → 409 `parent_cell_full`. **El panel debe haber verificado capacidad con `GET /cells/{cell}/capacity` antes de mandar.**
-> - Si `env == "prod"`: proyecto nuevo. NKR elige la cell con menos `project_id` únicos (menos clientes), tie-break por RAM committed. Cap por defecto: **7 proyectos por cell** (configurable vía `NKR_MAX_PROJECTS_PER_CELL`). Si todas las cells de la versión están full → 409 `all_cells_full`.
-> - `parent_nkr_name` actúa como `source` automáticamente para el clone (no mandes ambos — si lo haces, 400 `source_parent_mismatch`).
+> **Lógica de cell selection v3 (corregida 2026-05-16):**
+> - **`env="staging"`**: `parent_nkr_name` es **OBLIGATORIO**. Razón física: el clone de DB usa `CREATE DATABASE … WITH TEMPLATE` que solo funciona intra-postgres → parent y staging deben compartir postgres → misma cell. Sin parent → 400 `parent_required_for_staging`.
+> - **`env="dev"`**: `parent_nkr_name` es **OPCIONAL**. Dev arranca con DB vacía del cell template (no clona del parent). Si el panel manda parent → cell affinity al parent. Si NO manda parent pero el `project_id` ya tiene instancias en alguna cell → **NKR auto-detecta y usa esa cell** (afinidad implícita por proyecto). Si project_id es nuevo (sin instancias previas) → NKR auto-elige cell con menos proyectos.
+> - **`env="prod"`**: standalone. NKR auto-elige cell con menos `project_id` únicos. Tie-break por RAM committed. Cap por defecto: **7 proyectos por cell** (configurable vía `NKR_MAX_PROJECTS_PER_CELL`).
+>
+> **Errors específicos:**
+> - 404 `parent_not_found` — el `parent_nkr_name` no existe en ninguna cell.
+> - 409 `parent_cell_full` — la cell del parent ya tiene 21 instancias. **El panel debe haber verificado con `GET /cells/{cell}/capacity` antes.**
+> - 409 `parent_version_mismatch` — parent vive en cell de otra versión.
+> - 409 `all_cells_full` — todas las cells de la version están en límite de proyectos.
+>
+> `parent_nkr_name` actúa como `source` automáticamente para el clone (no mandes ambos — si lo haces, 400 `source_parent_mismatch`).
 >
 > **El panel maneja la lógica de negocio**, NKR es "tonto": NKR no rechaza si un proyecto tiene >3 envs, ni valida quotas. Sólo verifica capacidad física.
 
