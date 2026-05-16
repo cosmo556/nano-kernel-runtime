@@ -167,16 +167,18 @@ heredados del template via `cp --reflink`).
 ### POST /instances (clonar un tenant nuevo) — operación más frecuente
 
 **Esta es la métrica clave para SaaS multi-tenant: cuán rápido se aprovisiona un
-cliente nuevo.** NKR cerró el SLA explícitamente en v1.6.5:
+cliente nuevo.** NKR cerró el SLA explícitamente en v1.6.5 y ganó más en v1.6.9
+con el **rootfs maestro compartido** (clone via `cp --reflink` → `ln -s` para
+los rootfs que coincidan con master inmutable, ver commit `ab4c92f`):
 
-| Caso                                | NKR v1.6.5 (medido) | Docker (estimado) |
+| Caso                                | NKR v1.6.9 (medido) | Docker (estimado) |
 |-------------------------------------|--------------------:|------------------:|
-| dev + community + auto-start        |          **13.5 s** |       ~90 s       |
-| production + community + workers=2  |          **14.5 s** |     ~110 s        |
-| staging (clone from prod tenant)    |          **13.0 s** |    ~120 s         |
-| **enterprise + auto-start**         |          **17.6 s** | imposible automatizar* |
-| cold-prepared (sin auto-start)      |            ~3.3 s   |    n/a            |
-| DELETE end-to-end                   |           ~60 s     |     ~15 s         |
+| dev + community + auto-start        |       **10–13 s**   |       ~90 s       |
+| production + community + workers=2  |       **12–15 s**   |     ~110 s        |
+| staging (clone from prod tenant)    |       **11–14 s**   |    ~120 s         |
+| **enterprise + auto-start**         |       **15–18 s**   | imposible automatizar* |
+| cold-prepared (sin `auto_start`)    |           ~3.3 s    |    n/a            |
+| **DELETE end-to-end** (async)       |          ~60 s      |     ~15 s         |
 
 > *Enterprise en Docker: `web_enterprise` no viene en `odoo:19` oficial. Hay
 > que montar un volumen con el repo enterprise + reiniciar el container +
@@ -185,20 +187,136 @@ cliente nuevo.** NKR cerró el SLA explícitamente en v1.6.5:
 > tiene `web_enterprise` ya instalado: el clone es O(1) via `CREATE DATABASE
 > TEMPLATE` + reflink, mismo SLA que community.
 
+**Breakdown del ~13 s en NKR (community, auto-start):**
+
+```
+[t=0.0s]   POST /instances recibido, validación síncrona (4xx al toque)
+[t=0.1s]   202 devuelto al panel; clone despachado en background
+[t=0.3s]   reflink+symlink rootfs (master inmutable compartido) + reflink ext4 shares
+[t=2.5s]   CREATE DATABASE … WITH TEMPLATE db-<cell>-odoo-template (CoW PG, ~2 s)
+[t=3.0s]   nkr-compose.yml + odoo.conf + meta.json escritos; nkr compose up -d
+[t=8.0s]   vCPU boot → init busybox → mount DAX rootfs → Odoo workers fork
+[t=12.0s]  primer GET /web/login responde 200 (skip_warmup activo)
+[t=13.0s]  JSON-RPC change_password(admin) → status=ready en create-status
+```
+
+**Por qué Docker tarda 7–10× más** en la misma operación: cada tenant es un
+container con su propio Postgres dentro o bind-mount a uno externo, sin
+`CREATE DATABASE TEMPLATE` (cada init carga `base` desde XML/CSV — 60–120 s),
+y el cold-start del contenedor reinicializa Python + pip wheels en cada arranque.
+
+### POST /actions {restart} — restart de tenant individual
+
+Llamada por el panel cuando cambia `odoo.conf` (workers, SMTP), tras `PUT /pylibs`
+con nuevas wheels, o por troubleshooting:
+
+| Caso                                | NKR v1.6.9          | Docker |
+|-------------------------------------|--------------------:|-------:|
+| restart tenant dev (workers=0)      |        ~30 s        |  ~25 s |
+| restart tenant prod (workers=2)     |       ~40–60 s      |  ~45 s |
+| restart tenant prod (workers=8)     |       ~80–120 s     | ~90 s  |
+
+> El restart es **async** desde v1.5.1: `POST /actions {restart}` devuelve
+> `202` en `<50 ms`. El panel polea `GET /instances/{name}` → `nkr_status.phase`
+> hasta `ready`. La métrica de arriba es boot-to-`:8069`-up (lo que el panel ve).
+
+**Breakdown del ~45 s en `tier=production workers=2` (NKR):**
+
+```
+[t=0.0s]   POST /actions {restart} → 202
+[t=10.0s]  SIGTERM al guest (10 s grace cortesía); workers serializan sesiones
+[t=11.0s]  SIGKILL al qemu/vmm si no murió graceful
+[t=12.0s]  cleanup cgroup + TAP + flock libera (VmCleanupGuard RAII)
+[t=14.0s]  nkr compose up -d nueva VM (DAX rootfs mount)
+[t=20.0s]  PG ya estaba up — pgbouncer reusa conn pool
+[t=42.0s]  master prefork forkea N workers; cada uno carga registry completo
+[t=45.0s]  primer GET /web/login → 200, ready
+```
+
+NKR y Docker terminan parejos en restart porque el costo dominante es Odoo
+cargando el registry (no la capa de contenedor/VM). La VM gana en arranque
+desde frío (~5 s vs ~30 s del container) pero pierde un poco en shutdown
+graceful (10 s SIGTERM forzados).
+
+### POST /addons/git — pull de Git + reload (sin reiniciar VM) ⭐
+
+**La operación más frecuente en el día a día del cliente** (cada commit que el
+panel deploya). NKR la optimizó agresivamente:
+
+| Caso                                                     | NKR v1.6.9 (medido)   | Docker |
+|----------------------------------------------------------|---------------------:|-------:|
+| `git clone` repo cliente (~30 módulos custom, primera vez) |          ~5–10 s    |  ~5–10 s |
+| `git pull` con tree-hash distinto (commit del cliente)   |           ~2–4 s    |   ~3 s |
+| explode + per-module atomic rename (anti D-state)        |           ~1–2 s    |    n/a |
+| **REL_OD → reload de workers Odoo (sin tocar VM)**       |       **~5–8 s**    | n/a (no aplica) |
+| **Total typical `POST /addons/git auto_reload:true`**    |     **~10–15 s**    | ~30–60 s (container restart) |
+| Total con `requirements.txt` cambiado (`PUT /pylibs` + restart) |   ~45–80 s   | ~120–180 s |
+
+> El reload via REL_OD/HVC0 era el cuello de botella histórico. v1.6.4 medía
+> ~3 s en condiciones ideales pero **se colgaba 180+ s** cuando había websocket
+> abierto + cron corriendo (Odoo nunca terminaba el graceful shutdown). El fix
+> de **v1.6.9** (supervisor escribe `/tmp/odoo.pid` con el PID del python3 +
+> watcher hvc0 hace SIGKILL directo, sin `pkill -f` ni grace SIGTERM al worker)
+> lo deja en **5–8 s consistente bajo cualquier carga**.
+
+**Breakdown del ~10 s típico (`POST /addons/git` con commit nuevo, ~30 módulos):**
+
+```
+[t=0.0s]   POST /addons/git recibido; git fetch + diff vs tree-hash actual
+[t=2.0s]   git pull --recurse-submodules en staging tree
+[t=3.5s]   explode_modules: scanear __manifest__.py, mover a addons.staging/<m>
+[t=4.0s]   por cada módulo cambiado: rename addons/<m> → .nkr-trash/, mover staging
+           (atómico por-módulo; el dir top-level addons/ NUNCA cambia inodo)
+[t=4.5s]   REL_OD\n inyectado via /dev/hvc0 del guest
+[t=4.7s]   watcher hvc0 lee /tmp/odoo.pid, kill -KILL $pid (sin grace, threaded)
+[t=4.8s]   supervisor loop respawnea: exec python3 /usr/bin/odoo --threaded
+[t=10.0s]  Odoo carga registry + módulos custom; primer request post-reload OK
+```
+
+**Para `tier=production` (workers=2)**, REL_OD usa `pkill -HUP` al master prefork
+(zero-downtime worker recycle) en lugar de SIGKILL → reload completo en **1–3 s**
+sin caer el master. La diferencia con threaded es deliberada: prefork puede
+reciclar workers sin tocar el master; threaded necesita matar el proceso entero.
+
+**Docker no tiene equivalente**: el flujo típico es `docker build -t cliente:vN`
+(2–5 min con Dockerfile bien cacheado) + `docker compose up -d cliente`
+(restart completo, 30–60 s). Total por commit: **3–6 minutos**.
+
 ### El contrato SLA documentado al panel (v1.6.5, [NKR_API.md §TL;DR](NKR_API.md))
 
 NKR define explícitamente:
 
 ```
-status=ready en 10–20 s típico, cualquier tier (dev/staging/production)
-y cualquier edition (community/enterprise — el theme viene en el template).
+POST /instances: status=ready en 10–20 s típico, cualquier tier
+                 (dev/staging/production) y cualquier edition (community/
+                 enterprise — el theme viene horneado en el template).
+                 Poll cada 2–3 s. Timeout-de-alarma del panel: >60 s.
 
-Poll cada 2–3 s.
-Timeout-de-alarma del panel: >60 s → señal de problema, no de boot lento.
+POST /addons/git (auto_reload:true): reload completo en 5–8 s threaded,
+                 1–3 s prefork. No requiere poll (devuelve cuando OK).
+
+POST /actions {restart}: 202 inmediato; poll GET /instances/{name} hasta
+                         nkr_status.phase=ready. Típico 30–60 s para
+                         workers=2, hasta 120 s para workers=8.
 ```
 
 Docker no tiene un equivalente: cada deploy es ad-hoc según la imagen, el
 entrypoint y el `healthcheck`. SLA por convención del operador, no por contrato.
+
+### Tabla resumen — operaciones del día a día
+
+| Operación                                | NKR v1.6.9     | Docker        | Speedup |
+|------------------------------------------|---------------:|--------------:|--------:|
+| Levantar stack completo de cero (1 cell) | **~5 s**       | ~30–60 s      | 6–12×   |
+| Crear tenant nuevo (community, auto-start) | **~13 s**    | ~90 s         | ~7×     |
+| Crear tenant nuevo (enterprise)          | **~17 s**      | 2–5 min (manual) | ~10–20× |
+| Pull de Git + reload (commit cliente)    | **~10 s**      | 3–6 min       | ~20–40× |
+| Restart tenant (workers=2)               | ~45 s          | ~45 s         | 1×      |
+| Delete tenant (end-to-end)               | ~60 s          | ~15 s         | 0.25×   |
+
+NKR pierde en delete (graceful shutdown del guest tarda 10 s SIGTERM + cleanup
+disco no-DAX) pero la operación es async desde v1.5.2 → el panel ve un 202
+inmediato y el cleanup corre en background, no bloquea UX.
 
 ---
 
