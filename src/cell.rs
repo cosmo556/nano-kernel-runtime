@@ -1413,6 +1413,57 @@ pub fn clone_instance_with_opts(
         }
     }
 
+    // **Master rootfs compartido (2026-05-16, audit P4 / optimización):** si
+    // existe `/mnt/nkr/images/odoo<v>.ext4` con `chattr +i` (immutable, base
+    // canónica), reemplazamos el `odoo.ext4` del tenant clonado por un
+    // SYMLINK al master. vmm.rs::run hace `canonicalize()` del path antes de
+    // hashearlo → todos los tenants con symlink convergen al MISMO mount point
+    // (mismo loop device, mismo page cache backing). Para 22 tenants × 2.6GB,
+    // eso son ~56GB de page cache duplicado que ahora pasan a ~2.6GB. El
+    // archivo per-tenant copiado se borra (~2.6GB de disco recuperado por
+    // tenant). El master tiene `chattr +i` → ningún tenant puede modificarlo.
+    //
+    // Cuándo NO se hace:
+    //   - Si el master no existe (cell vieja sin images/ poblado) → mantener copia.
+    //   - Si el master no tiene chattr +i (mutable) → seguridad: no compartir.
+    //   - Si dst_dir/odoo.ext4 difiere de tamaño con el master → puede haber
+    //     contenido divergente (build custom, etc.). Mantener copia.
+    if let Some(version) = opts.odoo_version.as_deref().or(cell.odoo_version.as_deref()) {
+        let major = version.split('.').next().unwrap_or(version);
+        let master_path = std::path::PathBuf::from(format!("/mnt/nkr/images/odoo{}.ext4", major));
+        let tenant_ext4 = dst_dir.join("odoo.ext4");
+        if master_path.exists() && tenant_ext4.exists() && !tenant_ext4.is_symlink() {
+            let master_size = fs::metadata(&master_path).map(|m| m.len()).unwrap_or(0);
+            let tenant_size = fs::metadata(&tenant_ext4).map(|m| m.len()).unwrap_or(0);
+            // Verificar inmutabilidad del master (chattr +i — solo leíble).
+            // Si no podemos confirmar, skip (defensive).
+            let master_immutable = check_chattr_i(&master_path).unwrap_or(false);
+            if master_immutable && master_size == tenant_size && master_size > 0 {
+                // Borrar copia + crear symlink atómicamente
+                if let Err(e) = fs::remove_file(&tenant_ext4) {
+                    eprintln!("[NKR-CLONE] WARN: no pude borrar copia tenant odoo.ext4: {} — \
+                               mantengo copia full", e);
+                } else if let Err(e) = std::os::unix::fs::symlink(&master_path, &tenant_ext4) {
+                    eprintln!("[NKR-CLONE] WARN: no pude crear symlink al master: {} — \
+                               re-creando copia full", e);
+                    // Re-copy the file from master to preserve correctness
+                    let _ = std::process::Command::new("cp")
+                        .args(["-a", "--reflink=auto",
+                               &master_path.to_string_lossy(),
+                               &tenant_ext4.to_string_lossy()])
+                        .status();
+                } else {
+                    eprintln!("[NKR-CLONE] ✅ odoo.ext4 → symlink master ({} GB ahorrados)",
+                        master_size / 1024 / 1024 / 1024);
+                }
+            } else if !master_immutable {
+                eprintln!("[NKR-CLONE] master {} NO tiene chattr +i — manteniendo copia full \
+                           (seguridad: master mutable no es seguro de compartir)",
+                    master_path.display());
+            }
+        }
+    }
+
     // Clone `.nkr-data/` files (filestore + pg-per-instance volumes).
     // Without this, the clone starts with empty filestore and Odoo throws
     // FileNotFoundError when looking up ir.attachment referenced in the DB
@@ -2673,6 +2724,31 @@ pub fn find_cell_by_nkr_name(nkr_name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// **API v3 / Master rootfs compartido (2026-05-16):** verifica si un archivo
+/// tiene el flag `chattr +i` (inmutable) seteado. Lo usamos para confirmar
+/// que el master rootfs es seguro de compartir vía symlinks — un archivo
+/// mutable podría modificarse durante el runtime y corromper VMs activas.
+///
+/// Usa `lsattr` (más portable que el ioctl `EXT2_IMMUTABLE_FL` directo).
+/// Return `Ok(true)` si tiene +i, `Ok(false)` si no, `Err` si no se puede leer.
+pub fn check_chattr_i(path: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
+    let out = std::process::Command::new("lsattr")
+        .arg("-d")
+        .arg(path)
+        .output()?;
+    if !out.status.success() {
+        return Err(format!("lsattr falló: {}",
+            String::from_utf8_lossy(&out.stderr)).into());
+    }
+    // Salida: "----i----------C------ /path/to/file"
+    let s = String::from_utf8_lossy(&out.stdout);
+    // El primer campo (antes del whitespace) son los flags.
+    let flags = s.split_whitespace().next().unwrap_or("");
+    // +i aparece como 'i' en la posición 5 (0-indexed: ----i...)
+    // Más robusto: simplemente buscar 'i' en los flags.
+    Ok(flags.contains('i'))
 }
 
 /// Suma de RAM committed (sum `ram_mb` de todas las VMs registradas) en una
