@@ -8,6 +8,7 @@
 - **v1 (2026-05-17)** — propuesta inicial.
 - **v2 (2026-05-17, primera rueda de revisión)** — incorpora feedback del equipo (sección §10) sobre tres puntos ciegos críticos: (1) refcount de CPython rompe el sharing CoW del heap, (2) virtio-fs en snapshot causa pánico al restore, (3) la matemática real de densidad descuenta footprint de Postgres con 100 DBs activas. Números corregidos en TL;DR, §3, §4, §6, §7, §8.
 - **v3 (2026-05-17, segunda rueda de revisión — sección §11)** — el equipo recordó que **KSM ya está descartado en NKR por decisión arquitectónica previa** (compatibilidad/estabilidad — confirmado en `CLAUDE.md`: *"KSM es una mentira"*). La v2 lo había revivido como mitigación mandatoria; v3 lo elimina de toda la propuesta. Sin KSM, la matemática de densidad colapsa: target real **60–75 Odoos activos** (no 80–110), techo absoluto ~75 con margen cero. El proyecto sigue, pero la justificación principal pasa de "densidad" a **velocidad de boot (5 s → 1.5–3 s)** y eliminación del boot storm. **Luz verde a Fase 0 con misión alterada:** medir el sangrado de CoW post-restore bajo carga HTTP real (100 reqs concurrentes × 10 min), no medir sharing teórico.
+- **v3.1 (2026-05-17, pre-Fase 0)** — agregado §12 con el registro completo de **alternativas evaluadas** antes de aterrizar en snapshot/restore (initramfs reducido, kernel diet más agresivo, balloon más agresivo, kernel XIP, userfaultfd, + opciones rechazadas con razón). Algunas son complementarias y baratas — pidiendo confirmación del equipo para hacer A (initramfs) y B (kernel diet) en paralelo a Fase 0.
 
 ---
 
@@ -660,3 +661,144 @@ El equipo respondió los 8 puntos abiertos de §10 y agregó un nuevo punto crí
 **Acuerdo cerrado de los 3 (NKR / equipo / Claude):** Fase 0 arranca cuando el equipo confirme calendario. Misión: bombardeo HTTP + medición de RSS en T=0 / T=10 min / T=60 min + confirmación de versión Python. Output go/no-go basado en el umbral de ~300 MB estable a T=60 min.
 
 **No hay más rounds de revisión antes de Fase 0.** Si Fase 0 trae resultados inesperados (RSS dispara a 450 MB, o Python es 3.8 sin alternativa, etc.), se abre una 3ª rueda para reconsiderar.
+
+---
+
+## 12. Alternativas evaluadas — registro completo para revisión del equipo
+
+Antes de aterrizar en snapshot/restore, evalué otras técnicas para reducir el overhead de ~120 MB de kernel por VM. Algunas quedaron descartadas con razón documentada; otras son **complementarias al snapshot/restore** y se pueden hacer en paralelo (ahorros pequeños pero gratis). Esta sección se conserva para que el equipo decida si vale la pena tomar alguno de los complementos como tarea independiente.
+
+### 12.1 Complementos viables (se pueden combinar con snapshot/restore)
+
+#### A) Initramfs reducido — mover init logic al DAX rootfs
+
+**Qué es:** hoy el initramfs cpio empaquetado pesa ~2–4 MB descomprimido en RAM por VM. Está empaquetado con `src/initramfs.rs` y contiene busybox + scripts de init (`nkr-start.sh`, watcher hvc0, supervisor loop de Odoo, etc.).
+
+**Cómo se reduce:** mover la mayor parte de esos scripts al rootfs DAX (que ya es compartido entre todas las VMs sin costo extra). El initramfs queda con lo mínimo absoluto: mount del rootfs, switch_root, exec /sbin/init. Sub-500 KB es factible.
+
+**Ahorro:** ~2–3 MB de RAM por VM. Con 75 VMs por host: ~150–225 MB totales.
+
+**Costo:** refactor de [`src/initramfs.rs`](src/initramfs.rs) + mover scripts al `Nkrfile.odoo*`. ~1 día. Riesgo bajo (cada script movido al rootfs es testeable individualmente; el initramfs reducido es fácil de auditar — menos código = menos sorpresas).
+
+**Pitfall:** los scripts críticos pre-mount-del-rootfs (montar virtio-pmem, parsear `nkr.rootfs=`, setup de network) DEBEN quedar en initramfs por definición. Solo se mueve lo post-pivot_root.
+
+**Status:** **complementario, recomendado en paralelo a Fase 0**. Ahorro modesto pero gratis. Compatible con el snapshot porque el initramfs reducido también va al snapshot.
+
+#### B) Kernel diet — `.config` más agresivo
+
+**Qué es:** hoy el kernel custom (`build-kernel/`) ya está stripped vs distros, pero hay margen para más. Eliminar drivers no usados + symbols de debug + filesystems que el guest no monta.
+
+**Candidatos a sacar (auditar el `.config` actual):**
+- Drivers: USB, sound (snd_*), framebuffer (fbcon, vesa), wireless, bluetooth, SCSI, MTD, IPv6 si no se usa
+- Debug: `CONFIG_DEBUG_KERNEL`, `CONFIG_KALLSYMS`, `CONFIG_SLUB_DEBUG`, `CONFIG_LOCKDEP`, `CONFIG_KASAN`, `CONFIG_KMEMLEAK`
+- Filesystems: xfs, btrfs (en el guest — el host sí lo usa), jffs2, reiser, f2fs
+- Net protocols: sctp, dccp, decnet, irda, can
+- `CONFIG_NR_CPUS=2` (vs default 64+) — reduce el tamaño de algunas estructuras per-CPU del kernel
+- `CONFIG_NR_LRU_GENS=2` (default 4) — page replacement más simple
+- `CONFIG_HZ=100` (vs 250/1000) — menos timer interrupts, menos slab churn
+
+**Ahorro:** ~10–25 MB de slab + BSS per VM. Con 75 VMs: ~750 MB – 1.8 GB totales.
+
+**Costo:** 1–2 días de iterar + benchmark de boot + tests de regresión (algunas optimizaciones pueden romper subsistemas usados — ej. quitar IPv6 si el guest pinguea a algún `::1`). Riesgo bajo si se hace con cuidado.
+
+**Pitfall:** algunas opciones interactúan con seccomp del NKR daemon. La incidencia v1.6.7 (`clone3`/`openat2` missing del whitelist) muestra que cambios al kernel pueden requerir ajustes al filter del host.
+
+**Status:** **complementario, recomendado en paralelo a Fase 0**. Bajo riesgo si se mide cada cambio. Compatible con snapshot/restore (el snapshot incluye el kernel actual, así que rebuild del kernel obliga a regenerar snapshot).
+
+#### C) Reducir `compose.ram` defaults + balloon más agresivo
+
+**Qué es:** hoy dev nace con `ram=1300 MB`, staging con `1024 MB`. El balloon trabaja IDLE→ACTIVE pero los defaults son conservadores tras OOM history del Odoo 19 boot. Si el snapshot/restore baja el RSS estable a 250–300 MB, podemos bajar el `compose.ram` también.
+
+**Cómo:** después de validar Fase 0 + Fase 2 en producción, ajustar `derive_resources_for_tier` en [`src/api.rs`](src/api.rs):
+- dev: 1300 → 1000 MB (con balloon IDLE más agresivo: 600 MB en vez de 256)
+- staging: 1024 → 800 MB
+- prod: sin cambio (PROD ya nace ACTIVE balloon=0 por doctrina)
+
+**Ahorro:** ~30 % del `compose.ram` committed per dev/staging VM. NO es RSS real (el balloon es lazy) — pero reduce la presión percibida sobre el host y permite acomodar más VMs antes del overcommit.
+
+**Costo:** cambio de configuración + restart de tenants para que tome efecto. Riesgo: si dev/staging crece y necesita más de 1000/800 MB, hay deflate del balloon — funciona pero hay latencia. Histórico Odoo 19 mostró bootstrap pesado (~350 MB RSS) — el techo de 800–1000 deja margen pero estrecho.
+
+**Pitfall:** ya pasó una vez en v1.6.2 (`Server memory limit reached` cuando dev estaba en 768 MB con ~31 módulos custom). No volver a bajar sin medir bien.
+
+**Status:** **complementario, hacer DESPUÉS de snapshot/restore en producción**, no antes — necesitamos ver cómo se estabiliza el RSS estable real antes de comprometernos con compose.ram más bajo.
+
+### 12.2 Investigación abierta (puede o no resultar)
+
+#### D) Kernel-as-DAX / XIP (Execute In Place)
+
+**Qué es:** hoy el VMM carga el kernel image (~12 MB comprimido, ~30 MB descomprimido) en la RAM de cada guest. Si en su lugar mapeamos el kernel image como un virtio-pmem DAX adicional, el guest podría **ejecutar el kernel directamente del archivo mapped read-only** — y el kernel TEXT (~10–15 MB) sería físicamente compartido entre todas las VMs del mismo build, sin necesidad de KSM ni CoW.
+
+**Cómo funcionaría:**
+- Compilar kernel con `CONFIG_XIP_KERNEL=y` (existe pero está orientado a ARM embedded)
+- Loader en initramfs apunta al pmem device en vez de copiar a RAM
+- Kernel TEXT vive en el pmem mapped, el resto (BSS, slab) sigue en RAM normal del guest
+
+**Ahorro:** ~10–15 MB kernel TEXT × (N − 1) VMs = ~750 MB – 1 GB con 75 VMs.
+
+**Costo:** **investigación alta** — XIP en x86 KVM no es path standard, hay que validar si funciona y qué requiere. Posible que necesitemos parchear el loader del kernel. Si funciona: 1–2 semanas de implementación.
+
+**Riesgos:**
+- XIP en x86 es raro (la mayoría del soporte upstream es ARM/embedded).
+- Puede no compilar sin parches no triviales.
+- Si compila pero crashea, perdimos el tiempo de investigación.
+
+**Status:** **no comprometer**. Dejar como spike paralelo de 2–3 días si algún ingeniero tiene bandwidth tras Fase 0. Si funciona, gran ahorro complementario. Si no, no perdimos nada en el path principal.
+
+#### E) userfaultfd + page sharing on-demand
+
+**Qué es:** alternativa más dinámica al snapshot/restore. En vez de mmap un snapshot file CoW, mantener una "VM blueprint" siempre encendida (paused) y servir páginas a las VMs nuevas vía `userfaultfd` del kernel del host.
+
+**Diferencia con snapshot/restore tradicional:**
+- Snapshot/restore: páginas precargadas al mmap, CoW al primer write
+- userfaultfd: páginas servidas LAZY al primer read del guest nuevo, desde la blueprint en vivo
+
+**Ahorro:** similar al snapshot, pero más "live" — la blueprint puede recibir actualizaciones (patches de seguridad de Odoo, por ejemplo) sin regenerar snapshot.
+
+**Status:** **demasiado complejo para v1**. Si snapshot/restore tradicional funciona, no necesitamos esto. Dejarlo en backlog para v2 si en el futuro queremos updates en vivo del template sin parar VMs.
+
+### 12.3 Rechazadas con razón documentada (registro de no-go)
+
+#### F) Unikernel (Unikraft / MirageOS / OSv)
+
+**Por qué:** unikernels arrancan en 1–10 MB y boot en ms. Pero Python + Odoo NO corren sobre unikernel — requieren libc completa, `fork()`, threading POSIX, signals, dynamic linker. Refactor de Odoo para correr en unikernel es **inviable** (cientos de assumptions sobre el OS subyacente). **Rechazado.**
+
+#### G) gVisor (user-space kernel sandbox)
+
+**Por qué:** gVisor intercepta syscalls del guest y los emula en user-space (Go). Ofrece aislamiento sin VM completa. Pero Odoo es **syscall-heavy** (fork de workers, epoll para HTTP, polls de cron, signals) → overhead de 20–40 % en throughput. Además ya tenemos aislamiento VM-grade — moverse a gVisor sería downgrade. **Rechazado.**
+
+#### H) systemd-nspawn / LXC (containers con kernel compartido)
+
+**Por qué:** cero overhead de kernel (todos los tenants comparten el kernel del host). Pero pierde TODO el aislamiento que justificó NKR vs Docker:
+- Sin `cgroup memory.max` strict (kernel exploits cross-tenant)
+- Un kernel panic mata a todos los tenants
+- Sin barrera VM contra escape de privilegios
+**Esto es esencialmente Docker** — volver al problema original. **Rechazado.**
+
+#### I) virtio-mem inter-guest page sharing
+
+**Por qué:** sería ideal — una página física en N guests al mismo tiempo, gestionada por el VMM. **Pero el EPT/NPT (extended page tables del CPU) mappea cada página física a UN solo guest a la vez.** No es limitación de software — es limitación del hardware de virtualización x86. La única vía es `MAP_SHARED` file-backed (DAX) que ya usamos para el rootfs. **Rechazado por física del hardware.**
+
+#### J) KSM (Kernel Same-page Merging)
+
+**Por qué:** ya documentado en §3.2 y §11. NKR tomó la decisión arquitectónica previa de descartarlo por compatibilidad/estabilidad. **Rechazado, no se revive.**
+
+### 12.4 Resumen para el equipo
+
+| ID | Opción | Estado | Acción sugerida |
+|---|---|---|---|
+| A | Initramfs reducido | Complementario | **Hacer en paralelo a Fase 0** (~1 día, bajo riesgo) |
+| B | Kernel diet más agresivo | Complementario | **Hacer en paralelo a Fase 0** (1–2 días, bajo riesgo) |
+| C | Bajar `compose.ram` + balloon agresivo | Complementario | **Hacer DESPUÉS de Fase 2** en producción, una vez validado RSS estable |
+| D | Kernel-as-DAX / XIP | Investigación | **Spike paralelo de 2–3 días** si hay bandwidth, sino diferir |
+| E | userfaultfd + on-demand sharing | Investigación | Backlog v2 — solo si snapshot/restore tradicional resulta insuficiente |
+| F | Unikernel | **Rechazado** | Incompatible con Python/Odoo |
+| G | gVisor | **Rechazado** | Syscall overhead intolerable + downgrade de aislamiento |
+| H | nspawn/LXC | **Rechazado** | Es Docker — pierde justificación de NKR |
+| I | virtio-mem inter-guest | **Rechazado** | Física del hardware (EPT/NPT) lo impide |
+| J | KSM | **Rechazado** | Decisión arquitectónica previa de NKR |
+
+**Pregunta abierta para el equipo antes de Fase 0:**
+
+¿Autorizan tomar A (initramfs) y B (kernel diet) como tareas paralelas durante los 3 días de Fase 0? Son ahorros pequeños individuales (~12–28 MB por VM combinados) pero gratis y compatibles con el snapshot — si los hacemos ahora, el snapshot que generamos en Fase 1 ya incluye estos beneficios y no hay que regenerar después.
+
+D (XIP) lo dejaría como tarea explícita para alguien con interés en investigación — no bloquea Fase 0 ni Fase 1.
