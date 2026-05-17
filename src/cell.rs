@@ -2462,6 +2462,25 @@ pub fn delete_instance(nkr_name: &str, drop_db: bool) -> Result<String, Box<dyn 
         }
     }
 
+    // 7. Clean up generated initramfs file (2026-05-18 — anti-orphan cleanup).
+    //    Naming convention: `/mnt/nkr/initramfs/<short>.cpio.gz` (ver
+    //    `src/initramfs.rs::generate_initramfs` que escribe el archivo con
+    //    ese nombre). El archivo se regenera en cada boot, así que borrarlo
+    //    es seguro — incluso si otra instancia con el mismo short name
+    //    (caso raro: templates comparten "odoo-template" entre cells) lo
+    //    necesita, el próximo boot lo regenera.
+    //    Best-effort: si el archivo no existe (ej. delete idempotente, o
+    //    una VM nunca llegó a bootear), simplemente no se hace nada.
+    let initramfs_path = std::path::PathBuf::from("/mnt/nkr/initramfs")
+        .join(format!("{}.cpio.gz", short));
+    if initramfs_path.exists() {
+        match fs::remove_file(&initramfs_path) {
+            Ok(_) => eprintln!("[NKR-DELETE] initramfs removido: {}", initramfs_path.display()),
+            Err(e) => eprintln!("[NKR-DELETE] WARN: no se pudo borrar initramfs {}: {} (continuando)",
+                initramfs_path.display(), e),
+        }
+    }
+
     eprintln!("[NKR-DELETE] ✅ instancia '{}' eliminada", nkr_name);
     Ok(cell.name)
 }
