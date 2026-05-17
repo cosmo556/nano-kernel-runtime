@@ -335,6 +335,21 @@ pub fn generate_initramfs(name: &str, disk_path: &str, docker_cmd: Option<&[Stri
         return Err("Fallo copiando base initramfs".into());
     }
 
+    // **Opción B — Kernel diet (2026-05-18, post-Fase 0):**
+    // El kernel custom de NKR (`build-kernel/build-nanolinux.sh`) compila con
+    // `--disable MODULES` (monolítico, cero soporte de loadable modules) y
+    // tiene EXT4_FS, JBD2, VIRTIO_BLK, VIRTIO_NET, VIRTIO_CONSOLE, VIRTIO_FS,
+    // VIRTIO_PMEM, etc. todos como BUILTIN. Los archivos `.ko` que vienen en
+    // el base initramfs (`lib/modules/<ver>/ext4.ko`, `jbd2.ko`, etc.) son
+    // dead weight — el init script NUNCA hace `modprobe`/`insmod` (verificado
+    // con grep en la propia src/initramfs.rs). Borrarlos ahorra ~3 MB de RAM
+    // por VM (el initramfs se descomprime entero en memoria del guest).
+    let modules_dir = work.join("lib/modules");
+    if modules_dir.exists() {
+        let _ = fs::remove_dir_all(&modules_dir);
+        eprintln!("[NKR-INITRAMFS] Removido lib/modules/ (kernel es monolítico, .ko = dead weight)");
+    }
+
     let mut detected_entrypoint: Option<String> = None;
 
     let scan_root = Path::new(disk_path);
