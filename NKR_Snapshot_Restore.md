@@ -6,7 +6,8 @@
 
 **Historial de revisión:**
 - **v1 (2026-05-17)** — propuesta inicial.
-- **v2 (2026-05-17, primera rueda de revisión)** — incorpora feedback del equipo (sección §10) sobre tres puntos ciegos críticos: (1) refcount de CPython rompe el sharing CoW del heap, (2) virtio-fs en snapshot causa pánico al restore, (3) la matemática real de densidad descuenta footprint de Postgres con 100 DBs activas. Números corregidos en TL;DR, §3, §4, §6, §7, §8. **No se procede a Fase 0 hasta cierre de la segunda rueda con el equipo.**
+- **v2 (2026-05-17, primera rueda de revisión)** — incorpora feedback del equipo (sección §10) sobre tres puntos ciegos críticos: (1) refcount de CPython rompe el sharing CoW del heap, (2) virtio-fs en snapshot causa pánico al restore, (3) la matemática real de densidad descuenta footprint de Postgres con 100 DBs activas. Números corregidos en TL;DR, §3, §4, §6, §7, §8.
+- **v3 (2026-05-17, segunda rueda de revisión — sección §11)** — el equipo recordó que **KSM ya está descartado en NKR por decisión arquitectónica previa** (compatibilidad/estabilidad — confirmado en `CLAUDE.md`: *"KSM es una mentira"*). La v2 lo había revivido como mitigación mandatoria; v3 lo elimina de toda la propuesta. Sin KSM, la matemática de densidad colapsa: target real **60–75 Odoos activos** (no 80–110), techo absoluto ~75 con margen cero. El proyecto sigue, pero la justificación principal pasa de "densidad" a **velocidad de boot (5 s → 1.5–3 s)** y eliminación del boot storm. **Luz verde a Fase 0 con misión alterada:** medir el sangrado de CoW post-restore bajo carga HTTP real (100 reqs concurrentes × 10 min), no medir sharing teórico.
 
 ---
 
@@ -14,11 +15,11 @@
 
 - **Pregunta original:** ¿podemos eliminar los ~120 MB de overhead de RAM que cada nano-VM gasta solo por tener kernel + initramfs + estructuras de kernel?
 - **Respuesta corta:** sí, vía **snapshot/restore con memoria CoW compartida entre VMs** (técnica popularizada por AWS Lambda / Firecracker, pero la implementación es 100 % `ioctl(KVM_*)` directos — no necesitamos Firecracker como dependencia).
-- **Ahorro estimado (v2, post-1ª revisión):** **40–80 MB de RAM compartibles por VM** vía CoW de kernel + libs read-only + bytecode immortal. El heap de Python NO se comparte tras el primer request por el refcount de CPython (`Py_INCREF`/`Py_DECREF` dirty cada página leída). El ahorro real total combinado con KSM mandatorio: **RSS efectivo ~150–200 MB por VM ociosa** (vs ~400–500 MB hoy).
-- **Tiempo de boot (v2, post-1ª revisión):** baja de **~5 s a ~1.5–3 s** (no a 200–500 ms como decía v1 — el snapshot core-only obliga a cargar el module registry post-restore para no romper virtio-fs).
-- **Densidad esperada en 32 GB:** ~80–110 Odoos activos (vs ~22 hoy). La meta del whitepaper (100 Odoos) es alcanzable, con poco margen.
-- **Costo de implementación (v2):** **~3–4 semanas de un ingeniero senior** (era ~2 en v1 — KSM mandatorio + arquitectura "snapshot sin virtio-fs" agregan trabajo). Refactor de `vmm.rs` + `compose.rs` + nuevo módulo `snapshot.rs` + `crates/nkr-init-agent`. Cero deps nuevas.
-- **Riesgo (v2):** alto. Tres focos: (1) virtio-fs DEBE quedar fuera del snapshot — cualquier intento de incluirlo crashea el guest; (2) Python heap CoW degrada en horas si KSM no está activo desde día 1; (3) TSC drift + entropy pool + per-tenant patching tienen que ser perfectos. Todo resoluble pero exige rigor.
+- **Ahorro estimado (v3, post-2ª revisión, SIN KSM):** **40–80 MB de RAM compartibles por VM** vía CoW de kernel + libs read-only + bytecode immortal. **El heap de Python NO se comparte** tras el primer request por el refcount de CPython, y **sin KSM (descartado en NKR) nadie viene a re-fusionar páginas refcount-divergidas con contenido idéntico.** RSS efectivo por VM: **~100 MB al restore, estabiliza en ~250–300 MB tras horas de tráfico** (vs ~400–500 MB hoy con boot frío). Mejora real: ~30–40 %, no 50 % como decía v2.
+- **Tiempo de boot:** baja de **~5 s a ~1.5–3 s** (sin cambio vs v2 — el snapshot core-only obliga a cargar el module registry post-restore para no romper virtio-fs).
+- **Densidad esperada en 32 GB (v3, post-2ª revisión):** **~60–75 Odoos activos** (vs ~22 hoy). **La meta del whitepaper (100 Odoos) NO es alcanzable en este hardware sin KSM** — para llegar a 100 requiere host de 64 GB. v3 reposicionado: el proyecto se justifica por velocidad de boot + eliminación de boot storm + mejora modesta de densidad (3–3.5×), no por la promesa de "100 Odoos en 32 GB".
+- **Costo de implementación:** **~3–4 semanas de un ingeniero senior**. Refactor de `vmm.rs` + `compose.rs` + nuevo módulo `snapshot.rs` + `crates/nkr-init-agent`. Cero deps nuevas.
+- **Riesgo (v3):** alto. Tres focos: (1) virtio-fs DEBE quedar fuera del snapshot — cualquier intento de incluirlo crashea el guest; (2) **el sangrado de CoW post-restore por refcount es irreversible sin KSM** — Fase 0 mide qué tan rápido y profundo es ese sangrado bajo carga real; si el RSS se dispara de vuelta a 450 MB en <10 minutos bajo tráfico, el snapshot solo acelera el arranque pero no ahorra RAM a largo plazo; (3) TSC drift + entropy pool + per-tenant patching tienen que ser perfectos. Todo resoluble pero exige rigor.
 
 ---
 
@@ -226,22 +227,36 @@ Consecuencia para el snapshot:
 - **PEP 683 / immortal objects** (Python 3.12+) — marca objetos específicos como inmortales; CPython skipea `INCREF`/`DECREF` sobre ellos vía sentinel check. Si Python del rootfs es ≥ 3.12, marcar la registry + módulos importados como immortal podría recuperar 30–50 MB extras de páginas estáticas. **Hay que confirmar versión Python en rootfs Odoo 19** — si es 3.10/3.11, no aplica.
 - **NoGIL Python (3.13+ experimental)** — deferred refcounting para algunos objetos. Far future para Odoo.
 
-**KSM como salvavidas (1ª revisión, mandatorio):**
+**Sin KSM en NKR (v3, post-2ª revisión — decisión arquitectónica previa):**
 
-Una vez que CoW separa una página, su contenido en ambas VMs sigue siendo idéntico hasta que algo más cambie. Ejemplo: dos VMs leen el mismo objeto N veces → refcount termina en N+(snapshot value) en ambas → contenido idéntico, página físicamente distinta. **KSM** (`ksmd` en el host, scan periódico) detecta páginas con contenido idéntico y las re-fusiona como CoW.
+Una vez que CoW separa una página, su contenido en ambas VMs puede seguir siendo idéntico hasta que algo más cambie (ej. dos VMs leen el mismo objeto N veces → refcount termina en N+(snapshot value) en ambas → contenido idéntico, página físicamente distinta). En otras arquitecturas, `ksmd` del host scaneaba periódicamente, detectaba contenido idéntico y re-fusionaba como CoW.
 
-Sin KSM, el sharing se degrada en horas. Con KSM agresivo:
-- Cubre las páginas zero del heap (massive).
-- Cubre las páginas refcount-divergidas que llegan a contenido idéntico.
-- Cubre el sharing inter-cell (dos cells del mismo Odoo versión tienen kernel TEXT idéntico).
-- Costo CPU: 1–3% de un core en scan continuo (configurable).
+**En NKR, KSM está descartado por decisión arquitectónica previa** (compatibilidad / estabilidad — confirmado en `CLAUDE.md` y en los resúmenes públicos del proyecto). No vamos a revivirlo solo porque la matemática lo necesite. Eso tiene consecuencias directas:
 
-**KSM activo desde día 1, no como Fase 5 opcional. Es parte del modelo de funcionamiento, no un extra.**
+- **El sangrado de CoW por refcount es irreversible.** Las páginas que se separan al primer request HTTP no se re-fusionan nunca más.
+- **El RSS por VM sube monotónicamente** desde ~100 MB al restore hasta estabilizar en ~250–300 MB tras horas de tráfico activo. A partir de ese punto se mantiene estable porque el heap de Odoo no crece linealmente con el tiempo (la app es REST/HTTP, no acumula state permanente entre requests más allá de session cache + ORM cache).
+- **No hay sharing inter-cell ni inter-tenant a largo plazo.** Solo lo que el kernel/libs read-only mapean del DAX rootfs sigue compartido.
 
-**Resultado realista esperado (v2):**
-- RAM RSS real per-VM ociosa post-restore: **150–200 MB** (no 100–150 MB como decía v1).
-- Densidad teórica en 32 GB: 32 GB − 2 GB (OS+NKR) − 8 GB (Postgres con 100 DBs activas) = 22 GB / 180 MB ≈ **120 VMs techo**, ~80–110 activas con tráfico real.
-- La meta del whitepaper (100 Odoos) es alcanzable, con poco margen.
+Mitigaciones que SÍ aplican (sin KSM):
+- `gc.disable()` + `gc.freeze()` pre-snapshot: marca los objetos cargados como permanent generation; el GC no los scanea → evita escrituras del mark/sweep. **No mitiga el refcount**, pero reduce un vector secundario.
+- **PEP 683 / immortal objects** (Python 3.12+): marca objetos específicos como inmortales; CPython skipea `INCREF`/`DECREF` sobre ellos. **Esta es la única herramienta real para frenar el sangrado del refcount** en objetos seleccionados (la registry de Odoo, los modelos, los managers de pool). Si el rootfs Odoo 19 usa Python ≥ 3.12, podría recuperar 30–50 MB de páginas estáticas que de otro modo se irían a CoW. **Confirmar versión en Fase 0.**
+- Sin Python 3.12, no hay segunda mitigación. La degradación va de ~100 MB inicial a ~250–300 MB final y no hay reversión.
+
+**Resultado realista esperado (v3, sin KSM):**
+
+| Estado | RSS por VM | Notas |
+|---|---:|---|
+| Post-restore (inmediato) | ~100 MB | Solo páginas dirty del bootstrap del init-agent + Python startup |
+| Tras primer request HTTP | ~150 MB | Refcount empieza a separar el heap |
+| Tras ~1 hora de tráfico moderado | ~200 MB | Mayoría del módulo registry "tocado" → CoW split |
+| Estable post-12 h | ~250–300 MB | Heap activo de la app diverge; libs read-only siguen compartidas |
+| **Hoy sin snapshot (referencia)** | **~400–500 MB** | Boot frío + bootstrap completo |
+
+Densidad teórica en 32 GB (sin KSM):
+- 32 GB − 2 GB (OS+NKR) − 8 GB (Postgres con N DBs activas) = 22 GB netos
+- 22 GB / 280 MB (RSS estable medio) ≈ **78 VMs techo absoluto, ~60–75 activas con tráfico real**
+
+**La meta del whitepaper (100 Odoos en 32 GB) NO se cumple sin KSM.** Para 100 Odoos en este hardware el camino real es: snapshot/restore + upgrade del host a 64 GB. La inversión del proyecto se justifica entonces por velocidad de boot y eliminación del boot storm, no por la promesa original de densidad.
 
 ### 3.3 Per-tenant patching post-restore
 
@@ -261,17 +276,19 @@ Esto añade ~50–100 ms al restore. El total sigue siendo <500 ms.
 
 ---
 
-## 4. Comparación lado-a-lado — v2 post-1ª revisión
+## 4. Comparación lado-a-lado — v3 post-2ª revisión (sin KSM)
 
 | Aspecto | NKR hoy (boot desde kernel) | NKR + snapshot/restore in-house |
 |---|---|---|
-| **Tiempo de boot por VM** | ~5 s | **~1.5–3 s** (2–3× más rápido) — v1 decía 200–500 ms, corregido tras 1ª revisión: el snapshot core-only obliga a cargar module registry post-restore |
-| **RAM RSS post-boot por VM ociosa** | ~400–500 MB | **~150–200 MB** (-50% a -60%) — v1 decía 100–150, corregido por refcount CoW degradation |
-| **Densidad teórica en 32 GB** (descontando 8 GB para Postgres con 100 DBs) | ~22 Odoos | **~80–110 Odoos activos** (techo teórico ~120) |
-| **Overhead "kernel" per VM** | ~80–120 MB | ~30–50 MB (sólido compartido) — el heap de Python se degrada por refcount; KSM recupera parte |
+| **Tiempo de boot por VM** | ~5 s | **~1.5–3 s** (2–3× más rápido) |
+| **RAM RSS post-restore (inmediato)** | ~400–500 MB cold | **~100 MB** |
+| **RAM RSS estable tras horas de tráfico** | ~400–500 MB | **~250–300 MB** (-30 a -40 %) — sin KSM no hay re-fusión de páginas refcount-divergidas |
+| **Densidad activa en 32 GB** (descontando 8 GB Postgres) | ~22 Odoos | **~60–75 Odoos** (no 100 — la meta del whitepaper requiere 64 GB) |
+| **Overhead "kernel" per VM** | ~80–120 MB | ~30–50 MB sólido compartido (kernel TEXT + libs read-only del DAX rootfs) |
 | **POST /instances end-to-end** | ~13 s (clone DB + boot) | ~5–8 s (clone DB + restore + module load post-mount) |
 | **REL_OD / commit→reload** | 5–8 s | 5–8 s (sin cambio — es un re-exec dentro del guest) |
 | **POST /actions {restart}** | 30–60 s | **5–15 s** (restore + module load en vez de boot full) |
+| **Boot storm (levantar N VMs simultáneo al iniciar la cell)** | N × 5s, CPU/IO saturado | N × ~1.5s, despreciable — gran win |
 | **Dependencias externas nuevas** | — | **ninguna** (puros ioctls KVM) |
 | **Líneas de Rust nuevas** | — | ~1500–2500 (`snapshot.rs`, refactor `vmm.rs`) |
 | **Crates nuevos** | — | **0** |
@@ -342,7 +359,7 @@ Esto añade ~50–100 ms al restore. El total sigue siendo <500 ms.
 
 1. **virtio-fs en el snapshot causa kernel panic / D-state inmediato al restore.** El estado de virtio-fs vive en tres lugares: virtqueue indices del guest, FUSE session state del guest, proceso `virtiofsd` del host (per-VM, no compartible). Si congelamos el estado del guest apuntando a un virtiofsd del template y restoramos con un virtiofsd nuevo, los índices de la vring no matchean → kernel BUG antes que el init-agent ejecute. **Mitigación obligatoria (NO opcional):** el snapshot se toma SIN virtio-fs montado (core-only), el mount es post-restore via PCI hot-plug. Trade-off: añade ~1–3 s al restore (module registry load post-mount) — el boot total queda en 1.5–3 s, no 200–500 ms como decía v1.
 
-2. **Refcount de CPython degrada el sharing del heap en horas.** `Py_INCREF`/`Py_DECREF` escriben en `ob_refcnt` con cada lectura de objeto → CoW split de la página entera. Tras el primer request HTTP, ~40–60 % del heap se separa físicamente entre VMs. **Mitigación obligatoria:** (a) `gc.disable()` + `gc.freeze()` pre-snapshot — barato, ayuda en el margen; (b) **KSM activo agresivo desde día 1** para re-fusionar páginas refcount-divergidas que llegan a contenido idéntico — esto NO es opcional ni Fase 5, es parte del modelo de funcionamiento; (c) si Python >= 3.12 en rootfs, marcar registry + módulos como immortal (PEP 683). Sin estas tres, el sharing se degrada hasta el punto de no compensar el costo del refactor.
+2. **Refcount de CPython degrada el sharing del heap en horas — sin reversión posible en NKR.** `Py_INCREF`/`Py_DECREF` escriben en `ob_refcnt` con cada lectura de objeto → CoW split de la página entera. Tras el primer request HTTP, ~40–60 % del heap se separa físicamente entre VMs. **Mitigaciones que SÍ aplican (sin KSM):** (a) `gc.disable()` + `gc.freeze()` pre-snapshot — barato, ayuda en el margen (no toca refcount, sí evita escrituras del GC scan); (b) si Python ≥ 3.12 en rootfs, marcar registry + módulos como immortal (PEP 683) — **única herramienta real para frenar el refcount en objetos seleccionados**. **KSM NO está disponible en NKR** (decisión arquitectónica previa, ver `CLAUDE.md`) → las páginas refcount-divergidas no se re-fusionan. Consecuencia: el RSS por VM sube monotónicamente hasta estabilizar en ~250–300 MB y se queda ahí. La densidad cae a 60–75 Odoos activos en 32 GB (no 100). El proyecto se justifica por velocidad de boot, no por densidad.
 
 ### Alto
 
@@ -360,6 +377,8 @@ Esto añade ~50–100 ms al restore. El total sigue siendo <500 ms.
 
 8. **PCI hot-plug latency del virtio-fs post-restore**: hot-attachar 4+ virtio-fs devices al guest desde el host añade ~100–300 ms (depende de cuántos shares por tenant y qué tan rápido el kernel guest los enumera). Es el costo del "snapshot sin virtio-fs". **Mitigación:** paralelizar el hot-plug de los N devices en vez de serial. Aceptable dentro del presupuesto de 1.5–3 s de boot total.
 
+9. **Enumeración PCI / colisión de IRQs en hot-plug (2ª revisión)**: el guest pre-pauseado del snapshot tiene un árbol PCI ya enumerado (virtio-console, virtio-balloon, virtio-net, virtio-pmem). Al hotpluggear 4 virtio-fs devices nuevos, hay que asegurar que los slots PCI asignados no pisen IRQs ya en uso (especialmente el de virtio-net — si colisiona, el guest pierde la red al primer paquete). **Mitigación:** reservar un rango fijo de slots PCI en el snapshot (ej. slots 8–11) para los virtio-fs que vienen después, validar pre-hotplug que esos slots están libres en el guest enumerado. Listado como riesgo medio porque la mecánica es estándar (QEMU lo hace todos los días), pero NKR tiene un VMM custom y hay que hacerlo bien la primera vez.
+
 ### Bajo
 
 7. **MTU del virtio-net en el snapshot**: si el cell cambia, hay que regenerar. Aceptable — los cells no cambian network config seguido.
@@ -372,26 +391,29 @@ Esto añade ~50–100 ms al restore. El total sigue siendo <500 ms.
 
 ## 7. Plan de implementación por fases — v2 post-1ª revisión
 
-### Fase 0 — Spike de viabilidad (3 días)
+### Fase 0 — Spike de viabilidad (3 días) — v3 misión alterada (sin KSM)
 
-- Escribir un `snapshot_poc.rs` standalone que: bootea una VM de hello-world (5 líneas de init), pausea, dump regs+memoria, restora en proceso nuevo, verifica que la VM siga andando.
-- Medir: tamaño del dump, tiempo de restore, RSS compartido entre 2 restores (vía `/proc/<pid>/smaps_rollup`).
-- **AGREGADO 1ª revisión:** medir también RSS compartido tras hacer 100 GET requests sobre el guest (simular el dirty del refcount). Esto valida el número de 165 MB efectivo del equipo.
-- **AGREGADO 1ª revisión:** confirmar versión exacta de Python en el rootfs de odoo-v19 (3.10? 3.11? 3.12?) — define si PEP 683 immortal objects aplica.
-- **Salida:** go/no-go con número real de RSS compartido pre- y post-dirty.
+**Nueva misión (2ª revisión):** el objetivo NO es medir si KSM nos salva (KSM no aplica). El objetivo es medir **cuán rápido y cuán profundo es el sangrado de CoW** cuando bombardeas la instancia restorada con tráfico real, **sin ningún mecanismo de re-fusión disponible**.
 
-### Fase 1 — KSM mandatorio + snapshot del template community (1.5 semanas)
+- Escribir un `snapshot_poc.rs` standalone que: bootea una VM con Odoo full hasta el punto del snapshot core-only, pausea, dump regs+memoria, restora N=5 procesos nuevos en paralelo, monta virtio-fs post-restore, lanza Odoo.
+- Medir RSS en 3 puntos temporales:
+  - **T=0** (inmediatamente post-restore, antes del primer request): RSS esperado ~100 MB
+  - **T=10 min** tras bombardear con **100 peticiones HTTP concurrentes** sobre cada VM (login + lista de productos + creación de orden + búsqueda): RSS esperado ~200–250 MB
+  - **T=60 min** tras tráfico sostenido moderado (10 req/s sobre cada VM): RSS esperado estabiliza ~250–300 MB
+- Si el RSS a T=60 min se dispara a ~450 MB (equivalente a boot frío) en menos de 10 minutos → el snapshot solo acelera el arranque pero no ahorra RAM a largo plazo → reconsiderar si el refactor de 3–4 semanas vale solo por velocidad.
+- Si el RSS a T=60 min se estabiliza en ~250–300 MB → el proyecto tiene producto sólido: 2–3× boot speedup + 30–40 % ahorro de RAM sostenido + densidad 60–75 Odoos.
+- **Confirmar versión exacta de Python** en el rootfs de odoo-v19 (`python3 --version` dentro del guest). Si ≥ 3.12 → aplicar PEP 683 immortal en Fase 1. Si < 3.12 → solo `gc.freeze()`.
+- **Salida:** go/no-go con números reales de RSS estable post-tráfico + versión Python confirmada.
 
-**ADELANTADO desde Fase 5 a Fase 1** por 1ª revisión: KSM es parte del modelo, no extra.
+### Fase 1 — snapshot del template community (1 semana) — v3 sin KSM
 
-- **Activar KSM agresivo en el host**: `/sys/kernel/mm/ksm/run=1`, `pages_to_scan=10000`, `sleep_millisecs=20`, `max_page_sharing=256`. systemd unit que lo configure al boot.
 - Implementar `snapshot.rs` completo (capture + restore + validate).
 - Implementar `nkr-init-agent` Rust musl static, embebido en initramfs.
-- En el path de captura del snapshot: ejecutar `gc.disable()` + `gc.freeze()` desde el init Python pre-pause. Si Python ≥ 3.12, marcar registry + módulos como immortal vía `PyUnstable_Object_EnableDeferredRefcount` o sentinel `_Py_IMMORTAL_REFCNT`.
+- En el path de captura del snapshot: ejecutar `gc.disable()` + `gc.freeze()` desde el init Python pre-pause. Si Python ≥ 3.12 (confirmado en Fase 0), marcar registry + módulos como immortal vía `PyUnstable_Object_EnableDeferredRefcount` o sentinel `_Py_IMMORTAL_REFCNT` — única herramienta para frenar el refcount sin KSM.
 - `nkr cell snapshot odoo-v19` genera el snapshot del template community **SIN virtio-fs montado** (core-only: kernel + initramfs + Python + odoo importado, pero sin addons cargados).
 - Modificar `compose.rs` para usar restore cuando hay snapshot.
 - **No tocar production todavía** — probar solo en una cell de test paralela.
-- **Salida:** demo de 5 tenants restorados, RSS host real medido pre- y post-dirty, validación de que KSM re-fusiona páginas (`/sys/kernel/mm/ksm/pages_sharing` > 0).
+- **Salida:** demo de 5 tenants restorados, RSS host real medido pre- y post-dirty bajo carga HTTP (mismo bombardeo que Fase 0).
 
 ### Fase 2 — Patches per-tenant completos + virtio-fs hot-plug (1 semana)
 
@@ -418,66 +440,70 @@ Esto añade ~50–100 ms al restore. El total sigue siendo <500 ms.
 - Migrar cells de prod una a una. Cell de test primero, luego v17 (vacía), luego v19.
 - **Rollback:** `unset NKR_USE_SNAPSHOT` + restart daemon → todas las VMs nuevas vuelven a boot normal. Las VMs ya corriendo no se tocan.
 
-### Fase 5 — Optimizaciones (1 semana, post-cutover)
+### Fase 5 — Optimizaciones (post-cutover, scope reducido v3)
 
 - Compresión zstd del snapshot en disco.
-- KSM tuning fino (medir overhead CPU vs sharing efectivo, ajustar `pages_to_scan`).
-- Pre-warm pool: tener N VMs restoradas pero pausadas, listas para asignarse a un POST /instances → tiempo perceptible <100 ms.
+- ~~KSM tuning~~ — descartado (KSM no aplica en NKR).
+- ~~Pre-warm pool~~ — **diferido indefinidamente** por decisión de la 2ª revisión: añade complejidad de orquestación por un ahorro de ~1 s. El foco queda en estabilidad del flujo principal, no en optimizaciones marginales.
 
 ---
 
-## 8. Recomendación — v2 post-1ª revisión
+## 8. Recomendación — v3 post-2ª revisión (sin KSM, refocus en boot speed)
 
-1. **Empezar por Fase 0 (spike) solo si la 2ª rueda de revisión cierra OK.** Cuesta 3 días, te da los números reales (RSS compartido pre- y post-dirty, versión Python en rootfs). Si el RSS compartido post-dirty es <40 MB por VM, la idea no compensa el refactor. Si es >60 MB **y KSM recupera otros 30–50 MB de páginas refcount-divergidas**, hay que hacerlo.
+1. **Luz verde a Fase 0 (spike) con misión alterada.** Aprobado por el equipo en la 2ª revisión. Cuesta 3 días, mide el sangrado de CoW bajo carga HTTP real (100 req concurrentes × 10 min), no sharing teórico. El umbral go/no-go:
+   - RSS estable a T=60 min ≤ ~300 MB → producto sólido (boot speedup + ahorro real)
+   - RSS se dispara a ~450 MB en <10 min → snapshot solo acelera arranque, no ahorra RAM a largo plazo → reconsiderar si el refactor de 3–4 semanas vale solo por velocidad
 
-2. **Comparación con la alternativa KSM-only (corregida 1ª revisión):**
+2. **El proyecto se justifica ahora por VELOCIDAD DE BOOT, no por densidad.**
 
-   | | KSM con memfd split (sin snapshot) | Snapshot/restore + KSM (combinado) |
+   | Beneficio | Magnitud | Valor real |
    |---|---|---|
-   | Tiempo de implementación | 1 semana | 3–4 semanas |
-   | Ahorro RAM por VM | 30–80 MB | 50–120 MB |
-   | Reduce tiempo de boot | no | sí (2–3×, no 10–25× como decía v1) |
-   | Cambio arquitectónico | mínimo | mayor |
-   | Reversible | trivial (sysctl) | flag por cell |
-   | Compatible con todo el flujo actual | sí | sí (con init-agent) |
-   | Requiere KSM activo en host | no (es lo único) | **sí, mandatorio** |
-   | Riesgo de bugs catastróficos | bajo | alto (virtio-fs, refcount, TSC) |
+   | Boot por VM 5 s → 1.5–3 s | 2–3× | Elasticidad / UX — un ERP que arranca en 2 s es magia negra en la industria |
+   | Eliminación del boot storm al levantar la cell | N × 5s → N × 1.5s | Cell de 20 VMs: 100 s → 30 s, sin saturar CPU/IO del host |
+   | POST /actions {restart} | 30–60 s → 5–15 s | Restart de tenant casi imperceptible |
+   | RSS estable | -30 a -40 % | ~60–75 Odoos en 32 GB (vs ~22 hoy) |
+   | Densidad 100 Odoos en 32 GB | **NO se cumple** | Requiere host de 64 GB |
 
-   **KSM ya no es "extra" — es parte del modelo snapshot/restore.** Sin KSM agresivo, el sharing del snapshot se degrada en horas por el refcount de CPython.
-
-   Dos escenarios a considerar:
-   - **A — solo KSM con memfd split**: opción conservadora, 1 semana, ~30–80 MB ahorrados por VM, ~30–50 Odoos posibles en 32 GB. NO llega al objetivo de 100.
-   - **B — Snapshot/restore + KSM combinado**: 3–4 semanas, ~150–200 MB RSS efectivo por VM, ~80–110 Odoos. Llega al objetivo del whitepaper con poco margen.
-
-   Si el objetivo de 100 Odoos en 32 GB es duro, B es el único camino. Si flexibilidad existe (e.g. aceptar 50–70 Odoos o subir el host a 64 GB), A es más sano.
+   Tres puntos sobre la densidad:
+   - El whitepaper original prometía 100 en 32 GB asumiendo sharing efectivo del heap. La realidad de Python (refcount) sin re-fusión (sin KSM) hace eso imposible en este hardware.
+   - **Mejora real:** 3–3.5× más densidad (22 → 60–75), no 5× como decía v1.
+   - Si el negocio exige estrictamente 100 Odoos en producción, la decisión correcta no es forzar el snapshot a ese objetivo — es upgradear el host a 64 GB o segmentar en 2 hosts × 32 GB.
 
 3. **No depender de Firecracker.** Implementar in-house con ioctls KVM nativos. Mismo principio que justificó escribir el VMM en vez de usar QEMU.
 
-4. **Diferir confidential computing.** SEV/TDX no es compatible con snapshot CoW por diseño. Si en el futuro hay clientes que pidan memoria encriptada, ese subset corre sin snapshot (boot normal). El 95 % del workload SaaS no necesita SEV.
+4. **No revivir KSM.** La decisión arquitectónica previa de NKR (ya documentada en `CLAUDE.md` y removida de los resúmenes públicos) se respeta. No vamos a meter una tecnología descartada solo porque la matemática lo necesite.
 
-5. **No comprometer fechas hasta cerrar la 2ª rueda de revisión con el equipo.** El feedback de la 1ª rueda demostró que hay puntos ciegos serios — el plan v2 los acomoda, pero el equipo puede tener más críticas. Sin acuerdo de los 3 (NKR, Claude, equipo) no se procede a Fase 0.
+5. **Diferir confidential computing.** SEV/TDX no es compatible con snapshot CoW por diseño. Si en el futuro hay clientes que pidan memoria encriptada, ese subset corre sin snapshot (boot normal). El 95 % del workload SaaS no necesita SEV.
+
+6. **Pre-warm pool diferido indefinidamente.** Complejidad de orquestación alta por ~1 s de ahorro. Foco en estabilidad del flujo principal.
 
 ---
 
-## 9. Conclusión — v2 post-1ª revisión
+## 9. Conclusión — v3 post-2ª revisión
 
-| Decisión a tomar | Recomendación v2 |
+| Decisión a tomar | Recomendación v3 (sin KSM) |
 |---|---|
-| ¿Empezar el spike? | **Solo tras cerrar 2ª rueda de revisión** con acuerdo de los 3 (NKR, Claude, equipo) |
+| ¿Empezar el spike? | **Sí — luz verde a Fase 0**, aprobado por el equipo en 2ª revisión |
 | ¿Depender de Firecracker? | **No**, implementación in-house con KVM ioctls |
-| ¿KSM es opcional o mandatorio? | **Mandatorio** desde día 1 (Fase 1, no Fase 5). Sin KSM el sharing colapsa por refcount CoW. |
+| ¿Usar KSM? | **No.** Decisión arquitectónica previa de NKR. No se revive. |
 | ¿virtio-fs puede ir en el snapshot? | **No.** Snapshot core-only, virtio-fs hot-plug post-restore. |
 | ¿gc.disable + gc.freeze pre-snapshot? | **Sí**, barato, ayuda en el margen |
-| ¿Marcar objetos como immortal (PEP 683)? | **Solo si Python ≥ 3.12** en el rootfs — confirmar en Fase 0 |
+| ¿Marcar objetos como immortal (PEP 683)? | **Sí si Python ≥ 3.12** en el rootfs (única herramienta para frenar refcount sin KSM). Confirmar en Fase 0. |
 | ¿Bajar el VM_RAM mínimo aprovechando esto? | Sí, una vez en producción — dev de 1300 → 800–1000, prod igual pero más VMs por host |
 | ¿Cambiar la API o el contrato del panel? | **No**, transparente para el panel |
 | ¿Cambiar la arquitectura per-tenant (DAX rootfs, virtio-fs shares)? | **No**, todo se preserva |
+| ¿Target de densidad? | **60–75 Odoos activos en 32 GB** (no 100). Para 100 Odoos: host de 64 GB. |
+| ¿Pre-warm pool? | **Diferido indefinidamente** |
+| ¿Confidential computing (SEV/TDX)? | **No**, incompatible con CoW. Si requerido en el futuro: subset con boot normal. |
+| ¿Cuidar enumeración PCI en hot-plug virtio-fs? | **Sí, riesgo medio agregado por equipo en 2ª revisión** — validar que los slots PCI hotpluggeados no pisen IRQs del virtio-net. Listado en §6. |
 
-**El cambio grande paga, con expectativas honestas.** No es "Lambda-grade microVM" (200 ms boot) como decía v1; es "boot 2–3× más rápido + ~50% RAM reduction + densidad llega a 100 Odoos en 32 GB con poco margen". Sigue siendo el único camino al objetivo del whitepaper sin agregar dependencias externas.
+**El cambio paga, con expectativas honestas y mucho más modestas que v1.** Es "boot 2–3× más rápido + 30–40 % menos RAM sostenida + eliminación de boot storm + ~60–75 Odoos en 32 GB". NO es 100 Odoos en 32 GB — eso requiere KSM (descartado) o más hardware. La inversión de 3–4 semanas se justifica principalmente por la velocidad de boot, no por la densidad.
 
 ---
 
 ## 10. Primera rueda de revisión — Q&A del equipo (2026-05-17)
+
+> **⚠️ SUPERSEDED por §11 en algunos puntos:** la 2ª rueda de revisión descartó KSM como mitigación (ver §11). Cualquier referencia a "KSM mandatorio" o "KSM como salvavidas" en esta §10 fue válida en el momento de la 1ª rueda pero queda **anulada por la 2ª rueda**. Los demás puntos (refcount de Python, virtio-fs out, snapshot core-only) siguen vigentes. Esta sección se conserva como registro histórico de la iteración.
 
 Esta sección documenta el feedback técnico del equipo sobre la versión v1 del doc. Las correcciones del equipo están incorporadas a las secciones §3, §4, §6, §7, §8 y al TL;DR. Esta sección queda como registro para que la 2ª rueda de revisión sepa qué se ajustó y qué quedó pendiente de debate.
 
@@ -579,3 +605,58 @@ Mi v2 ajusta a **150–200 MB RSS por VM** (un poco más conservador que sus 165
 | 8 | ¿El daemon NKR debe poder coexistir con cells "viejas" (boot normal) y nuevas (snapshot) en el mismo host? | Sí, flag `NKR_USE_SNAPSHOT` por cell. Fallback automático si snapshot inválido. | OK / preferimos all-or-nothing |
 
 **Sin acuerdo de los 3 en estos 8 puntos, no se procede a Fase 0.**
+
+---
+
+## 11. Segunda rueda de revisión — respuestas del equipo (2026-05-17)
+
+El equipo respondió los 8 puntos abiertos de §10 y agregó un nuevo punto crítico que yo había omitido. Cierre de la 2ª rueda: **luz verde a Fase 0** con misión alterada (sin KSM) y target de densidad ajustado.
+
+### Punto nuevo del equipo — "El elefante en la habitación: KSM ya está descartado en NKR"
+
+> "El documento v2 hace que KSM sea mandatorio (Fase 1) para salvar el colapso del CoW. Sin embargo, tenemos que ser implacables con las restricciones de nuestra propia infraestructura: **KSM ya no va en este proyecto por problemas de compatibilidad.** Ya habíamos tomado la dura decisión de sacarlo de nuestra documentación y resúmenes públicos porque, en la práctica, nos rompe más cosas de las que soluciona. No podemos revivir a KSM solo porque la matemática de la densidad lo necesita."
+
+**Respuesta de Claude:**
+
+**Aceptado al 100 %, y debo disculparme** — la `CLAUDE.md` ya decía *"KSM es una mentira: NKR usa memfd + MAP_SHARED. El kernel rechaza MADV_MERGEABLE en VMAs compartidos"*. Yo lo interpreté como "KSM no funciona para la región DAX shared, pero podría aplicarse a una región privada nueva". Eso técnicamente es cierto, pero **políticamente / arquitecturalmente** el equipo ya había cerrado el tema: KSM ROMPE COSAS en NKR y queda fuera, punto. Lo reviví en v2 sin chequear esa decisión preexistente.
+
+**Implicaciones que el equipo señala correctamente:**
+
+- RSS por VM post-restore empieza en ~100 MB.
+- Tras horas de tráfico, refcount CoW separa el heap completo. RSS estabiliza en ~250–300 MB.
+- En 32 GB (menos OS + Postgres), techo real **~60–75 Odoos activos**, no 100.
+- **La meta del whitepaper (100 en 32 GB) no es alcanzable con este hardware sin KSM.**
+- **El proyecto sigue valiendo, pero por velocidad de boot — no por densidad.**
+
+**Cambios incorporados en v3:**
+- Todas las menciones de "KSM mandatorio" eliminadas de §3.2, §6, §7, §8, §9.
+- Números de RSS / densidad ajustados en TL;DR y §4.
+- Recomendación de §8 reposicionada: el valor es boot speed, no densidad.
+- Misión de Fase 0 alterada (§7): medir sangrado de CoW bajo carga real sin re-fusión disponible.
+
+**Estado:** **acordado**, doc actualizado a v3. KSM permanentemente fuera del scope del proyecto.
+
+---
+
+### Respuestas del equipo a los 8 puntos abiertos de §10
+
+| # | Pregunta | Respuesta del equipo | Estado v3 |
+|---|---|---|---|
+| 1 | Versión Python en rootfs Odoo 19 | "Confirmarlo en Fase 0 es crítico. Si es Python 3.12, immortal objects (PEP 683) son nuestra única herramienta para frenar la degradación sin KSM." | **Acordado.** Step explícito en Fase 0. |
+| 2 | ¿Boot 1.5–3 s aceptable vs 200 ms? | "Aceptado. Es el único camino arquitectónicamente sano. Un arranque de 2 segundos para un ERP pesado sigue siendo magia negra en la industria." | **Acordado.** Confirmado en §4. |
+| 3 | ¿Target estricto 100 Odoos o aceptable 60–110? | "Tenemos que ser honestos con el negocio. Sin KSM, el target garantizado debe bajarse a ~60–70 activos. Si el cliente exige 100, necesitamos saltar a 64 GB de RAM. La física es la física." | **Acordado.** Target oficial: 60–75 activos. 100 requiere 64 GB. Reflejado en TL;DR, §4, §8, §9. |
+| 4 | Pre-warm pool en Fase 5 | "Diferir indefinidamente. Añade demasiada complejidad de orquestación por un ahorro de ~1 segundo. Concentrémonos en que el flujo principal no explote." | **Acordado.** Removido de Fase 5. |
+| 5 | Confidential computing (SEV/TDX) | "Ignorar. Si algún cliente Enterprise paranoico lo pide en 2027, le hacemos un flag para que use el boot normal sin snapshot." | **Acordado.** Fuera de scope. |
+| 6 | Acuerdo de los 3 antes de Fase 0 | "Acuerdo total sobre la viabilidad mecánica, sujeto a la eliminación de KSM de la arquitectura." | **Acordado.** KSM removido en v3. Luz verde. |
+| 7 | ¿Features de NKR olvidadas? | "Revisa bien la enumeración de los slots PCI al hacer el hot-plug del virtio-fs post-restore. El guest pre-pausado tiene un árbol PCI; si inyectas 4 shares de virtio-fs, asegúrate de que el guest los mapee sin pisar los IRQs de red." | **Acordado.** Agregado como riesgo medio #9 en §6. Reservar slots PCI 8–11 para hotplug virtio-fs en el snapshot. |
+| 8 | Flag `NKR_USE_SNAPSHOT` por cell | "Aprobado. Es la estrategia de rollout perfecta y nos da un botón de pánico gratuito." | **Acordado.** Conservado en Fase 4. |
+
+---
+
+### Decisión final de la 2ª rueda
+
+> "Autorizo el inicio de la Fase 0 (Spike de 3 días), pero con una misión alterada: tu objetivo en `snapshot_poc.rs` ya no es ver si KSM nos salva. Tu objetivo es medir cuán rápido y cuán profundo es el sangrado del CoW cuando bombardeas la instancia restorada con 100 peticiones HTTP concurrentes. Si el RSS se estabiliza en ~250 MB por VM sin KSM, tenemos un producto sólido de alta disponibilidad. Si se dispara de vuelta a los 450 MB como un boot frío en menos de 10 minutos, entonces el esfuerzo del Snapshot/Restore solo sirve para acelerar el arranque, pero no nos ahorra un solo byte de RAM a largo plazo."
+
+**Acuerdo cerrado de los 3 (NKR / equipo / Claude):** Fase 0 arranca cuando el equipo confirme calendario. Misión: bombardeo HTTP + medición de RSS en T=0 / T=10 min / T=60 min + confirmación de versión Python. Output go/no-go basado en el umbral de ~300 MB estable a T=60 min.
+
+**No hay más rounds de revisión antes de Fase 0.** Si Fase 0 trae resultados inesperados (RSS dispara a 450 MB, o Python es 3.8 sin alternativa, etc.), se abre una 3ª rueda para reconsiderar.
