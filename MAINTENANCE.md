@@ -232,6 +232,44 @@ que sube el threshold efectivo a 180s durante 240s post-reload.
 Si aún dispara: el reload tomó >180s. Investigar Odoo log para ver si el tenant
 está bajo carga anómala (cron infinito, websocket loop, etc.).
 
+### 4.6 "Reiniciar pg o pgbouncer (infra de cell — el panel JAMÁS los ve)"
+
+> **Importante:** el panel NUNCA ve pg ni pgbouncer — son infraestructura interna de NKR a nivel cell. La API HTTP no expone estas VMs. Esta sección es solo para el operador del host con acceso SSH.
+
+**Pitfall confirmado 2026-05-18 durante rollout A+B:** el endpoint `POST /api/v1/cells/{cell}/instances/{vm}/actions {action:"restart"}` **NO funciona correctamente para VMs de infra (`<cell>-pgb`, `<cell>-db`)**. Devuelve `{"async":true,"status":"accepted"}` y mata el proceso `nkr run` correspondiente — pero **NO lo respawnea**. El `handle_action` busca el `meta.json` del tenant en `cells/<cell>/instances/<vm>/`, no existe para infra → cleanup OK, respawn nunca dispara. Resultado: pgb/db queda muerto y todos los tenants Odoo de la cell pierden conexión PostgreSQL.
+
+**Recordar:** este endpoint nunca debería llegarle a un panel para infra — el panel solo conoce tenants Odoo. Pero un operador puede equivocarse llamándolo directo con curl. No lo hagas.
+
+**Procedimiento correcto (solo operador, vía SSH al host):**
+
+```bash
+# Restart de pgbouncer de una cell:
+pid=$(ps -eo pid,args | grep "nkr run --name <cell>-pgb " | grep -v grep | awk '{print $1}')
+kill $pid && sleep 5
+cd /mnt/nkr/cells/<cell>
+nkr cell up <cell> -d            # idempotente — respawnea sólo lo que falta
+sleep 10
+pgrep -f "nkr run --name <cell>-pgb" && echo OK  # verificar
+
+# Restart de PostgreSQL de una cell (más disruptivo — tenants pierden conn transitoria):
+pid=$(ps -eo pid,args | grep "nkr run --name <cell>-db " | grep -v grep | awk '{print $1}')
+kill $pid && sleep 8
+cd /mnt/nkr/cells/<cell>
+nkr cell up <cell> -d
+sleep 15
+# Los tenants Odoo retryean automáticamente (DB pool con auto-reconnect)
+```
+
+**¿Cuándo hace falta restartear infra?**
+- Después de cambiar `pgbouncer.ini` (config nueva no toma efecto sin restart)
+- Después de tunear `postgresql.conf` (shared_buffers, max_connections, etc.)
+- Después de un hotfix en `src/initramfs.rs` que afecta el init script (para que infra reciba el initramfs nuevo)
+- Después de cambiar permisos/secrets en `pg/data.ext4` (rotación de password, etc.)
+
+**Idempotencia de `nkr cell up`:** este comando es seguro de correr aunque algunas VMs estén vivas — el daemon detecta cuáles faltan y solo arranca esas. NO duplica VMs ni reinicia las ya corriendo.
+
+**TODO arquitectónico (no urgente):** agregar handling en `api.rs::handle_action` para detectar VMs de infra (nombre termina en `-pgb` o `-db`) y devolver `400 not_a_tenant_use_cli` en vez de matar sin respawnear. Hoy es un foot-gun. Tracked en NKR_Snapshot_Restore_FASE0_REPORT.md.
+
 ---
 
 ## 5. Cómo agregar features sin romper invariantes
@@ -328,24 +366,47 @@ nkr compose up -d                                     # regenera initramfs autom
 
 ### 6.4 Regenerar initramfs de TODOS los tenants (rollout de hot fix)
 
-Después de un cambio crítico en `initramfs.rs` (watcher, supervisor, etc.):
+Después de un cambio crítico en `initramfs.rs` (watcher, supervisor, optimización del cpio, etc.):
 
+**Para TENANTS Odoo (vía API HTTP, escalonado):**
 ```bash
-# Una VM a la vez, ~10s downtime cada una, total ~5min:
-for vm in $(nkr ps | awk 'NR>2 && NF>5 {print $3}'); do
-  cell=$(nkr ps | awk -v v="$vm" '$3==v {print $1}')
-  cd /mnt/nkr/cells/$cell
-  nkr stop "$vm" && sleep 1 && nkr compose up -d
-  # Verificar antes de seguir al próximo:
-  ip=$(nkr ps | awk -v v="$vm" '$3==v {print $7}')
-  if [ "$ip" != "—" ]; then
-    for i in $(seq 1 30); do
-      curl -sf --max-time 2 "http://$ip:8069/web/login" >/dev/null && break
-      sleep 1
-    done
-  fi
+TOKEN=$(awk -F= '/NKR_API_TOKEN/ {print $2}' /etc/nkr/api.env)
+for cell in $(nkr cell ls | awk 'NR>1 {print $1}'); do
+  curl -sS -H "Authorization: Bearer $TOKEN" \
+    "http://127.0.0.1:9090/api/v1/cells/$cell/capacity" \
+    | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin).get("projects", [])))' \
+    | while read vm; do
+        echo "→ Restart $vm..."
+        curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
+          -H "Content-Type: application/json" \
+          "http://127.0.0.1:9090/api/v1/cells/$cell/instances/$vm/actions" \
+          -d '{"action":"restart"}' > /dev/null
+        sleep 35
+      done
+done
+# Verificación final:
+TENANTS=$(curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9090/api/v1/cells/odoo-v19/capacity | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin).get("projects", [])))')
+for vm in $TENANTS; do
+  port=$(curl -sS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:9090/api/v1/cells/odoo-v19/instances/$vm" | grep -oE '"port_8069_up":(true|false)')
+  echo "$vm $port"
 done
 ```
+
+**Para INFRA (pgb + db de cada cell): NO USAR EL LOOP DE ARRIBA** — la API HTTP los mata sin respawnear (ver §4.6). Después de los tenants:
+
+```bash
+# Por cada cell:
+for cell in $(nkr cell ls | awk 'NR>1 {print $1}'); do
+  for vm in ${cell}-pgb ${cell}-db; do
+    pid=$(ps -eo pid,args | grep "nkr run --name $vm " | grep -v grep | awk '{print $1}')
+    [ -n "$pid" ] && kill $pid && sleep 8
+  done
+  (cd /mnt/nkr/cells/$cell && nkr cell up $cell -d)
+  sleep 15
+done
+```
+
+**Versión legacy (kill manual con `nkr stop`, sin API):** la teníamos antes pero `nkr stop` puede no funcionar parejo en algunas versiones del CLI. Preferir la versión vía API+kill de arriba.
 
 ---
 
