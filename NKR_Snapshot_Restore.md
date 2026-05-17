@@ -10,6 +10,7 @@
 - **v3 (2026-05-17, segunda rueda de revisión — sección §11)** — el equipo recordó que **KSM ya está descartado en NKR por decisión arquitectónica previa** (compatibilidad/estabilidad — confirmado en `CLAUDE.md`: *"KSM es una mentira"*). La v2 lo había revivido como mitigación mandatoria; v3 lo elimina de toda la propuesta. Sin KSM, la matemática de densidad colapsa: target real **60–75 Odoos activos** (no 80–110), techo absoluto ~75 con margen cero. El proyecto sigue, pero la justificación principal pasa de "densidad" a **velocidad de boot (5 s → 1.5–3 s)** y eliminación del boot storm. **Luz verde a Fase 0 con misión alterada:** medir el sangrado de CoW post-restore bajo carga HTTP real (100 reqs concurrentes × 10 min), no medir sharing teórico.
 - **v3.1 (2026-05-17, pre-Fase 0)** — agregado §12 con el registro completo de **alternativas evaluadas** antes de aterrizar en snapshot/restore (initramfs reducido, kernel diet más agresivo, balloon más agresivo, kernel XIP, userfaultfd, + opciones rechazadas con razón). Algunas son complementarias y baratas — pidiendo confirmación del equipo para hacer A (initramfs) y B (kernel diet) en paralelo a Fase 0.
 - **v4 (2026-05-17, post-Fase 0 — CANCELACIÓN)** — la medición real del host (PSS = 223 MB por VM dev ociosa, refcount CoW degradation visible en `intech-devp`, host de 64 GB no 32 GB) demostró que el ROI del refactor era marginal. **Equipo cancela snapshot/restore completo (Camino 1).** Las opciones §12.1.A (initramfs) y §12.1.B (kernel diet) se autorizan como sprint inmediato. Agregada §12.1.C (EROFS + inode_share) propuesta por el equipo como mejora v2 — incluyo análisis con observaciones técnicas que merecen segunda mirada antes de comprometerse. Ver §11 "Decisión final".
+- **v4.1 (2026-05-18, post-A+B)** — A.1 y B aplicados, commiteados, verificados (initramfs 4.20 MB → 1.17 MB, ~70 MB de RAM liberados en el host con 21 VMs). **EROFS RECHAZADO DE POR VIDA** tras debate del equipo: DAX ya hace el sharing, EROFS no agrega y traería overhead. Marca permanente en §12.1.C + §12.4 — no se re-evalúa. **D (compose.ram más agresivo)** queda pendiente de debate con explicación expandida — ver §12.1.D.
 
 ---
 
@@ -706,7 +707,11 @@ Antes de aterrizar en snapshot/restore, evalué otras técnicas para reducir el 
 
 **Status:** **complementario, recomendado en paralelo a Fase 0**. Bajo riesgo si se mide cada cambio. Compatible con snapshot/restore (el snapshot incluye el kernel actual, así que rebuild del kernel obliga a regenerar snapshot).
 
-#### C) EROFS + `inode_share` como rootfs read-only (propuesto por el equipo, v4)
+#### C) ~~EROFS + `inode_share` como rootfs read-only~~ — **RECHAZADO DE POR VIDA (2026-05-18)**
+
+> **❌ Decisión final del equipo (2026-05-18):** EROFS queda permanentemente descartado de NKR. **DAX ya lo reemplaza.** Las mediciones de Fase 0 confirmaron que el DAX sobre ext4 + virtio-pmem ya entrega el ~31 % del sharing por VM (PSS = 223 MB, Shared = 69 MB) sin overhead extra. Cualquier intento de meter EROFS como alternativa caería en uno de dos casos: imagen comprimida (gana disco, **pierde DAX** → MÁS RSS, no menos) o imagen no-comprimida (misma huella que ext4+DAX, cero ganancia). Además `inode_share` aplica a fscache con múltiples imágenes distintas — NKR tiene una sola imagen rootfs por cell mapeada por N tenants, ya deduplicada por el page cache del kernel. **No se vuelve a evaluar esta vía. Si en el futuro alguien la propone, redirigir acá.**
+>
+> Análisis técnico que llevó al rechazo (queda como registro):
 
 **Qué es (la propuesta del equipo):** hoy el rootfs base de Odoo se empaqueta en ext4 y se comparte vía virtio-pmem (DAX). La alternativa propuesta es cambiar el pipeline de construcción a **EROFS (Enhanced Read-Only File System)** — montado en el host con flag `inode_share` y `domain_id` restringido, el kernel deduplica de forma nativa e inmediata el caché de páginas a nivel de inodos para archivos idénticos (ej. librerías dinámicas `.so` de Python, lxml, psycopg2).
 
@@ -777,22 +782,94 @@ Sin esos números, agregar EROFS al pipeline es complejidad sin justificación c
 
 ---
 
-#### D) Reducir `compose.ram` defaults + balloon más agresivo
+#### D) Reducir `compose.ram` defaults + balloon más agresivo — **PENDIENTE DEBATE (v4.1)**
 
-**Qué es:** hoy dev nace con `ram=1300 MB`, staging con `1024 MB`. El balloon trabaja IDLE→ACTIVE pero los defaults son conservadores tras OOM history del Odoo 19 boot. Si el snapshot/restore baja el RSS estable a 250–300 MB, podemos bajar el `compose.ram` también.
+##### Conceptos básicos primero (para alinear lenguaje del debate)
 
-**Cómo:** después de validar Fase 0 + Fase 2 en producción, ajustar `derive_resources_for_tier` en [`src/api.rs`](src/api.rs):
-- dev: 1300 → 1000 MB (con balloon IDLE más agresivo: 600 MB en vez de 256)
-- staging: 1024 → 800 MB
-- prod: sin cambio (PROD ya nace ACTIVE balloon=0 por doctrina)
+| Término | Qué es | Quién lo mide |
+|---|---|---|
+| `compose.ram` | RAM que el VMM (`nkr run`) le asigna a la VM al boot. Es el tope físico que KVM mappea. La VM cree que tiene esa cantidad. | `--ram 1300` en el args de `nkr run` |
+| `balloon_mb` (boot/ACTIVE) | MB que el guest "dona" al host vía `virtio_balloon` desde el momento del boot. Ej: `ram=1024 + balloon_mb=256` → guest cree que tiene 1024 pero solo usa 768 reales. | `--balloon-mb 256` en `nkr run` |
+| `balloon_idle_mb` | MB que el balloon infla DESPUÉS de `decay_secs` sin tráfico (estado IDLE). Si el guest queda inactivo, se queda con menos RAM real. | `--balloon-idle-mb 256` |
+| RSS del proceso `nkr run` (host-side) | Cuántas páginas físicas el VMM tiene realmente residente en host. Lo único que cuesta RAM de verdad. | `smaps_rollup` / `ps rss=` |
+| PSS del proceso `nkr run` | RSS proporcional, descontando lo compartido vía DAX/file-backed. **La métrica honesta.** | `smaps_rollup` campo `Pss` |
+| Floor de seguridad | Mínimo absoluto antes de OOM-kill del init guest. Doctrina NKR: **256 MB** real. | Implícito en cgroup `memory.max` |
 
-**Ahorro:** ~30 % del `compose.ram` committed per dev/staging VM. NO es RSS real (el balloon es lazy) — pero reduce la presión percibida sobre el host y permite acomodar más VMs antes del overcommit.
+##### Estado HOY (medido en Fase 0, 2026-05-17)
 
-**Costo:** cambio de configuración + restart de tenants para que tome efecto. Riesgo: si dev/staging crece y necesita más de 1000/800 MB, hay deflate del balloon — funciona pero hay latencia. Histórico Odoo 19 mostró bootstrap pesado (~350 MB RSS) — el techo de 800–1000 deja margen pero estrecho.
+| Tier | `compose.ram` | `balloon` IDLE | RSS real medio | **PSS real medio** | Margen RAM committed vs PSS |
+|---|---:|---:|---:|---:|---|
+| dev (smoke-*) | **1300 MB** | 256 MB | 260 MB | **223 MB** | committed = **5.8× PSS** |
+| staging (stag-*) | **1024 MB** | 768 MB | 215 MB | **197 MB** | committed = **5.2× PSS** |
+| prod (prod-t1) | **2048 MB** | 0 MB (PROD doctrina) | 386 MB | **343 MB** | committed = **5.9× PSS** |
+| dev con tráfico (intech-devp) | **1300 MB** | 256 MB | 637 MB | **524 MB** | committed = **2.5× PSS** |
 
-**Pitfall:** ya pasó una vez en v1.6.2 (`Server memory limit reached` cuando dev estaba en 768 MB con ~31 módulos custom). No volver a bajar sin medir bien.
+**El compose.ram es 5–6× el PSS observado en VMs ociosas y 2.5× incluso bajo tráfico real.** Hay MUCHO margen — la pregunta es cuánto bajarlo sin morir.
 
-**Status:** **complementario, hacer DESPUÉS de snapshot/restore en producción**, no antes — necesitamos ver cómo se estabiliza el RSS estable real antes de comprometernos con compose.ram más bajo.
+##### Propuesta concreta (a debatir, NO ejecutar todavía)
+
+Ajustar `derive_resources_for_tier` en [`src/api.rs`](src/api.rs):
+
+| Tier | Compose.ram hoy → propuesto | Balloon IDLE hoy → propuesto | Floor real (peor caso) |
+|---|---|---|---|
+| **dev** | 1300 → **1000 MB** | 256 → **600 MB** | guest queda con 1000 − 600 = **400 MB real cuando idle** |
+| **staging** | 1024 → **800 MB** | 768 → **600 MB** | 800 − 600 = **200 MB real cuando idle** ⚠️ (debajo del floor de 256 — REVISAR) |
+| **prod** (sin cambio) | 2048 + (768·W) | 0 | siempre 100 % committed |
+
+Corrijo staging — para respetar el floor de 256 MB:
+- staging: 1024 → **900 MB**, balloon IDLE 768 → **600 MB** → 900 − 600 = **300 MB real cuando idle** (sobre el floor)
+
+##### Aritmética del ahorro real
+
+**OJO al concepto crítico:** bajar `compose.ram` **NO baja directamente el RSS** del proceso `nkr` cuando la VM está bajo carga. Lo que hace es:
+1. Bajar el **tope** que KVM committea al boot
+2. Reducir las **page tables** del host (EPT/NPT) — esto sí ahorra ~2 MB por GB de RAM bajada
+3. Reducir el `struct page` array del host (otros ~15 MB por GB bajada)
+4. Comprimir el **techo de exposición a OOM** — si el guest pide más, no puede crecer más allá del nuevo compose.ram
+
+**Ahorro real medido en el host por VM si bajamos 300 MB de compose.ram (dev 1300→1000):**
+- Page tables: ~0.6 MB
+- struct page array: ~4.5 MB
+- **Total: ~5 MB por VM en RAM del host realmente liberada**
+
+Con 21 VMs dev/staging: **~100 MB total**. NO es transformador.
+
+##### El verdadero efecto: "headroom percibido" y overcommit
+
+El compose.ram es lo que el panel/operador VE como "esta VM ocupa X GB". Si tenés 22 VMs con compose.ram=1300 → committed = 28.6 GB. **El host real RSS es 6.2 GB, pero el operador no se anima a meter más VMs porque cree que ya está al 90 % del host.** Bajar compose.ram desbloquea psicológicamente más densidad.
+
+Eso es un win **operativo**, no técnico. Reduce el committed visible pero no la RAM física consumida.
+
+##### Riesgos honestos
+
+1. **Bootstrap OOM** — Odoo 19 al arrancar levanta ~350 MB de RSS antes de estabilizar. Si `compose.ram` queda en 1000 MB y `balloon_mb` boot es 600 MB → guest tiene 400 MB efectivos al boot → **margen apretado**. Histórico: **v1.6.2 mató dev con 768 MB / ~31 módulos custom** (`Server memory limit reached`). Habría que arrancar con balloon=0 y solo inflar tras decay.
+
+2. **Latencia del deflate** — si la VM IDLE recibe un request grande (export Excel, install módulo), el guest hace `madvise(DONTNEED)` → kernel del guest tiene que pedir páginas de vuelta al host → latencia 10–500 ms en el primer request post-decay. Ya pasa hoy, pero más agresivo el balloon = más frecuente la latencia.
+
+3. **Picos sostenidos** — si un cliente importa 50.000 productos (caso real reportado en `intech-devp`), el peak RSS sube a 600+ MB. Con compose.ram=1000 y limit_memory_hard=1000 MB, no hay buffer → worker OOM-kill → import falla.
+
+4. **Cgroup memory.max** — hoy NKR setea `memory.max = ram·1.15`. Con ram=1000 → cgroup tope 1150 MB. Sin margen para spikes transitorios.
+
+5. **Visibilidad del problema** — si baja compose.ram y un cliente reporta lentitud por balloon deflate latency, **no es trivial diagnosticar** desde el panel. Hoy el balloon stats vq permite ver `guest_mem_available` — útil para post-mortem pero reactivo.
+
+##### Mi recomendación para el debate
+
+**Tres caminos posibles:**
+
+**Camino D.1 — No tocar nada.** El baseline actual es seguro, el host tiene margen (Fase 0 confirmó 6 GB used / 64 GB total). El "ahorro" sería 100 MB host-side de page tables — no compensa el riesgo de OOM/latencia.
+
+**Camino D.2 — Bajar solo dev a 1000 MB, mantener staging y prod.** dev es el tier con menos uso productivo (sandbox de clientes), tolera más latencia. Staging y prod sin cambio. Ahorro real: ~50 MB con N=10 dev tenants. Riesgo: bootstrap OOM en `aintech-dev` y similares con muchos módulos.
+
+**Camino D.3 — Solo subir el `balloon_idle_mb` agresivo (sin tocar compose.ram).** Mantenés 1300 MB committed pero el IDLE recupera más (de 256 → 600 MB devueltos al host). Si la VM despierta, deflate normal. **Cero riesgo de OOM** (el compose.ram sigue siendo el mismo). Ahorro real: aproximadamente lo que el balloon ya logra — pero más agresivo. Probablemente recupera ~100-200 MB extra de páginas no usadas con N=10 dev tenants idle.
+
+**Mi voto: D.3 si querés moverte, D.1 si no.** D.2 (bajar compose.ram) tiene los riesgos sin la mayor parte del beneficio — el host-side saving es marginal y el riesgo de OOM es real.
+
+**Datos que ayudarían a decidir antes de tocar:**
+1. ¿Cuántos dev tenants suelen estar idle vs activos en producción? Si la mayoría son idle, D.3 maximiza ahorro.
+2. ¿Cuál fue el peak RSS de `intech-devp` durante el tráfico pesado? Si <800 MB, hay margen para bajar a 1000. Si llegó a 1100+, no.
+3. ¿El panel tiene alguna alarma de "VM se acerca al limit_memory_hard"? Sin telemetría reactiva, bajar el compose.ram es ciego.
+
+**Status:** complementario, hacer DESPUÉS de validar las preguntas anteriores. NO bloqueante.
 
 ### 12.2 Investigación abierta (puede o no resultar)
 
@@ -860,8 +937,8 @@ Sin esos números, agregar EROFS al pipeline es complejidad sin justificación c
 |---|---|---|---|
 | A | Initramfs reducido | **AUTORIZADO** (post-Fase 0, v4) | Sprint inmediato (~1 día, bajo riesgo) |
 | B | Kernel diet más agresivo | **AUTORIZADO** (post-Fase 0, v4) | Sprint inmediato (1–2 días, bajo riesgo) |
-| C | **EROFS + `inode_share`** (propuesto por equipo v4) | A validar con benchmark | **Spike 1 día** antes de comprometer al refactor de `build-rootfs` — mis dudas técnicas en §12.1.C |
-| D | Bajar `compose.ram` + balloon agresivo | Complementario | **Hacer DESPUÉS de A + B** en producción, una vez validado el nuevo PSS estable |
+| C | ~~EROFS + `inode_share`~~ | **❌ RECHAZADO DE POR VIDA (v4, 2026-05-18)** | DAX lo reemplaza. Mediciones Fase 0 demuestran que ext4+DAX ya entrega el sharing. EROFS comprimido pierde DAX, no-comprimido = misma huella, `inode_share` no aplica al caso de un rootfs único compartido por N tenants. **No re-evaluar.** |
+| D | Bajar `compose.ram` + balloon agresivo | Complementario, pendiente debate | **A discutir** — explicado en §12.1.D, requiere medir el techo de RSS bajo carga real antes de comprometerse |
 | E | Kernel-as-DAX / XIP | Investigación | **Diferido indefinidamente** post-cancelación de snapshot (poca prioridad) |
 | F | userfaultfd + on-demand sharing | Investigación | **Archivado** — snapshot/restore cancelado, esta opción dependía de ese path |
 | G | Unikernel | **Rechazado** | Incompatible con Python/Odoo |
