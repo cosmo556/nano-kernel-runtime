@@ -405,19 +405,15 @@ pub fn generate_initramfs(name: &str, disk_path: &str, docker_cmd: Option<&[Stri
         fs::create_dir_all(work.join(dir))?;
     }
 
-    // Embeber nkr-watcher (binario Rust estático). Sustituye al subshell
-    // busybox del init script para evitar la race rara que el shell tenía
-    // con virtio-console (audit 2026-05-15). Compilado pre-build con
-    // `cargo build --release -p nkr-watcher --target=x86_64-unknown-linux-musl`.
-    // El binario va a /bin/nkr-watcher con 0755.
-    const NKR_WATCHER_BIN: &[u8] = include_bytes!(
-        concat!(env!("CARGO_MANIFEST_DIR"),
-            "/target/x86_64-unknown-linux-musl/release/nkr-watcher"));
-    let watcher_path = work.join("bin/nkr-watcher");
-    fs::write(&watcher_path, NKR_WATCHER_BIN)?;
-    Command::new("chmod").args(["0755", &watcher_path.to_string_lossy()]).status()?;
-    eprintln!("[NKR-INITRAMFS] Embebido /bin/nkr-watcher ({} bytes)",
-        NKR_WATCHER_BIN.len());
+    // **Opción A — Initramfs reducido (2026-05-18, post-Fase 0):**
+    // Removido el embedding de `nkr-watcher` (binario Rust estático, ~428 KB).
+    // El binario nunca se llegó a usar en producción — el watcher real es el
+    // subshell busybox del init script (ver línea ~709 "Clean-shutdown
+    // watcher"). El binario Rust quedó embebido por inercia tras el audit
+    // 2026-05-15 que probó y descartó esa vía. Sacarlo ahorra ~428 KB de
+    // RAM por VM (el initramfs se descomprime entero en memoria del guest).
+    // El crate `crates/nkr-watcher/` se mantiene como referencia histórica
+    // pero ya no se invoca desde el build de NKR.
 
     // Embed env vars in /etc/nkr-env inside the initramfs (if provided).
     // This ensures immediate availability without depending on file delivery via shares.
@@ -713,8 +709,9 @@ echo "[NKR-{label}] DNS configurado: $NKR_DNS_LIST"
 # con BufReader, re-open por iteración con BufReader, y libc::open+read raw,
 # y los tres se cuelgan tras el primer mensaje. El subshell busybox sí
 # funciona (con una race rara en el N-ésimo reload consecutivo, manejada
-# por el watchdog). El binario `nkr-watcher` queda embebido en /bin/ del
-# initramfs para futuro re-uso/investigación, pero no se lanza.
+# por el watchdog). Crate `crates/nkr-watcher/` se mantiene como referencia
+# histórica pero el binario ya NO se embebe en el initramfs desde 2026-05-18
+# (Opción A — ahorro ~428 KB/VM).
 ( # ─── Diagnostic logging to /var/log/odoo/nkr-watcher.log ──────────────
   # Visible desde el HOST en <instance>/logs/nkr-watcher.log (virtio-fs share
   # RW). Útil para diagnosticar por qué el watcher subshell no reacciona a
