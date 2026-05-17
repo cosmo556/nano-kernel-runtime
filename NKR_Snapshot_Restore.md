@@ -1,6 +1,6 @@
 # NKR Snapshot/Restore — análisis y plan de implementación
 
-**Estado:** propuesta de arquitectura, no implementado. Doc para tomar la decisión.
+**Estado:** ❌ **PROYECTO CANCELADO oficialmente (2026-05-17, post-Fase 0).** Ver §11 "Decisión final del equipo" y [NKR_Snapshot_Restore_FASE0_REPORT.md](NKR_Snapshot_Restore_FASE0_REPORT.md). Este documento se archiva como **caso de estudio interno** de excelencia en ingeniería: cómo la telemetría temprana (Fase 0, ~30 min de medición) previno 3–4 semanas de refactor masivo con ROI marginal. Las opciones complementarias §12.1.A (initramfs reducido) y §12.1.B (kernel diet) **SÍ proceden** como tareas separadas.
 **Fecha:** 2026-05-17
 **Versión NKR de referencia:** 1.6.9
 
@@ -9,6 +9,7 @@
 - **v2 (2026-05-17, primera rueda de revisión)** — incorpora feedback del equipo (sección §10) sobre tres puntos ciegos críticos: (1) refcount de CPython rompe el sharing CoW del heap, (2) virtio-fs en snapshot causa pánico al restore, (3) la matemática real de densidad descuenta footprint de Postgres con 100 DBs activas. Números corregidos en TL;DR, §3, §4, §6, §7, §8.
 - **v3 (2026-05-17, segunda rueda de revisión — sección §11)** — el equipo recordó que **KSM ya está descartado en NKR por decisión arquitectónica previa** (compatibilidad/estabilidad — confirmado en `CLAUDE.md`: *"KSM es una mentira"*). La v2 lo había revivido como mitigación mandatoria; v3 lo elimina de toda la propuesta. Sin KSM, la matemática de densidad colapsa: target real **60–75 Odoos activos** (no 80–110), techo absoluto ~75 con margen cero. El proyecto sigue, pero la justificación principal pasa de "densidad" a **velocidad de boot (5 s → 1.5–3 s)** y eliminación del boot storm. **Luz verde a Fase 0 con misión alterada:** medir el sangrado de CoW post-restore bajo carga HTTP real (100 reqs concurrentes × 10 min), no medir sharing teórico.
 - **v3.1 (2026-05-17, pre-Fase 0)** — agregado §12 con el registro completo de **alternativas evaluadas** antes de aterrizar en snapshot/restore (initramfs reducido, kernel diet más agresivo, balloon más agresivo, kernel XIP, userfaultfd, + opciones rechazadas con razón). Algunas son complementarias y baratas — pidiendo confirmación del equipo para hacer A (initramfs) y B (kernel diet) en paralelo a Fase 0.
+- **v4 (2026-05-17, post-Fase 0 — CANCELACIÓN)** — la medición real del host (PSS = 223 MB por VM dev ociosa, refcount CoW degradation visible en `intech-devp`, host de 64 GB no 32 GB) demostró que el ROI del refactor era marginal. **Equipo cancela snapshot/restore completo (Camino 1).** Las opciones §12.1.A (initramfs) y §12.1.B (kernel diet) se autorizan como sprint inmediato. Agregada §12.1.C (EROFS + inode_share) propuesta por el equipo como mejora v2 — incluyo análisis con observaciones técnicas que merecen segunda mirada antes de comprometerse. Ver §11 "Decisión final".
 
 ---
 
@@ -705,7 +706,78 @@ Antes de aterrizar en snapshot/restore, evalué otras técnicas para reducir el 
 
 **Status:** **complementario, recomendado en paralelo a Fase 0**. Bajo riesgo si se mide cada cambio. Compatible con snapshot/restore (el snapshot incluye el kernel actual, así que rebuild del kernel obliga a regenerar snapshot).
 
-#### C) Reducir `compose.ram` defaults + balloon más agresivo
+#### C) EROFS + `inode_share` como rootfs read-only (propuesto por el equipo, v4)
+
+**Qué es (la propuesta del equipo):** hoy el rootfs base de Odoo se empaqueta en ext4 y se comparte vía virtio-pmem (DAX). La alternativa propuesta es cambiar el pipeline de construcción a **EROFS (Enhanced Read-Only File System)** — montado en el host con flag `inode_share` y `domain_id` restringido, el kernel deduplica de forma nativa e inmediata el caché de páginas a nivel de inodos para archivos idénticos (ej. librerías dinámicas `.so` de Python, lxml, psycopg2).
+
+**Promesa del equipo:** ahorro hasta ~20–30 % adicional en caché compartido del host para librerías pesadas, sin el costo de CPU de KSM y sin la fragilidad del CoW de snapshot.
+
+**Costo estimado por el equipo:** medio. Modificar `build-rootfs` para usar `mkfs.erofs` en vez de `mkfs.ext4` + asegurar `CONFIG_EROFS_FS` y `CONFIG_EROFS_FS_ZIP` en el kernel.
+
+**Riesgo estimado por el equipo:** bajo. EROFS es estándar industrial maduro (mainline desde 5.4, usado por Android a escala billion-device).
+
+**Status según el equipo:** complementario, recomendado para v2 (no bloquea A + B).
+
+---
+
+##### 🟡 Mis observaciones / dudas técnicas (Claude, 2026-05-17)
+
+EROFS es excelente para su caso de uso original (rootfs comprimido de Android, imágenes inmutables de containers). Pero antes de comprometerse, hay 4 preguntas técnicas que merecen validación porque la arquitectura actual de NKR (ext4 + virtio-pmem + DAX) ya está **muy cerca del óptimo** para "un rootfs read-only mounted by N tenants".
+
+**1. ¿EROFS + fsdax es compatible con virtio-pmem en el kernel de NKR?**
+- EROFS soporta `fsdax` mount option desde kernel 6.1 (config `CONFIG_FS_DAX`).
+- Pero **fsdax sobre EROFS requiere la imagen NO comprimida** (DAX hace XIP — execute in place — directo del archivo; no se puede ejecutar bytes comprimidos en memoria).
+- Si la imagen EROFS es no-comprimida: misma huella de disco que ext4, **mismo sharing de page cache que ext4+DAX hoy**. No hay ganancia.
+- Si la imagen EROFS es comprimida (lo que da el ahorro de disco): **se pierde DAX**. El kernel descomprime al page cache → cada VM tiene su propia copia descomprimida → MÁS memoria, no menos.
+
+**Necesito validar:** ¿el kernel custom de NKR (`build-kernel/`) tiene `CONFIG_FS_DAX` + `CONFIG_EROFS_FS` simultáneamente y funciona sobre virtio-pmem? No es trivial, no he visto reportes en producción de esa combinación.
+
+**2. ¿`inode_share` aplica realmente al caso de uso de NKR?**
+
+`inode_share` es parte de la integración EROFS + **fscache** (`CONFIG_EROFS_FS_ONDEMAND` + `cachefilesd`). Su uso típico: tenés **múltiples imágenes EROFS distintas** (ej. 10 containers con base Ubuntu) que comparten blobs comunes (libc.so.6) — el `domain_id` agrupa imágenes "afines" y el kernel deduplica los blobs entre ellas.
+
+**Pero NKR tiene UNA sola imagen rootfs por cell (`/mnt/nkr/images/odoo19.ext4`).** Todas las VMs de la cell mappean **el mismo archivo**. El kernel del host YA hace page cache sharing automático entre todos los mappings del mismo archivo (es lo que hace DAX al máximo: mismas páginas físicas para todas las VMs).
+
+`inode_share` aporta cuando tenés N imágenes distintas. **Para un solo rootfs compartido por N tenants, no hay nada que deduplicar — ya está deduplicado.**
+
+**3. El "20–30 % adicional" prometido — ¿de dónde sale realmente?**
+
+Las mediciones reales de Fase 0 mostraron:
+- PSS por VM dev = 223 MB
+- Shared (DAX rootfs) = 69 MB por VM (31 % del PSS)
+- Private (heap Python + kernel BSS) = 191 MB (69 % del PSS)
+
+El "20–30 % adicional" tendría que venir de uno de estos lados:
+- **Más sharing del rootfs:** ya estamos en el techo con DAX. EROFS no agrega.
+- **Sharing del heap de Python:** EROFS no toca esto. Sigue siendo refcount-CoW.
+- **Compresión del rootfs en disco:** beneficio real para storage, pero no para RAM.
+
+Si los 20–30 % vienen de comparar EROFS vs un baseline SIN DAX, sí hay mejora. Pero NKR ya tiene DAX. La comparación honesta es **EROFS+fsdax vs ext4+DAX**, y ahí la diferencia es marginal o nula.
+
+**4. ¿Hay overhead nuevo que estamos asumiendo cero?**
+
+- EROFS sobre fscache añade un daemon en user-space (`cachefilesd` o nuestro propio) que mantiene el cache backend → proceso extra, fd extra, otro punto de falla.
+- `domain_id` requiere configuración consistente entre cells, otra cosa para mantener.
+- Si las librerías Python no son idénticas byte-a-byte entre el template community y el enterprise (diferentes builds, optimizaciones distintas), el inode_share no las mergea aunque se llamen igual.
+
+##### Mi recomendación sobre EROFS
+
+**No descartar, pero validar con un benchmark concreto antes de comprometerse al refactor de `build-rootfs`.**
+
+Propuesta de spike (1 día):
+1. Build un `odoo19.erofs` desde el mismo Nkrfile que genera `odoo19.ext4` actual
+2. Bootear 5 VMs sobre ese rootfs EROFS (con fsdax si compila, sino sin)
+3. Medir PSS de cada una vs el baseline ext4+DAX de Fase 0
+4. Si la mejora es **>15 % de PSS** → vale el refactor para v2
+5. Si la mejora es **<10 %** → archivar y seguir con ext4+DAX
+
+Sin esos números, agregar EROFS al pipeline es complejidad sin justificación cuantificada. Mi sospecha basada en cómo funcionan EROFS y DAX en kernel: la mejora será del orden de **0–5 % de PSS**, no 20–30 % (porque el bulk del PSS no es el rootfs — son las páginas private dirty del heap de Python, que EROFS no toca).
+
+**Pregunta abierta al equipo:** ¿autorizan el spike de 1 día para benchmark EROFS antes de meterlo al plan v2? Si los números no validan, ahorramos otro proyecto sin ROI.
+
+---
+
+#### D) Reducir `compose.ram` defaults + balloon más agresivo
 
 **Qué es:** hoy dev nace con `ram=1300 MB`, staging con `1024 MB`. El balloon trabaja IDLE→ACTIVE pero los defaults son conservadores tras OOM history del Odoo 19 boot. Si el snapshot/restore baja el RSS estable a 250–300 MB, podemos bajar el `compose.ram` también.
 
@@ -724,7 +796,7 @@ Antes de aterrizar en snapshot/restore, evalué otras técnicas para reducir el 
 
 ### 12.2 Investigación abierta (puede o no resultar)
 
-#### D) Kernel-as-DAX / XIP (Execute In Place)
+#### E) Kernel-as-DAX / XIP (Execute In Place)
 
 **Qué es:** hoy el VMM carga el kernel image (~12 MB comprimido, ~30 MB descomprimido) en la RAM de cada guest. Si en su lugar mapeamos el kernel image como un virtio-pmem DAX adicional, el guest podría **ejecutar el kernel directamente del archivo mapped read-only** — y el kernel TEXT (~10–15 MB) sería físicamente compartido entre todas las VMs del mismo build, sin necesidad de KSM ni CoW.
 
@@ -744,7 +816,7 @@ Antes de aterrizar en snapshot/restore, evalué otras técnicas para reducir el 
 
 **Status:** **no comprometer**. Dejar como spike paralelo de 2–3 días si algún ingeniero tiene bandwidth tras Fase 0. Si funciona, gran ahorro complementario. Si no, no perdimos nada en el path principal.
 
-#### E) userfaultfd + page sharing on-demand
+#### F) userfaultfd + page sharing on-demand
 
 **Qué es:** alternativa más dinámica al snapshot/restore. En vez de mmap un snapshot file CoW, mantener una "VM blueprint" siempre encendida (paused) y servir páginas a las VMs nuevas vía `userfaultfd` del kernel del host.
 
@@ -758,15 +830,15 @@ Antes de aterrizar en snapshot/restore, evalué otras técnicas para reducir el 
 
 ### 12.3 Rechazadas con razón documentada (registro de no-go)
 
-#### F) Unikernel (Unikraft / MirageOS / OSv)
+#### G) Unikernel (Unikraft / MirageOS / OSv)
 
 **Por qué:** unikernels arrancan en 1–10 MB y boot en ms. Pero Python + Odoo NO corren sobre unikernel — requieren libc completa, `fork()`, threading POSIX, signals, dynamic linker. Refactor de Odoo para correr en unikernel es **inviable** (cientos de assumptions sobre el OS subyacente). **Rechazado.**
 
-#### G) gVisor (user-space kernel sandbox)
+#### H) gVisor (user-space kernel sandbox)
 
 **Por qué:** gVisor intercepta syscalls del guest y los emula en user-space (Go). Ofrece aislamiento sin VM completa. Pero Odoo es **syscall-heavy** (fork de workers, epoll para HTTP, polls de cron, signals) → overhead de 20–40 % en throughput. Además ya tenemos aislamiento VM-grade — moverse a gVisor sería downgrade. **Rechazado.**
 
-#### H) systemd-nspawn / LXC (containers con kernel compartido)
+#### I) systemd-nspawn / LXC (containers con kernel compartido)
 
 **Por qué:** cero overhead de kernel (todos los tenants comparten el kernel del host). Pero pierde TODO el aislamiento que justificó NKR vs Docker:
 - Sin `cgroup memory.max` strict (kernel exploits cross-tenant)
@@ -774,11 +846,11 @@ Antes de aterrizar en snapshot/restore, evalué otras técnicas para reducir el 
 - Sin barrera VM contra escape de privilegios
 **Esto es esencialmente Docker** — volver al problema original. **Rechazado.**
 
-#### I) virtio-mem inter-guest page sharing
+#### J) virtio-mem inter-guest page sharing
 
 **Por qué:** sería ideal — una página física en N guests al mismo tiempo, gestionada por el VMM. **Pero el EPT/NPT (extended page tables del CPU) mappea cada página física a UN solo guest a la vez.** No es limitación de software — es limitación del hardware de virtualización x86. La única vía es `MAP_SHARED` file-backed (DAX) que ya usamos para el rootfs. **Rechazado por física del hardware.**
 
-#### J) KSM (Kernel Same-page Merging)
+#### K) KSM (Kernel Same-page Merging)
 
 **Por qué:** ya documentado en §3.2 y §11. NKR tomó la decisión arquitectónica previa de descartarlo por compatibilidad/estabilidad. **Rechazado, no se revive.**
 
@@ -786,19 +858,16 @@ Antes de aterrizar en snapshot/restore, evalué otras técnicas para reducir el 
 
 | ID | Opción | Estado | Acción sugerida |
 |---|---|---|---|
-| A | Initramfs reducido | Complementario | **Hacer en paralelo a Fase 0** (~1 día, bajo riesgo) |
-| B | Kernel diet más agresivo | Complementario | **Hacer en paralelo a Fase 0** (1–2 días, bajo riesgo) |
-| C | Bajar `compose.ram` + balloon agresivo | Complementario | **Hacer DESPUÉS de Fase 2** en producción, una vez validado RSS estable |
-| D | Kernel-as-DAX / XIP | Investigación | **Spike paralelo de 2–3 días** si hay bandwidth, sino diferir |
-| E | userfaultfd + on-demand sharing | Investigación | Backlog v2 — solo si snapshot/restore tradicional resulta insuficiente |
-| F | Unikernel | **Rechazado** | Incompatible con Python/Odoo |
-| G | gVisor | **Rechazado** | Syscall overhead intolerable + downgrade de aislamiento |
-| H | nspawn/LXC | **Rechazado** | Es Docker — pierde justificación de NKR |
-| I | virtio-mem inter-guest | **Rechazado** | Física del hardware (EPT/NPT) lo impide |
-| J | KSM | **Rechazado** | Decisión arquitectónica previa de NKR |
+| A | Initramfs reducido | **AUTORIZADO** (post-Fase 0, v4) | Sprint inmediato (~1 día, bajo riesgo) |
+| B | Kernel diet más agresivo | **AUTORIZADO** (post-Fase 0, v4) | Sprint inmediato (1–2 días, bajo riesgo) |
+| C | **EROFS + `inode_share`** (propuesto por equipo v4) | A validar con benchmark | **Spike 1 día** antes de comprometer al refactor de `build-rootfs` — mis dudas técnicas en §12.1.C |
+| D | Bajar `compose.ram` + balloon agresivo | Complementario | **Hacer DESPUÉS de A + B** en producción, una vez validado el nuevo PSS estable |
+| E | Kernel-as-DAX / XIP | Investigación | **Diferido indefinidamente** post-cancelación de snapshot (poca prioridad) |
+| F | userfaultfd + on-demand sharing | Investigación | **Archivado** — snapshot/restore cancelado, esta opción dependía de ese path |
+| G | Unikernel | **Rechazado** | Incompatible con Python/Odoo |
+| H | gVisor | **Rechazado** | Syscall overhead intolerable + downgrade de aislamiento |
+| I | nspawn/LXC | **Rechazado** | Es Docker — pierde justificación de NKR |
+| J | virtio-mem inter-guest | **Rechazado** | Física del hardware (EPT/NPT) lo impide |
+| K | KSM | **Rechazado** | Decisión arquitectónica previa de NKR |
 
-**Pregunta abierta para el equipo antes de Fase 0:**
-
-¿Autorizan tomar A (initramfs) y B (kernel diet) como tareas paralelas durante los 3 días de Fase 0? Son ahorros pequeños individuales (~12–28 MB por VM combinados) pero gratis y compatibles con el snapshot — si los hacemos ahora, el snapshot que generamos en Fase 1 ya incluye estos beneficios y no hay que regenerar después.
-
-D (XIP) lo dejaría como tarea explícita para alguien con interés en investigación — no bloquea Fase 0 ni Fase 1.
+**Estado post-Fase 0 (v4, 2026-05-17):** snapshot/restore cancelado. A + B autorizados para sprint inmediato. C (EROFS) pendiente de validación con benchmark de 1 día antes de comprometer al refactor de `build-rootfs`.

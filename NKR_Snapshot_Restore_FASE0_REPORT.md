@@ -1,8 +1,8 @@
-# Fase 0 — Reporte de hallazgos (PARADA TEMPRANA)
+# Fase 0 — Reporte de hallazgos (PARADA TEMPRANA → CANCELACIÓN OFICIAL)
 
 **Fecha:** 2026-05-17
-**Estado:** **STOP-WORK recomendado**. El spike NO continúa hasta decisión del equipo.
-**Tiempo invertido:** ~30 min de medición (no se llegó a escribir snapshot_poc.rs).
+**Estado:** ✅ **PROYECTO CANCELADO OFICIALMENTE por el equipo (2026-05-17, post-decisión final §"Decisión final del equipo").** Reporte se archiva como **caso de estudio interno de excelencia en ingeniería**: cómo la telemetría temprana (~30 min) previno 3–4 semanas de refactor masivo sin ROI.
+**Tiempo invertido:** ~30 min de medición (snapshot_poc.rs **nunca se escribió** — los datos baseline bastaron para tomar la decisión).
 
 ---
 
@@ -171,3 +171,50 @@ done
 cat /sys/kernel/mm/ksm/run
 cat /sys/kernel/mm/ksm/pages_sharing
 ```
+
+---
+
+## Decisión final del equipo (2026-05-17)
+
+Respuestas a las 4 preguntas bloqueantes:
+
+### 1. ¿Target "100 Odoos en 32 GB" superado por la realidad de hardware?
+
+> "Sí, absolutamente. El hallazgo de que el host real tiene 64 GB cambia las reglas de la física. Estábamos diseñando un motor de Fórmula 1 para escapar de un embotellamiento imaginario. Con 64 GB y el PSS actual, el host respira tranquilo. El target de '100 en 32 GB' queda oficialmente catalogado como un ejercicio teórico superado por la realidad del hardware aprovisionado."
+
+### 2. ¿La velocidad de boot (5 s → 1.5–3 s) justifica 3–4 semanas de refactor?
+
+> "Definitivamente NO. Si la ruta POST /instances ya es asíncrona desde la v1.6.4, el usuario final no percibe esos 5 segundos. Desde el punto de vista del producto, gastar un mes de ingeniería para rascar 2.5 segundos invisibles en un proceso de despliegue es un despilfarro de recursos. La experiencia de usuario ya está resuelta."
+
+### 3. ¿Hacemos A + B sí o sí?
+
+> "SÍ. Luz verde inmediata. Reducir el Initramfs (Opción A) y aplicar una dieta agresiva al Kernel (Opción B) son victorias tácticas. Bajar el PSS en 12–28 MB por VM de forma gratuita, determinista y con bajo riesgo es higiene de infraestructura básica. Hazlo y fusiónalo."
+
+### 4. ¿Camino 1, 2 o 3?
+
+> "Mi voto definitivo es por el **Camino 1** (STOP-WORK total al Snapshot + Ejecutar A y B). El Camino 3 (A + B + Warm Restart) suena tentador para el POST /actions {restart}, pero sigue añadiendo complejidad de estado al orquestador. Si un tenant reinicia su Odoo hoy en 5-8 segundos con un pkill (vía REL_OD que implementamos antes), eso ya es excepcionalmente rápido para un ERP. Mantengamos la arquitectura de NKR inmaculada, lineal y sin estado pausado a menos que un cliente real se queje formalmente de los tiempos de reinicio."
+
+### Veredicto final del equipo
+
+> "Queda oficialmente cancelado el refactor de Snapshot/Restore. Archiva este documento de Fase 0 como un caso de estudio interno de excelencia en ingeniería ('Cómo la telemetría temprana previene la deuda técnica'). Tus próximos pasos son claros y libres de riesgo:
+> 1. Poda el Kernel (.config).
+> 2. Adelgaza el Initramfs.
+> 3. Actualiza la doctrina para reflejar que el baseline PSS actual es el estándar de oro."
+
+### Lecciones del caso (autopsia técnica del equipo)
+
+> "**El Triunfo de DAX**: Medir un PSS de 223 MB y ver que DAX ya está deduplicando ~69 MB por instancia demuestra que tu arquitectura base ya es de élite. Estás obteniendo el 80% de los beneficios de memoria compartida sin ninguna de las fragilidades de KSM o Snapshot.
+>
+> **El Baño de Realidad de Python**: Descubrir que PEP 683 en Python 3.12 no permite hacer inmortales objetos arbitrarios sin la API inestable de 3.14+ es un hallazgo crítico. Confirmaste en vivo que el Private_Dirty se dispara a 416 MB bajo carga real (intech-devp). El sangrado del Reference Counting es real, rápido y destructivo para la memoria compartida.
+>
+> **El PSS no miente**: Ver la diferencia entre el RSS (637 MB) y el PSS (524 MB) bajo carga demuestra exactamente cuánto le cuesta cada Odoo al host. Con 64 GB de RAM, tienes pista libre."
+
+### Plan ejecutivo aprobado
+
+| Tarea | Owner | Esfuerzo | Riesgo |
+|---|---|---:|---|
+| **§12.1.A — Initramfs reducido** | NKR / Claude | ~1 día | Bajo |
+| **§12.1.B — Kernel diet `.config`** | NKR / Claude | 1–2 días | Bajo |
+| **§12.1.C — EROFS spike (benchmark de 1 día)** | Pendiente confirmación equipo | ~1 día | A validar |
+| Actualizar `CLAUDE.md` con "baseline PSS = estándar de oro" | NKR / Claude | <1 hora | Cero |
+| ~~Snapshot/Restore completo~~ | ❌ **CANCELADO** | — | — |
