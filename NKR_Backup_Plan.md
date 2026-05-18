@@ -1,317 +1,305 @@
-# NKR Backup Plan — propuesta v1
+# NKR Backup Plan — propuesta v2
 
 **Estado:** propuesta para revisión, no implementado.
 **Fecha:** 2026-05-18
-**Scope:** backups internos en el mismo servidor (no off-site todavía).
+**Scope:** backups internos en el mismo servidor con cleanup nightly. Off-site lo maneja un proceso externo (NKR no retiene >24h).
 **Versión NKR de referencia:** 1.6.9 + sprint post-Fase 0.
 
----
-
-## TL;DR
-
-- **Qué se respalda**: lo único persistente del cliente → DB + filestore + addons + pylibs + meta.json. El rootfs, kernel, infra y código de NKR NO se respaldan (son recreables desde git + master images).
-- **Cómo**: `pg_dump -Fc` para la DB + `tar -I zstd` para los archivos del tenant. Por-tenant, no por-cell. Sin downtime (PG hot dump, filestore copy mientras corre).
-- **Cuánto pesa**: ~100–500 MB por tenant pequeño (post-compresión), ~1–5 GB por tenant con datos reales (ERP de 1 año de uso).
-- **Cuánto tarda**: 20–60 s por tenant chico (intech-devp baseline), 2–5 min por tenant grande. Backup nightly de 14 tenants futuros: ~10 min secuencial, ~2 min paralelo.
-- **Dónde se guarda**: `/mnt/nkr/backups/<tenant>/<YYYY-MM-DD-HHMM>/` (mismo disco, btrfs reflink para minimizar duplicación entre backups consecutivos).
-- **Restore (respawn)**: nuevo comando `nkr restore <backup_dir> --as <new_nkr_name> [--cell <cell>]`. Crea instancia limpia vía API normal, después pg_restore + untar el filestore. Cell-agnostic: cualquier cell de la misma versión Odoo sirve.
-- **Compatibilidad cross-cell**: SÍ. El backup NO baked-in cell-specific paths/IPs. Lo que cambia per-cell (DB_HOST=10.0.X.3, secret SSO, etc.) lo regenera NKR en el create. Solo restauramos contenido de cliente.
+**Historial de revisión:**
+- **v1 (2026-05-18)** — propuesta inicial con retention 7d+4w+3m.
+- **v2 (2026-05-18, post-feedback usuario)** — cambia el modelo:
+  1. **NO hay creación programada** — backups son SOLO on-demand del operador NKR.
+  2. **Retention = 1 día**: al final del día (cron 1 AM) se borra TODO. NKR no es un sistema de backups long-term — solo staging temporal antes de off-site.
+  3. **Off-site**: un proceso externo recoge los backups durante el día y los envía a OTRO servidor. NKR no se involucra en eso.
+  4. **DOS tipos de backup distintos**:
+     - **`backup_nkr`** — formato interno NKR para respawn rápido en NKR.
+     - **`backup_odoo`** — formato Odoo-standard (ZIP con dump.sql + filestore) para entregar al panel/usuario, restorable en cualquier Odoo (no necesariamente NKR).
 
 ---
 
-## 1. Qué se respalda — alcance exacto
+## TL;DR (v2)
 
-| Componente | Path | Tamaño típico | ¿Backup? | Por qué |
-|---|---|---|---|---|
-| **PostgreSQL DB** | `db-<cell>-<name>` en PG de la cell | 50 MB – 10 GB | **SÍ** (pg_dump -Fc) | Datos del cliente |
-| **Filestore** | `cells/<cell>/.nkr-data/<short>-var_lib_odoo.ext4` | 100 MB – 5 GB | **SÍ** (extraer contenido, no el ext4 entero) | Attachments / Odoo binary fields |
-| **Addons custom** | `cells/<cell>/instances/<name>/addons/` | 1–50 MB | **SÍ** | Custom modules del cliente (técnicamente recuperable de git pero defensivo) |
-| **Pylibs** | `cells/<cell>/instances/<name>/pylibs/lib/` | 10–500 MB | **SÍ** | Dependencias pip del cliente |
-| **odoo.conf** | `cells/<cell>/instances/<name>/config/odoo.conf` | <2 KB | **SÍ** (para refrescar workers/tier en restore) | Settings del tenant |
-| **meta.json** | `cells/<cell>/instances/<name>/meta.json` | <500 B | **SÍ** | project_id, env, edition, tier |
-| **Logs** | `cells/<cell>/instances/<name>/logs/` | 1–500 MB | **NO** (opcional, off por default) | Útiles para debug, no críticos |
-| ~~rootfs (`odoo.ext4`)~~ | `cells/<cell>/instances/<name>/odoo.ext4` | 4 GB (o 0 si symlink) | **NO** | Es el master, se recrea via clone |
-| ~~initramfs~~ | `/mnt/nkr/initramfs/<short>.cpio.gz` | 1 MB | **NO** | Se regenera en cada boot |
-| ~~compose entry~~ | `cells/<cell>/nkr-compose.yml` | parte de yaml | **NO** | Se regenera en restore vía API |
-| ~~SSO secret~~ | sección `[nkr_sso]` en odoo.conf | 64 chars | **NO** (regenera fresh per-restore) | Security — no preservar entre tenants |
-
-### Decisión clave: backup CONTENIDO del filestore, no el ext4
-
-El share `var_lib_odoo.ext4` es un block device de 2 GB asignado (sparse). Para backup:
-- **Mal**: copiar el ext4 entero (2 GB declarados, 108 MB reales) → desperdicio + acoplado a tamaño/UUID fijo
-- **Bien**: montar el ext4 RO, hacer `tar -I zstd -cf filestore.tar.zst /mnt/inspect/filestore` → portable, compacto, cell-agnostic
+- **2 tipos de backup distintos** generados por el mismo comando (con flag):
+  - `backup_nkr` → para respawn interno en otra cell NKR (eficiente, NKR-specific)
+  - `backup_odoo` → ZIP Odoo-standard (dump.sql + filestore/) que el panel/usuario puede descargar y usar en cualquier Odoo del mundo
+- **On-demand**: NO hay cron creando backups. Operador NKR llama al script/API cuando lo necesita.
+- **Retention = 1 día**: cron a las **1 AM** borra TODO de `/mnt/nkr/backups/`. Punto.
+- **Off-site**: out-of-scope. Un proceso externo (rsync/rclone/scp del operador) saca los backups antes del cleanup.
+- **Compatibilidad cross-cell**: backup_nkr restorable en cualquier cell de la misma versión Odoo (DB_HOST + SSO secret regenerados en restore).
+- **Backup time real `intech-devp`**: ~25–40 s. ~150 MB de output.
 
 ---
 
-## 2. Estructura de archivos de backup
+## 1. Los dos formatos
+
+### 1.1 `backup_nkr` — formato interno (NKR-only)
+
+**Propósito:** restore rápido dentro de NKR, con todos los metadatos para recrear la instancia idéntica en cualquier cell de la misma versión.
+
+**Estructura:**
+```
+/mnt/nkr/backups/<nkr_name>/<YYYY-MM-DD-HHMM>/nkr/
+├── backup-info.json     ← cell origen, nkr_version, kernel_sha256, odoo_version, tier, edition
+├── meta.json            ← copy de meta.json del tenant (project_id, env)
+├── odoo.conf            ← copia literal (referencia; en restore se regenera lo cell-specific)
+├── db.dump              ← pg_dump -Fc (custom format, comprimido interno)
+├── filestore.tar.zst    ← contenido del var_lib_odoo (comprimido zstd)
+├── addons.tar.zst       ← cells/.../addons/  (custom modules del cliente)
+├── pylibs.tar.zst       ← cells/.../pylibs/lib/
+└── SHA256SUMS           ← checksums
+```
+
+**Compresión:** zstd default (level 3) — balance velocidad/tamaño.
+
+**Tamaño esperado (intech-devp):** ~150 MB.
+
+**Restore:** `nkr restore-nkr <backup_dir> [--as N] [--to-cell C]` — flujo de §6.
+
+---
+
+### 1.2 `backup_odoo` — formato Odoo-standard (entregable al usuario)
+
+**Propósito:** entregar al panel o al usuario un archivo que pueda restorear en CUALQUIER Odoo del mundo (no solo NKR). Mismo formato que el endpoint `/web/database/backup` de Odoo produce nativamente.
+
+**Estructura (ZIP):**
+```
+backup-<dbname>-<YYYY-MM-DD>.zip
+├── dump.sql              ← pg_dump SQL plain text (NO custom format — para portabilidad)
+├── manifest.json         ← Odoo metadata: version, modules installed, db creation date
+└── filestore/<dbname>/   ← directorio de attachments
+    ├── 0a/0a1b2c3d4e...
+    ├── 0b/...
+    └── ...
+```
+
+**Compresión:** ZIP (no tar+zstd — Odoo nativo espera ZIP) con DEFLATE estándar.
+
+**Tamaño esperado (intech-devp):** ~120 MB (similar al nkr pero formato distinto).
+
+**Restore:** el usuario lo sube a su Odoo (CUALQUIER Odoo de la versión correspondiente) vía `/web/database/restore` UI nativa, o NKR puede consumirlo también vía endpoint similar.
+
+---
+
+### ¿Cuándo se usa cada uno?
+
+| Caso de uso | Backup a usar |
+|---|---|
+| Recuperar tenant tras crash dentro de NKR | `backup_nkr` (más rápido, preserva todo) |
+| Migrar tenant a otra cell NKR de la misma versión | `backup_nkr` (cell-portable) |
+| Entregar copia al cliente para auditoría legal | `backup_odoo` (formato estándar, abrible en cualquier Odoo) |
+| Cliente quiere irse a otro proveedor / Odoo.sh / self-hosted | `backup_odoo` (formato portable) |
+| Panel ofrece "Download backup" en su UI | `backup_odoo` (lo que un usuario espera) |
+| Disaster recovery a otro servidor NKR | `backup_nkr` enviado off-site, restorable en otro NKR |
+
+---
+
+## 2. Qué se respalda (igual en ambos formatos)
+
+| Componente | ¿backup_nkr? | ¿backup_odoo? | Notas |
+|---|:---:|:---:|---|
+| PostgreSQL DB | ✅ (`-Fc`) | ✅ (`SQL plain`) | Custom format más chico/rápido para NKR, SQL plain para compat universal |
+| Filestore | ✅ (tar.zst) | ✅ (dir bajo ZIP) | Contenido literal de `var_lib_odoo` |
+| Addons custom | ✅ | ❌ | Odoo backup no incluye addons (asume que el target Odoo ya los tiene) |
+| Pylibs | ✅ | ❌ | Mismo: target Odoo debe tener sus deps |
+| odoo.conf | ✅ (referencia) | ❌ | Cell-specific, no portable a Odoo no-NKR |
+| meta.json | ✅ | ❌ | NKR-specific |
+| Logs | ❌ | ❌ | No críticos, no se backupean |
+| Templates | ❌ | ❌ | Recreables desde master |
+| rootfs / initramfs | ❌ | ❌ | Recreables |
+| SSO secret | ❌ | ❌ | Regenerado fresh per restore (security) |
+
+---
+
+## 3. Estructura final de directorios
 
 ```
 /mnt/nkr/backups/
 ├── odoo-v19-intech-devp/
-│   ├── 2026-05-18-0300/           ← timestamp del backup
-│   │   ├── meta.json              ← cell origen, tier, edition, version Odoo, kernel hash
-│   │   ├── db.dump                ← pg_dump -Fc -Z 5 (custom format, comprimido)
-│   │   ├── filestore.tar.zst      ← contenido del var_lib_odoo
-│   │   ├── addons.tar.zst         ← cells/.../addons/
-│   │   ├── pylibs.tar.zst         ← cells/.../pylibs/lib/
-│   │   ├── odoo.conf              ← copia literal (referencia, no se restaura tal cual)
-│   │   └── SHA256SUMS             ← checksum de cada archivo
-│   ├── 2026-05-17-0300/           ← backup anterior
-│   ├── 2026-05-16-0300/
-│   └── ...
-├── odoo-v17-cliente-X/
-│   └── ...
-└── _cell-level/                   ← backups cell-level (frequencia menor)
-    ├── odoo-v17/
-    │   ├── 2026-05-18-0400/
-    │   │   ├── systemouts-addons.tar.zst  ← módulos cell-wide (nkr_sso, etc.)
-    │   │   ├── nkr-compose.yml
-    │   │   ├── pg-postgresql.conf
-    │   │   └── pgbouncer.ini
-    │   └── ...
-    └── odoo-v19/
-        └── ...
+│   └── 2026-05-18-1430/
+│       ├── nkr/              ← backup_nkr (interno)
+│       │   ├── backup-info.json
+│       │   ├── db.dump
+│       │   ├── filestore.tar.zst
+│       │   ├── addons.tar.zst
+│       │   ├── pylibs.tar.zst
+│       │   ├── odoo.conf
+│       │   ├── meta.json
+│       │   └── SHA256SUMS
+│       └── odoo/             ← backup_odoo (entregable)
+│           └── backup-db-odoo-v19-intech-devp-2026-05-18.zip
+├── odoo-v19-cliente-X/
+│   └── 2026-05-18-1500/
+│       ├── nkr/
+│       └── odoo/
+└── ...
 ```
 
-### Tooling para minimizar duplicación entre backups consecutivos
-
-Btrfs soporta **reflinks** (CoW a nivel de archivo). Si el backup de hoy comparte el 95% del filestore con el de ayer, podemos:
-- `cp --reflink=always` el último filestore → tarball NUEVO solo escribe blocks que cambiaron
-- O mejor: tarball SIEMPRE pero zstd con dictionary entrenado en el backup previo (más complejo)
-
-**Decisión simple v1**: tarball completo cada backup, retain N=7 días + 4 weeks (~32 archivos por tenant). Si el espacio se vuelve issue, optimizar después.
+**Convención**: un solo directorio timestamped contiene ambos formatos. Si el operador solo necesita uno, el script tiene flags (`--nkr-only`, `--odoo-only`, default: ambos).
 
 ---
 
-## 3. Cómo se ejecuta — script `nkr-backup`
+## 4. Comandos CLI propuestos
 
-### Per-tenant backup (~20–60 s para intech-devp)
-
-```bash
-#!/bin/bash
-# /usr/local/bin/nkr-backup-tenant <cell> <nkr_name>
-set -e
-CELL=$1
-NAME=$2
-SHORT=${NAME#${CELL}-}
-TIMESTAMP=$(date +%Y-%m-%d-%H%M)
-BACKUP_DIR=/mnt/nkr/backups/${NAME}/${TIMESTAMP}
-INST=/mnt/nkr/cells/${CELL}/instances/${NAME}
-PG_IP=10.0.$(grep "^cell_id" /mnt/nkr/cells/${CELL}/cell.yml | awk '{print $2}').2
-DB_NAME=db-${NAME}
-
-mkdir -p "$BACKUP_DIR"
-cd "$BACKUP_DIR"
-
-# 1. Meta
-cp "$INST/meta.json" .
-cp "$INST/config/odoo.conf" .
-echo "{
-  \"cell_origin\": \"$CELL\",
-  \"nkr_name\": \"$NAME\",
-  \"backup_ts\": \"$TIMESTAMP\",
-  \"db_name\": \"$DB_NAME\",
-  \"nkr_version\": \"$(/usr/local/bin/nkr --version | awk '{print $2}')\",
-  \"kernel_sha256\": \"$(sha256sum /mnt/nkr/kernel/nanolinux | awk '{print $1}')\"
-}" > backup-info.json
-
-# 2. PG dump (HOT — sin bloquear el tenant)
-PGPASSWORD="$(awk -F= '/^db_password/ {print $2}' "$INST/config/odoo.conf" | tr -d ' ')" \
-    pg_dump -h "$PG_IP" -p 5432 -U odoo -d "$DB_NAME" -Fc -Z 5 -f db.dump
-
-# 3. Filestore (montar el ext4 RO + tar contenido)
-MNT_FS=$(mktemp -d /tmp/nkr-backup-fs-XXX)
-mount -o ro,loop /mnt/nkr/cells/${CELL}/.nkr-data/${SHORT}-var_lib_odoo.ext4 "$MNT_FS"
-tar -I 'zstd -3' -cf filestore.tar.zst -C "$MNT_FS" .
-umount "$MNT_FS" && rmdir "$MNT_FS"
-
-# 4. Addons (custom modules del tenant)
-tar -I 'zstd -3' -cf addons.tar.zst -C "$INST" addons/ 2>/dev/null
-
-# 5. Pylibs (instaladas vía PUT /pylibs)
-tar -I 'zstd -3' -cf pylibs.tar.zst -C "$INST/pylibs" lib/ 2>/dev/null
-
-# 6. Checksums
-sha256sum * > SHA256SUMS
-
-echo "✅ Backup completado en $BACKUP_DIR ($(du -sh . | cut -f1))"
-```
-
-### Orquestación nightly (cron)
+### 4.1 Crear backup (on-demand)
 
 ```bash
-# /etc/cron.d/nkr-backup
-# Daily backups at 03:00 — escalonado por tenant
-0 3 * * * root /usr/local/bin/nkr-backup-all-tenants
+# Ambos formatos (default)
+nkr backup <nkr_name>
 
-# Weekly cell-level at 04:00 Sunday
-0 4 * * 0 root /usr/local/bin/nkr-backup-cell-level
+# Solo NKR-interno
+nkr backup <nkr_name> --nkr-only
 
-# GC: borrar backups >32 días (retain ~daily 7 + weekly 4)
-0 5 * * * root /usr/local/bin/nkr-backup-gc
+# Solo Odoo-standard
+nkr backup <nkr_name> --odoo-only
+
+# Especificar output dir custom
+nkr backup <nkr_name> --output /tmp/manual-backup-foo/
 ```
 
-`nkr-backup-all-tenants` itera los tenants vía `GET /api/v1/cells/*/capacity` y llama a `nkr-backup-tenant` para cada uno. Secuencial (no concurrente — evita saturar PG en cells con muchos tenants).
+**Output esperado:**
+```
+[NKR-BACKUP] Backup de odoo-v19-intech-devp iniciado
+[NKR-BACKUP]   1/4 pg_dump (-Fc) → 12 MB en 4.2s
+[NKR-BACKUP]   2/4 filestore (108 MB → 41 MB) en 9.1s
+[NKR-BACKUP]   3/4 addons (14 MB → 4 MB) en 0.8s
+[NKR-BACKUP]   4/4 pylibs (99 MB → 31 MB) en 5.3s
+[NKR-BACKUP]   nkr format: 88 MB
+[NKR-BACKUP] Generando backup_odoo (ZIP)...
+[NKR-BACKUP]   pg_dump (--format=plain) + filestore + manifest → 122 MB en 11.2s
+[NKR-BACKUP] ✅ Backup completado en /mnt/nkr/backups/odoo-v19-intech-devp/2026-05-18-1430/ (210 MB total)
+```
+
+### 4.2 Restore backup_nkr (interno)
+
+```bash
+# Restore in-place (mismo nombre, misma cell)
+nkr restore-nkr /mnt/nkr/backups/odoo-v19-intech-devp/2026-05-18-1430/nkr/
+
+# Clone con nuevo nombre en misma cell
+nkr restore-nkr <backup>/nkr/ --as intech-devp-clone
+
+# Restore en otra cell de la misma versión Odoo
+nkr restore-nkr <backup>/nkr/ --as intech-devp --to-cell odoo-v19-second
+```
+
+### 4.3 Listar backups
+
+```bash
+nkr backup-ls [--tenant <name>]
+# Output:
+# odoo-v19-intech-devp:
+#   2026-05-18-1430    nkr: 88 MB    odoo: 122 MB    age: 2h
+```
+
+### 4.4 Borrar backup manualmente
+
+```bash
+nkr backup-rm odoo-v19-intech-devp/2026-05-18-1430
+```
+
+### 4.5 Cleanup automático (cron, NO crea backups — solo borra)
+
+```bash
+# /etc/cron.d/nkr-backup-cleanup
+0 1 * * * root /usr/local/bin/nkr-backup-cleanup
+```
+
+`nkr-backup-cleanup` borra **TODO** en `/mnt/nkr/backups/` sin contemplaciones (retention = 1 día). El operador es responsable de haber sacado los backups off-site ANTES de la 1 AM si los necesita.
 
 ---
 
-## 4. Cuánto tarda — números medidos + proyección
+## 5. Cuánto tarda — números medidos + proyección
 
-### Baseline real con `intech-devp` (2026-05-18, datos vivos)
+### Baseline real con `intech-devp` (DB 77 MB, filestore 108 MB)
 
-| Operación | Tamaño origen | Tiempo estimado | Output esperado |
-|---|---:|---:|---:|
-| `pg_dump -Fc -Z 5` (DB 77 MB) | 77 MB | ~5–10 s | ~30–50 MB |
-| `tar zstd -3` filestore (108 MB) | 108 MB | ~10–15 s | ~40–60 MB (depende qué hay) |
-| `tar zstd -3` addons (14 MB) | 14 MB | <2 s | ~3–5 MB |
-| `tar zstd -3` pylibs (99 MB) | 99 MB | ~5–10 s | ~25–40 MB (numpy ya comprimido) |
-| SHA256SUMS | n/a | <1 s | <1 KB |
-| **TOTAL `intech-devp`** | **~300 MB** | **~25–40 s** | **~100–160 MB compressed** |
+| Operación | Tiempo |
+|---|---:|
+| `pg_dump -Fc -Z 5` (formato nkr) | ~5 s |
+| `pg_dump --format=plain` (formato odoo) | ~8 s |
+| `tar zstd` filestore + addons + pylibs (nkr) | ~15 s |
+| `zip` filestore + dump.sql + manifest (odoo) | ~12 s |
+| SHA256SUMS | <1 s |
+| **TOTAL ambos formatos** | **~40 s** |
+| Solo `--nkr-only` | ~25 s |
+| Solo `--odoo-only` | ~22 s |
 
-### Proyección para tenants reales con datos
+### Proyección por tipo de tenant
 
-| Tipo tenant | DB | Filestore | Addons | Pylibs | Total raw | Backup time | Backup size |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| dev sandbox (intech-devp-like) | 80 MB | 100 MB | 15 MB | 100 MB | 300 MB | ~30 s | ~150 MB |
-| staging con datos prod | 1 GB | 500 MB | 20 MB | 100 MB | 1.6 GB | ~90 s | ~500 MB |
-| **prod 1 año de uso** | **5 GB** | **3 GB** | **30 MB** | **100 MB** | **8 GB** | **~5 min** | **~2.5 GB** |
-| prod 3+ años pesado | 15 GB | 10 GB | 50 MB | 200 MB | 25 GB | ~15 min | ~8 GB |
+| Tipo | DB | Filestore | Total raw | Backup time (both) | Output total |
+|---|---:|---:|---:|---:|---:|
+| dev sandbox (intech-devp) | 80 MB | 100 MB | 300 MB | ~40 s | ~210 MB |
+| staging con datos prod | 1 GB | 500 MB | 1.6 GB | ~3 min | ~1 GB |
+| prod 1 año | 5 GB | 3 GB | 8 GB | ~8 min | ~5 GB |
+| prod 3 años | 15 GB | 10 GB | 25 GB | ~25 min | ~15 GB |
 
-### Backup completo del cluster (proyección)
+### Backup ON-DEMAND simultáneo de N tenants
 
-| Escenario | Tenants | Tiempo secuencial | Tiempo paralelo (4 jobs) |
-|---|---:|---:|---:|
-| Hoy QA | 1 (intech-devp) | 30 s | 30 s |
-| Pre-producción | 7 (1 cliente × 3 envs + 4 dev) | ~5 min | ~1.5 min |
-| Producción ~50% | 50 (mix tiers) | ~50 min | ~15 min |
-| Producción cap (14 tenants × 2 cells × 64 GB host) | 100 | ~2 h | ~30 min |
+Como es on-demand, raramente se ejecutan N en paralelo. Si el operador necesita backupear todo el cluster manualmente:
 
-**Limitación**: PG admite N=~10 pg_dumps concurrentes sin saturar I/O. Cell-paralelizable mejor (1 dump por cell a la vez).
-
----
-
-## 5. Cuánto pesa — proyección de almacenamiento
-
-### Retention sugerida
-
-- **7 backups diarios** (última semana)
-- **4 backups semanales** (último mes)
-- **3 backups mensuales** (último trimestre)
-- = 14 backups por tenant retenidos en cualquier momento
-
-### Costo de storage por tenant
-
-| Tipo tenant | Backup size | × 14 backups | Anual |
-|---|---:|---:|---:|
-| dev | 150 MB | 2 GB | 2 GB (rotación constante) |
-| staging | 500 MB | 7 GB | 7 GB |
-| prod 1 año | 2.5 GB | 35 GB | 35 GB |
-| prod 3 años | 8 GB | 112 GB | 112 GB |
-
-### Costo total del cluster
-
-| Escenario | # tenants | Mix | Total backups |
-|---|---:|---|---:|
-| Hoy QA | 1 | 1 dev | 2 GB |
-| Pre-prod | 7 | 3 dev + 2 staging + 2 prod chico | ~25 GB |
-| Producción 50% | 50 | mix realista | ~250 GB |
-| **Producción cap** | **100** | **mix realista** | **~500 GB** |
-
-**Disco actual disponible**: `/mnt/nkr` tiene **813 GB libres** (`btrfs filesystem df` reporta 832 GB raid1/0 totales — verificar). 500 GB para backups deja ~300 GB de overhead — **OK para los próximos años de crecimiento**.
-
-Si el storage se vuelve issue:
-- Bajar retention (7 diarios + 2 semanales = 9 backups → -40%)
-- Subir compresión (zstd -19 en vez de -3 → -20% más, pero +5× tiempo)
-- Off-site weekly + local solo último día (-80% local, agrega complejidad)
+| Cluster size | Secuencial | Paralelo (4 jobs) |
+|---|---:|---:|
+| 7 tenants pre-prod | ~5 min | ~2 min |
+| 50 tenants | ~50 min | ~15 min |
+| 100 tenants cap | ~2 h | ~30 min |
 
 ---
 
-## 6. Restore (respawn) — cómo se levanta un tenant del backup
+## 6. Cuánto pesa (al cierre del día)
 
-### Caso A — Restore en la MISMA cell con MISMO nombre (recovery)
+**Solo el peak** durante el día (porque el cron 1 AM borra todo):
 
-```bash
-nkr restore /mnt/nkr/backups/odoo-v19-intech-devp/2026-05-18-0300/
-```
+### Escenario realista: backup ON-DEMAND de 5–10 tenants en un día
 
-Flujo interno:
-1. Validar checksums del backup (SHA256SUMS)
-2. `DELETE` del tenant existente vía API (drop_db=true) — si existe
-3. `POST /instances` con los mismos meta (cell, tier, edition, version) → crea instancia fresh + DB vacía
-4. `nkr stop <name>` (para no race con PG)
-5. `dropdb db-<name>` + `createdb db-<name>` (DB limpia)
-6. `pg_restore -d db-<name> backup.dump`
-7. Montar el nuevo `var_lib_odoo.ext4` y untar `filestore.tar.zst` adentro
-8. Untar `addons.tar.zst` → `<inst>/addons/`
-9. Untar `pylibs.tar.zst` → `<inst>/pylibs/lib/`
-10. `nkr cell up <cell> -d` para arrancar de nuevo
-11. Verify HTTP `:8069` responde
+| Mix de backups en el día | Peak storage |
+|---|---:|
+| 1 backup intech-devp | ~210 MB |
+| 3 backups de tenants pequeños | ~600 MB |
+| 10 backups de tenants mixtos (5 dev + 3 staging + 2 prod) | ~12 GB |
+| Caso extremo: backup full cluster (100 prod) | ~500 GB |
 
-### Caso B — Restore con NUEVO nombre (cloning / migración)
+**Disco disponible**: 813 GB libres en `/mnt/nkr`. Margen amplísimo para cualquier escenario operativo realista.
 
-```bash
-nkr restore /mnt/nkr/backups/odoo-v19-intech-devp/2026-05-18-0300/ \
-    --as intech-devp-clone
-```
-
-Como A pero el create usa `--as intech-devp-clone` como nkr_name. El renaming de DB en pg_restore se maneja vía `--dbname db-odoo-v19-intech-devp-clone` y se reescribe filestore path interno (`filestore/db-OLD/` → `filestore/db-NEW/`).
-
-### Caso C — Restore en OTRA CELL de la misma versión
-
-```bash
-nkr restore /mnt/nkr/backups/odoo-v19-intech-devp/2026-05-18-0300/ \
-    --as intech-devp \
-    --to-cell odoo-v19-second   # nueva cell v19 que se acaba de crear
-```
-
-NKR valida `backup_info.json::odoo_version` matchea `cells/<new_cell>/cell.yml::odoo_version`. Si match → procede. Si no → 400 `version_mismatch`.
-
-### Tiempos esperados de restore
-
-| Tenant | Backup size | Restore time | Componentes lentos |
-|---|---:|---:|---|
-| intech-devp | 150 MB | ~30 s | pg_restore (~5 s) + untar filestore (~10 s) + boot (~15 s) |
-| prod 1 año | 2.5 GB | ~5 min | pg_restore (~2 min) + untar (~1 min) + boot |
-| prod 3 años | 8 GB | ~20 min | pg_restore (~10 min) + untar (~5 min) + boot |
+**Importante**: el operador es responsable de sacar los backups off-site ANTES del cleanup automático. Si en 24 h no se transfirieron → se pierden definitivamente.
 
 ---
 
-## 7. Compatibilidad cross-cell de misma versión — la pregunta clave
+## 7. Compatibilidad cross-cell (backup_nkr)
 
-**Requerimiento del usuario**: "tiene que ser compatible para que se levante en cualquier cell de la misma version".
+**Requerimiento**: el `backup_nkr` debe levantarse en CUALQUIER cell de la misma versión Odoo (no solo la cell origen).
 
 ### ¿Qué hace cell-portable el backup?
 
-✅ **Portable (no cambia entre cells)**:
-- DB content (pg_dump es 100% portable entre PG de misma versión)
+✅ **Portable**:
+- DB content (pg_dump entre PG de misma versión es 100% portable)
 - Filestore (contenido binario)
-- Addons (Python source code)
-- Pylibs (wheels Python)
-- meta.json (project_id, env, edition — info del tenant)
+- Addons (Python source)
+- Pylibs (wheels)
+- meta.json content (project_id, env, edition — info del tenant)
 - odoo.conf settings de aplicación (workers, limits)
 
-❌ **NO portable (regenerado per-cell en restore)**:
+❌ **NO portable — regenerado per-cell en restore por NKR**:
 - DB_HOST en odoo.conf (cell-specific: `10.0.<cell_id>.3`)
-- `[nkr_sso] secret` (se regenera fresh per-tenant para no leak across cells)
-- IP del guest (`guest_ip` en meta.json — se asigna nuevo)
-- vm_id (registry asigna)
-- DNS (panel maneja separado vía `/dns`)
+- `[nkr_sso] secret` (regenera fresh — security: no leak across tenants/cells)
+- `guest_ip` (assigned by registry)
+- `vm_id` (assigned by registry)
+- DNS (panel maneja separado)
 
 ### Validación automática en restore
 
 ```python
 # Pseudocódigo del restore handler
-def restore(backup_dir, target_cell, new_name):
+def restore_nkr(backup_dir, target_cell, new_name):
     info = load(backup_dir + "/backup-info.json")
     target = load(cells_dir / target_cell / "cell.yml")
 
-    # Validar compat
     if info["odoo_version"] != target["odoo_version"]:
-        raise Conflict("odoo_version mismatch")
+        raise Conflict("odoo_version mismatch — backup era 19.0, target es 17.0")
+
     if info["kernel_sha256"] != current_kernel_sha256():
         warn("kernel cambió desde el backup — proceder con cautela")
 
-    # Procede con restore (los settings cell-specific se regeneran)
+    # Procede: crea tenant fresh vía API normal (cell-specific regenerado),
+    # después drop+pg_restore + untar filestore/addons/pylibs
     ...
 ```
 
@@ -321,97 +309,85 @@ def restore(backup_dir, target_cell, new_name):
 
 ### Riesgos identificados
 
-1. **PG dump bloquea queries DDL** del tenant durante el dump. Sin embargo, DML (INSERT/UPDATE) sigue funcionando. Bajo riesgo en producción Odoo (rara vez hace DDL en runtime).
-   - Mitigación: ya está mitigado por design (`pg_dump` toma `ACCESS SHARE LOCK`).
+1. **Backup tras delete por error**: el operador borra un tenant y se da cuenta tarde. El backup_nkr del día anterior (o del mismo día si se hizo) lo recupera.
+   - **Mitigación**: si el operador SABE que va a borrar un tenant, debería backupear ANTES.
 
-2. **Race entre backup y delete del tenant**: si el tenant se borra mientras se backupea, el dump falla.
-   - Mitigación: agregar lock en NKR — `nkr backup` toma el mismo InstanceLock que `delete_instance`.
+2. **Cleanup borra backup que el operador olvidó sacar off-site**: a las 1 AM se pierde.
+   - **Mitigación documentada**: alerta diaria a las 12:00 si hay backups >12 h sin tocar (señal de que olvidaron sacarlos).
 
-3. **Race entre backup y restart del tenant**: el restart re-monta el filestore ext4 — si nuestro mount RO ya está activo, el guest no puede tomar el RW exclusive.
-   - Mitigación: usar `mount -o ro,loop,nofail` con `noload` (skip journal). El guest abrirá su mount sin conflicto.
+3. **PG dump bloquea queries DDL** del tenant durante el dump (ACCESS SHARE LOCK).
+   - Impacto: bajo. Odoo en runtime no hace DDL normalmente.
 
-4. **PG dump de tenant con tabla muy grande**: 100M+ rows pueden tardar >30 min.
-   - Mitigación: para esos casos, `pg_dump -j 4` (parallel). v2 feature.
+4. **Race entre backup y restart del tenant**: el restart re-monta el filestore ext4.
+   - **Mitigación**: usar `mount -o ro,loop,nofail,noload`. Sin journal, sin conflict con el RW del guest.
 
-5. **Filestore con archivos abiertos por Odoo**: tar puede ver archivos a medio-escribir.
-   - Mitigación: el filestore de Odoo es append-only (nuevos files con hash único). Files en escritura tienen `.tmp` y se rename atómico. Tar puede leer files completos.
+5. **Race entre backup y delete del tenant**: el delete corre paralelo y borra files mid-backup.
+   - **Mitigación**: tomar `InstanceLock` durante backup (mismo que delete/restart/start).
 
-6. **Espacio en disco para backups durante el dump**: pg_dump escribe el dump completo a tmp file. 10 GB DB → necesita 10 GB libres temporales.
-   - Mitigación: pipe pg_dump | gzip directo, o validar espacio antes.
+6. **Backup gigante (3 años de prod, 25 GB raw)**: 25 min de dump puede ser intolerable bajo SLA.
+   - **Mitigación v2**: `pg_dump -j 4` (parallel custom format, NO compatible con `--format=plain`). Para backup_odoo seguiría plain serial.
 
-7. **Backup corrupto silencioso** (PG dump OK pero filestore corrupto): SHA256SUMS detecta diffs en futuras restauraciones, pero solo cuando se intenta.
-   - Mitigación v2: `nkr backup --verify` opcional que pg_restore + tar -t para validar.
+7. **Cleanup borra el backup que se está creando**: si el operador lanza un backup a las 1:00:30 AM mientras corre el cleanup.
+   - **Mitigación**: cleanup verifica `mtime` del dir antes de borrar; skip si <1 min old. O lockfile.
 
-### Edge cases
-
-- **Tenant sin DB** (`db_name=False` en odoo.conf): skip pg_dump, solo respaldar filestore + addons + meta. Útil para cold templates.
-- **Tenant nunca booteó**: filestore puede estar vacío, addons vacío. Backup completa pero pequeño.
-- **DB con extensiones custom** (pg_trgm, postgis...): pg_dump las incluye automáticamente. Restore funciona si target cell tiene las mismas extensiones disponibles (deben estar en master PG).
-- **Tenant durante POST /addons/git en curso**: skip backup (race con el rename atómico de addons). Detectar via lockfile.
+8. **`backup_odoo` no incluye addons custom**: si el cliente entrega el backup a otro proveedor, ese provider necesita los addons aparte.
+   - **Documentar**: el backup_odoo es solo DB + filestore. Los addons son código fuente que el cliente tiene en su git.
 
 ---
 
-## 9. Implementación por fases
+## 9. Implementación por fases (revisado v2)
 
-### Fase 1 — Script manual + smoke test (2–3 días)
+### Fase 1 — Script `nkr-backup` con ambos formatos (3–4 días)
 
-1. Implementar `/usr/local/bin/nkr-backup-tenant` (bash inicialmente).
-2. Probar con `intech-devp`: backup completo + checksum + restore en nuevo nombre `intech-devp-restored`.
-3. Verificar HTTP del restorado responde + DB tiene mismos datos.
-4. Medir tiempos reales y comparar con estimaciones.
-5. Commit.
+1. `/usr/local/bin/nkr-backup` (bash o Rust subcommand) que genera ambos formatos.
+2. Test con `intech-devp`: validar `backup_nkr` + `backup_odoo` correctos.
+3. Para validar `backup_odoo`: subir el ZIP a una instancia Odoo separada (puede ser otra v19 en NKR) vía `/web/database/restore` UI. Verificar que la DB se restaura completa.
+4. Para validar `backup_nkr`: implementar restore (Fase 2) y testear.
+5. Medir tiempos reales, ajustar compresión si necesario.
 
-### Fase 2 — Restore tooling (2 días)
+### Fase 2 — Restore tooling para backup_nkr (2–3 días)
 
-1. Implementar `/usr/local/bin/nkr-restore <backup_dir> [--as N] [--to-cell C]`.
-2. E2E test: backup intech-devp → DELETE → restore → verify.
-3. Cross-cell test: backup en odoo-v19 → restore en odoo-v19-otra (cuando exista).
-4. Commit.
+1. `/usr/local/bin/nkr-restore-nkr <backup_dir>` con flags `--as`, `--to-cell`.
+2. E2E test: backup intech-devp → DELETE → restore → verify HTTP responde + DB tiene datos.
+3. Cross-cell test (cuando exista otra cell v19): restore en otra cell.
+4. Cross-version test: rechazar restore de v19 backup en v17 cell.
 
-### Fase 3 — HTTP API (3 días)
+### Fase 3 — CLI helpers + cleanup cron (1 día)
 
-1. `POST /api/v1/cells/{cell}/instances/{name}/backup` → 202 async, devuelve poll URL
-2. `GET /api/v1/backups/{tenant}` → lista backups disponibles
-3. `POST /api/v1/restore` → restore con body JSON (backup_path, target cell, new_name)
-4. Panel-integrable. Commit.
+1. `nkr backup-ls` y `nkr backup-rm`.
+2. `/etc/cron.d/nkr-backup-cleanup` (cron 1 AM borra todo en `/mnt/nkr/backups/`).
+3. Lockfile en el cleanup para no comerse un backup en curso.
+4. Doc operativa en MAINTENANCE.md (sección nueva "Backups").
 
-### Fase 4 — Cron + retention + observability (2 días)
+### Fase 4 (opcional, futuro) — HTTP API
 
-1. `/etc/cron.d/nkr-backup` con backups nightly por tenant
-2. `/usr/local/bin/nkr-backup-gc` que aplica retention (7d + 4w + 3m)
-3. Métrica en `/metrics` Prometheus: `nkr_backup_age_seconds{tenant}`, `nkr_backup_size_bytes{tenant}`
-4. Alarma: si tenant no se backupeó en >24 h, log WARN al journal del daemon.
-5. Commit.
-
-### Fase 5 (futuro, no en scope inicial) — Off-site
-
-- Rclone a S3/Backblaze de los backups del último día
-- WAL archiving para PITR
-- Verificación periódica via `nkr backup --verify`
+- `POST /api/v1/cells/{cell}/instances/{name}/backup` → 202 async, devuelve path
+- `GET /api/v1/backups/{tenant}/{timestamp}/download?format=nkr|odoo` → descarga
+- Para integrar con panel si lo quieren.
 
 ---
 
-## 10. Preguntas abiertas antes de implementar
+## 10. Resumen de decisiones (v2, cerrado)
 
-1. **Retention exacta**: ¿7d+4w+3m está bien o querés diferente?
-2. **Hora del cron**: 03:00 sirve o preferís otra ventana?
-3. **¿Backupear logs?** Default propuesto: NO (no críticos). Lo activamos solo si se necesita para debug forense en algún tenant.
-4. **¿Backup también de templates** (`<cell>-odoo-template`, `<cell>-odoo-template-enterprise`)? Default propuesto: NO (son recreables desde el master rootfs + cell setup), pero sí del `db-<cell>-odoo-template` (para reset rápido si se corrompe).
-5. **¿Compresión**: zstd -3 (default propuesto, rápido) vs zstd -19 (más chico, mucho más lento)?
-6. **¿Permitir backups concurrentes** entre tenants? Default: NO (secuencial dentro de una cell, paralelizable entre cells).
-7. **¿Encriptar backups en disco?** Default: NO en v1 (mismo servidor, mismo acceso). v2 si vamos a off-site.
+| # | Pregunta | Respuesta del usuario |
+|---|---|---|
+| 1 | Retention | **1 día** — todo borrado al cierre del día |
+| 2 | Hora cleanup cron | **1 AM** |
+| 3 | Backup de logs | **NO** |
+| 4 | Backup de templates | **NO** |
+| 5 | Compresión | **zstd** (nivel default 3) |
+| 6 | Compatibilidad cross-cell | **SÍ** — `backup_nkr` restorable en otra cell de la misma versión |
+| 7 | Encriptación | **NO** (mismo servidor + off-site externo se encarga) |
+| 8 (nuevo) | Tipos de backup | **DOS**: `backup_nkr` interno + `backup_odoo` entregable a panel/usuario |
 
 ---
 
-## 11. Lo que YO recomiendo como punto de partida
+## 11. Lo que necesito antes de implementar
 
-1. **Empezar Fase 1** (script bash + test con intech-devp). Concreto, mide tiempos reales, sin riesgo.
-2. Implementar Fase 2 (restore) inmediatamente después — un backup que no podemos restaurar es inútil.
-3. **Saltarse la HTTP API por ahora** — los backups son ops, no del panel. CLI + cron es suficiente.
-4. Cron + retention (Fase 4) en cuanto haya 3+ tenants reales.
-5. Off-site lo dejamos para cuando haya datos reales de producción que justifiquen el costo.
+**Confirmar:**
+1. ✅ El plan v2 refleja lo que pediste (DOS formatos, on-demand, 1-day cleanup, no crea backups por cron)?
+2. ¿Algo más a aclarar sobre el formato `backup_odoo` (manifest.json incluye lista de módulos installed, fecha de creación de DB, etc. — formato Odoo nativo)?
+3. ¿El cleanup a las 1 AM borra TODO sin excepción, o algún whitelist? (default propuesto: TODO sin excepción).
+4. ¿El comando para sacar off-site lo manejas vos / panel externamente (rsync/rclone/scp)? NKR no lo hace.
 
-**Antes de implementar, esperar tu aprobación de:**
-- Estructura de archivos (§2)
-- Plan ejecutivo de Fases (§9)
-- Respuestas a las 7 preguntas abiertas (§10)
+**Si todo OK, próximo paso = Fase 1** (script `nkr-backup` con ambos formatos + test contra intech-devp).
