@@ -33,6 +33,20 @@ pub struct HttpResponse {
     pub body: String,
     pub content_type: String,
     pub extra_headers: Vec<(String, String)>,
+    /// Para responses que necesitan streaming de un archivo grande sin cargarlo
+    /// a RAM (típico: backups de varios GB). Cuando es Some, el caller debe
+    /// llamar `write_streamed_to(stream)` en vez de `to_wire()`. El body String
+    /// se ignora en ese caso.
+    pub body_file: Option<BodyFile>,
+}
+
+/// Streaming response: header con Content-Length conocido + body desde archivo
+/// del filesystem (`std::io::copy` directo al socket).
+#[derive(Clone)]
+pub struct BodyFile {
+    pub path: std::path::PathBuf,
+    pub size_bytes: u64,
+    pub filename: String,  // para Content-Disposition
 }
 
 impl HttpResponse {
@@ -43,6 +57,7 @@ impl HttpResponse {
             body,
             content_type: "application/json".to_string(),
             extra_headers: Vec::new(),
+            body_file: None,
         }
     }
     pub fn error(status: u16, err: &str, msg: Option<&str>) -> Self {
@@ -52,8 +67,8 @@ impl HttpResponse {
         };
         Self::json(status, v)
     }
-    pub fn to_wire(&self) -> String {
-        let reason = match self.status {
+    fn reason(&self) -> &'static str {
+        match self.status {
             200 => "OK",
             201 => "Created",
             202 => "Accepted",
@@ -70,15 +85,51 @@ impl HttpResponse {
             503 => "Service Unavailable",
             504 => "Gateway Timeout",
             _ => "OK",
-        };
+        }
+    }
+    pub fn to_wire(&self) -> String {
+        // Para responses con body_file, este path NO se usa — el caller debe
+        // usar `write_streamed_to`. Si por error llega acá, devuelve headers
+        // únicamente con un body de error explicativo.
+        if self.body_file.is_some() {
+            return format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 95\r\nConnection: close\r\n\r\n{{\"error\":\"internal_routing_bug\",\"message\":\"body_file requires write_streamed_to\"}}"
+            );
+        }
         let mut extras = String::new();
         for (k, v) in &self.extra_headers {
             extras.push_str(&format!("{}: {}\r\n", k, v));
         }
         format!(
             "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
-            self.status, reason, self.content_type, self.body.len(), extras, self.body
+            self.status, self.reason(), self.content_type, self.body.len(), extras, self.body
         )
+    }
+    /// Escribe headers + streaming del archivo al stream TCP. Usar SOLO cuando
+    /// body_file está seteado. Devuelve los bytes streameados (size_bytes del
+    /// archivo) o un error.
+    pub fn write_streamed_to(&self, stream: &mut impl std::io::Write) -> std::io::Result<u64> {
+        let bf = match &self.body_file {
+            Some(b) => b,
+            None => return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "write_streamed_to called without body_file",
+            )),
+        };
+        // Headers
+        let mut extras = String::new();
+        for (k, v) in &self.extra_headers {
+            extras.push_str(&format!("{}: {}\r\n", k, v));
+        }
+        let headers = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"{}\"\r\n{}Connection: close\r\n\r\n",
+            self.status, self.reason(), self.content_type, bf.size_bytes, bf.filename, extras
+        );
+        stream.write_all(headers.as_bytes())?;
+        // Stream del archivo (io::copy en buffers de 64KB)
+        let mut f = std::fs::File::open(&bf.path)?;
+        let bytes = std::io::copy(&mut f, stream)?;
+        Ok(bytes)
     }
 }
 

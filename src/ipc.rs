@@ -205,6 +205,29 @@ pub enum IpcRequest {
         cell: String,
         nkr_name: String,
     },
+
+    // === Backups (v1.6.9+, sprint 2026-05-18) ===
+    /// Dispara la creación de un backup (asíncrono). Genera un job_id y lanza
+    /// `/usr/local/bin/nkr-backup` en background. El daemon escribe el job
+    /// state en `/mnt/nkr/backups/.jobs/<job_id>.json`. El panel pollea
+    /// `GetBackupStatus` hasta status ∈ {ready, failed}.
+    CreateBackup {
+        cell: String,
+        nkr_name: String,
+        format: String,  // "odoo" | "nkr" | "both"
+    },
+    /// Lee el status file de un backup job. Devuelve JSON con el estado +
+    /// path del archivo final cuando ready.
+    GetBackupStatus {
+        job_id: String,
+    },
+    /// Devuelve la info necesaria para que `nkr-api-server` haga streaming
+    /// directo del archivo binario al socket TCP. NO devuelve el contenido
+    /// del archivo (sería muchos GB sobre IPC).
+    GetBackupFile {
+        job_id: String,
+        format: String, // "odoo" (default) | "nkr"
+    },
 }
 
 /// HTTP-shaped response. `body` is always valid UTF-8 (JSON or Prometheus text).

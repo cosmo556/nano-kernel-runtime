@@ -264,5 +264,13 @@ fn dispatch(req: IpcRequest) -> IpcResponse {
         IpcRequest::Sso { nkr_name, user } => api::handle_sso(&nkr_name, &user),
         IpcRequest::GetEnterpriseStatus { cell } => api::handle_enterprise_status(&cell),
         IpcRequest::GetCreateStatus { cell, nkr_name } => api::handle_create_status(&cell, &nkr_name),
+        IpcRequest::CreateBackup { cell, nkr_name, format } => {
+            let body = format!(r#"{{"format":"{}"}}"#, format);
+            api::handle_create_backup(&cell, &nkr_name, &body)
+        }
+        IpcRequest::GetBackupStatus { job_id } => api::handle_backup_status(&job_id),
+        IpcRequest::GetBackupFile { job_id, format } => {
+            api::handle_backup_file_meta(&job_id, &format)
+        }
     }
 }

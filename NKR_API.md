@@ -2417,6 +2417,156 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ---
 
+### 4.20 Backups — `POST /backup` + `GET /backups/{id}/status` + `GET /backups/{id}/download`
+
+Genera y entrega backups de tenants on-demand. **Diseñado para que el panel solicite y proxee la descarga al usuario final sin exponer el hostname de NKR** (ver `NKR_Backup_Panel_Integration.md` para el flujo completo del panel).
+
+**Formatos disponibles:**
+- `odoo` — ZIP estándar Odoo (`dump.sql` + `filestore/` + `manifest.json`). Restorable en cualquier Odoo del mundo vía `/web/database/restore`. **Único formato que el panel debe usar en esta etapa.**
+- `nkr` — interno NKR (`tar.zst` + `pg_dump -Fc` + meta). Para respawn rápido cross-cell vía `nkr-restore-nkr`. **Disponible vía API pero no usado por el panel.**
+- `both` — genera ambos formatos.
+
+#### 4.20.1 `POST /api/v1/cells/{cell}/instances/{nkr_name}/backup` — Iniciar backup
+
+**Asíncrono.** Despacha el backup en background y devuelve `job_id` al toque.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
+  -d '{"format":"odoo"}' \
+  "http://nkr:9090/api/v1/cells/odoo-v19/instances/odoo-v19-intech-devp/backup"
+```
+
+**Body (todos opcionales):**
+```json
+{
+  "format": "odoo"            // "odoo" (default panel) | "nkr" | "both"
+}
+```
+
+**Respuesta 202:**
+```json
+{
+  "job_id": "bkp_a1b2c3d4e5f6",
+  "status": "accepted",
+  "format": "odoo",
+  "poll": "/api/v1/backups/bkp_a1b2c3d4e5f6/status",
+  "download": "/api/v1/backups/bkp_a1b2c3d4e5f6/download"
+}
+```
+
+**Errores síncronos:**
+- `400 invalid_format` — el `format` no es `odoo|nkr|both`
+- `400 invalid_nkr_name` / `400 invalid_cell_name`
+- `404 instance_not_found`
+- `409 action_in_progress` — hay un delete/restart/backup en curso para esta instancia
+- `503 spawn_failed`
+
+#### 4.20.2 `GET /api/v1/backups/{job_id}/status` — Polling del job
+
+```bash
+curl -H "Authorization: Bearer $TOK" \
+  "http://nkr:9090/api/v1/backups/bkp_a1b2c3d4e5f6/status"
+```
+
+**Respuesta 200 — en curso:**
+```json
+{
+  "job_id": "bkp_a1b2c3d4e5f6",
+  "status": "in_progress",
+  "format": "odoo",
+  "tenant": "odoo-v19-intech-devp",
+  "cell": "odoo-v19",
+  "started_at": 1779065799
+}
+```
+
+**Respuesta 200 — completado:**
+```json
+{
+  "job_id": "bkp_a1b2c3d4e5f6",
+  "status": "ready",
+  "format": "odoo",
+  "tenant": "odoo-v19-intech-devp",
+  "cell": "odoo-v19",
+  "started_at": 1779065799,
+  "finished_at": 1779065805,
+  "elapsed_ms": 6000,
+  "size_bytes": 25500000,
+  "filename": "db-odoo-v19-intech-devp-2026-05-18-1430.zip",
+  "sha256": "abc123def456..."
+}
+```
+
+**Respuesta 200 — falló:**
+```json
+{
+  "job_id": "bkp_a1b2c3d4e5f6",
+  "status": "failed",
+  "error": "pg_dump_failed",
+  "message": "could not connect to PG"
+}
+```
+
+**Errores:**
+- `404 job_not_found` — el job_id no existe (típico tras cleanup 1 AM, o id inventado)
+
+**Polling sugerido:** cada 2 s. Backups pequeños (~80 MB) terminan en <10 s; backups de prod (1-5 GB) tardan 1-5 min.
+
+#### 4.20.3 `GET /api/v1/backups/{job_id}/download` — Descargar el archivo
+
+**Streaming directo del archivo binario** (`application/zip` o `application/octet-stream`). NO carga el archivo a RAM en el api-server — usa `io::copy` del FS al socket TCP.
+
+```bash
+curl -H "Authorization: Bearer $TOK" -o backup.zip \
+  "http://nkr:9090/api/v1/backups/bkp_a1b2c3d4e5f6/download"
+```
+
+**Respuesta 200 (streaming):**
+```
+HTTP/1.1 200 OK
+Content-Type: application/zip
+Content-Length: 25500000
+Content-Disposition: attachment; filename="db-odoo-v19-intech-devp-2026-05-18-1430.zip"
+X-NKR-Backup-Sha256: abc123def456...
+X-NKR-Backup-Format: odoo
+
+<bytes ZIP del archivo>
+```
+
+**Errores:**
+- `404 job_not_found` — id inventado o ya cleanup
+- `409 not_ready` — status aún `in_progress` → poll antes
+- `409 failed` — el backup falló, no hay archivo que servir
+- `500 file_disappeared` — el archivo existía en el job pero fue borrado entre el status y el download (race con cleanup 1 AM)
+
+**Para `format=both`:** el endpoint sirve el formato `odoo` por default (el ZIP). Para descargar el formato `nkr` con un `job_id` que generó both, usar `?format=nkr` en la query string.
+
+#### 4.20.4 Diferencia entre `backup_nkr` y `backup_odoo` (para el panel)
+
+| Aspecto | `backup_odoo` (PANEL) | `backup_nkr` (operador NKR, no panel) |
+|---|---|---|
+| Para qué | Entregar al cliente, restorable en CUALQUIER Odoo | Respawn rápido dentro de NKR, cross-cell |
+| Formato | ZIP (Odoo `/web/database/backup` standard) | tar.zst + pg_dump -Fc + meta |
+| Restore | UI Odoo `/web/database/restore` | CLI `nkr-restore-nkr` (solo operador) |
+| Tamaño típico | ~24 MB (intech-devp 77MB DB) | ~57 MB (incluye addons + pylibs) |
+| Tiempo de generación | ~4 s | ~2 s |
+| ¿Panel descarga? | **SÍ** | **NO en esta etapa** (disponible via API pero no integrado al panel) |
+
+#### 4.20.5 Retention
+
+**1 día**. Cron `nkr-backup-cleanup` (1 AM) borra TODO en `/mnt/nkr/backups/`. El panel debe:
+- Generar y descargar dentro de las 24 h.
+- NO confiar en que un `job_id` exista después del cleanup.
+- Para retención long-term, el panel guarda el ZIP descargado en su propia infraestructura.
+
+#### 4.20.6 Concurrencia
+
+- Un solo backup en curso por tenant (lock vía InstanceLock, mismo que delete/restart).
+- Si el operador llama `nkr-backup` por CLI mientras el panel hace `POST /backup` → el segundo recibe `409 action_in_progress`.
+- Backups concurrentes entre tenants distintos: permitido. Solo limitado por carga de PG (recomendado ≤4 concurrentes).
+
+---
+
 ## 5. Layout por instancia
 
 Cada instancia vive en:

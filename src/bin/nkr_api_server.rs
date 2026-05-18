@@ -50,7 +50,7 @@ use std::time::Duration;
 use api_http::{
     check_auth, is_safe_addons_path, is_safe_dns, is_safe_git_ref, is_safe_git_url,
     is_safe_identifier, parse_headers, parse_request_line, query_get, read_request,
-    HttpResponse, GIT_BODY_LIMIT, PYLIBS_BODY_LIMIT,
+    BodyFile, HttpResponse, GIT_BODY_LIMIT, PYLIBS_BODY_LIMIT,
 };
 use ipc::{IpcRequest, IpcResponse};
 
@@ -155,7 +155,16 @@ fn main() {
             let parsed_headers = parse_headers(&headers);
 
             let resp = route(method, path, query, &parsed_headers, &body);
-            let _ = stream.write_all(resp.to_wire().as_bytes());
+            // Streaming path: si la response tiene body_file (típico: backup
+            // download), usar write_streamed_to para no cargar el archivo entero
+            // a RAM del api-server. Sino, path normal con to_wire().
+            if resp.body_file.is_some() {
+                if let Err(e) = resp.write_streamed_to(&mut stream) {
+                    eprintln!("[NKR-API-SERVER] streaming write error: {}", e);
+                }
+            } else {
+                let _ = stream.write_all(resp.to_wire().as_bytes());
+            }
         });
     }
 }
@@ -331,6 +340,98 @@ fn route(
                 nkr_name: (*name).to_string(),
                 user,
             }))
+        }
+
+        // === Backups (v1.6.9+, sprint 2026-05-18) ===
+        ("POST", ["api", "v1", "cells", cell, "instances", name, "backup"]) => {
+            if !is_safe_identifier(cell) {
+                return HttpResponse::error(400, "invalid_cell_name", None);
+            }
+            if !is_safe_identifier(name) {
+                return HttpResponse::error(400, "invalid_nkr_name", None);
+            }
+            let mut format = "odoo".to_string();
+            if !body.is_empty() {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+                    if let Some(f) = v.get("format").and_then(|x| x.as_str()) {
+                        format = f.to_string();
+                    }
+                }
+            }
+            ipc_to_http(ipc_call(&IpcRequest::CreateBackup {
+                cell: (*cell).to_string(),
+                nkr_name: (*name).to_string(),
+                format,
+            }))
+        }
+
+        ("GET", ["api", "v1", "backups", job_id, "status"]) => {
+            // Validar job_id formato bkp_<12hex>
+            if job_id.len() != 16 || !job_id.starts_with("bkp_")
+                || !job_id[4..].chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return HttpResponse::error(400, "invalid_job_id", None);
+            }
+            ipc_to_http(ipc_call(&IpcRequest::GetBackupStatus {
+                job_id: (*job_id).to_string(),
+            }))
+        }
+
+        ("GET", ["api", "v1", "backups", job_id, "download"]) => {
+            if job_id.len() != 16 || !job_id.starts_with("bkp_")
+                || !job_id[4..].chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return HttpResponse::error(400, "invalid_job_id", None);
+            }
+            // Format opcional via query (?format=odoo|nkr). Default: odoo.
+            let mut format = "odoo".to_string();
+            for pair in query.split('&').filter(|s| !s.is_empty()) {
+                if let Some(v) = pair.strip_prefix("format=") {
+                    format = v.to_string();
+                }
+            }
+            // 1. Pedir al daemon el path + metadata
+            let meta_resp = ipc_call(&IpcRequest::GetBackupFile {
+                job_id: (*job_id).to_string(),
+                format: format.clone(),
+            });
+            let meta = match meta_resp {
+                Ok(r) if r.status == 200 => r,
+                Ok(r) => return ipc_to_http(Ok(r)),
+                Err(e) => return ipc_to_http(Err(e)),
+            };
+            // 2. Parsear el JSON con el path + abrir streaming response
+            let v: serde_json::Value = match serde_json::from_str(&meta.body) {
+                Ok(v) => v,
+                Err(_) => return HttpResponse::error(500, "meta_parse_failed", None),
+            };
+            let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("");
+            let filename = v.get("filename").and_then(|x| x.as_str()).unwrap_or("backup.bin");
+            let size = v.get("size_bytes").and_then(|x| x.as_u64()).unwrap_or(0);
+            let content_type = v.get("content_type").and_then(|x| x.as_str())
+                .unwrap_or("application/octet-stream");
+            let sha256 = v.get("sha256").and_then(|x| x.as_str()).unwrap_or("");
+            // 3. Verify el archivo existe + es legible por nkr-api
+            let pathbuf = std::path::PathBuf::from(path);
+            if !pathbuf.exists() {
+                return HttpResponse::error(500, "file_disappeared",
+                    Some("file was reported ready but no longer exists on disk"));
+            }
+            // 4. Devolver HttpResponse con body_file → streaming
+            HttpResponse {
+                status: 200,
+                body: String::new(),
+                content_type: content_type.to_string(),
+                extra_headers: vec![
+                    ("X-NKR-Backup-Sha256".to_string(), sha256.to_string()),
+                    ("X-NKR-Backup-Format".to_string(), format),
+                ],
+                body_file: Some(BodyFile {
+                    path: pathbuf,
+                    size_bytes: size,
+                    filename: filename.to_string(),
+                }),
+            }
         }
 
         ("GET", ["api", "v1", "cells", _cell, "instances", name, "diag"]) |
@@ -732,6 +833,7 @@ fn ipc_to_http(res: Result<IpcResponse, std::io::Error>) -> HttpResponse {
             body: r.body,
             content_type: r.content_type,
             extra_headers: Vec::new(),
+            body_file: None,
         },
         Err(e) => {
             eprintln!("[NKR-API-SERVER] IPC error: {}", e);
@@ -2325,6 +2427,7 @@ fn handle_logs_download(cell: &str, instance: &str) -> HttpResponse {
         body,
         content_type: "text/plain; charset=utf-8".to_string(),
         extra_headers: Vec::new(),
+        body_file: None,
     };
     resp.extra_headers.push((
         "Content-Disposition".into(),

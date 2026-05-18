@@ -4686,6 +4686,408 @@ fn walk_size(path: &std::path::Path) -> u64 {
     total
 }
 
+// =============================================================================
+// Backups (v1.6.9+, sprint 2026-05-18)
+// =============================================================================
+//
+// 3 handlers expuestos al panel vía HTTP:
+//   - POST /api/v1/cells/{cell}/instances/{name}/backup  → handle_create_backup
+//   - GET  /api/v1/backups/{job_id}/status               → handle_backup_status
+//   - GET  /api/v1/backups/{job_id}/download             → handle_backup_file (returns path)
+//
+// El download usa `body_file` de HttpResponse (streaming directo del FS al TCP
+// socket, NO carga el archivo a RAM). Ver `nkr_api_server.rs::route_*`.
+// =============================================================================
+
+const BACKUPS_ROOT: &str = "/mnt/nkr/backups";
+const BACKUPS_JOBS_DIR: &str = "/mnt/nkr/backups/.jobs";
+
+/// Genera un job_id estable y URL-safe.
+fn gen_backup_job_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    // Hash determinístico para evitar requerir el crate `rand`. 12 hex chars
+    // = 48 bits de entropía, suficiente con TTL de 24h (no es secret).
+    let pid = std::process::id() as u128;
+    let mix = now.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(pid);
+    format!("bkp_{:012x}", mix & 0xffffffffffff)
+}
+
+pub fn handle_create_backup(cell: &str, nkr_name: &str, body_json: &str) -> IpcResponse {
+    if !is_safe_identifier(cell) {
+        return IpcResponse::error(400, "invalid_cell_name", None);
+    }
+    if !is_safe_identifier(nkr_name) {
+        return IpcResponse::error(400, "invalid_nkr_name", None);
+    }
+
+    // Parse body (format)
+    let format = if body_json.trim().is_empty() {
+        "odoo".to_string()
+    } else {
+        let v: serde_json::Value = match serde_json::from_str(body_json) {
+            Ok(v) => v,
+            Err(_) => return IpcResponse::error(400, "invalid_json", None),
+        };
+        v.get("format").and_then(|x| x.as_str()).unwrap_or("odoo").to_string()
+    };
+    if !matches!(format.as_str(), "odoo" | "nkr" | "both") {
+        return IpcResponse::error(400, "invalid_format",
+            Some("format must be 'odoo', 'nkr', or 'both'"));
+    }
+
+    // Validar que el tenant existe
+    if crate::cell::find_cell_by_nkr_name(nkr_name).is_none() {
+        return IpcResponse::error(404, "instance_not_found", None);
+    }
+
+    // Reservar slot in-flight (compartido con delete/restart/backup)
+    {
+        let mut set = match inflight_actions().lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        if set.contains(nkr_name) {
+            return IpcResponse::json(409, serde_json::json!({
+                "error": "action_in_progress",
+                "nkr_name": nkr_name,
+                "message": "ya hay un start/stop/restart/delete/backup en curso para esta instancia",
+            }));
+        }
+        set.insert(nkr_name.to_string());
+    }
+
+    // Crear job_id + status file
+    let job_id = gen_backup_job_id();
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+
+    let _ = std::fs::create_dir_all(BACKUPS_JOBS_DIR);
+
+    let job_file = format!("{}/{}.json", BACKUPS_JOBS_DIR, job_id);
+    let initial_status = serde_json::json!({
+        "job_id": job_id,
+        "status": "in_progress",
+        "format": format,
+        "tenant": nkr_name,
+        "cell": cell,
+        "started_at": started_at,
+    });
+    if let Err(e) = std::fs::write(&job_file, initial_status.to_string()) {
+        // Release in-flight slot
+        if let Ok(mut s) = inflight_actions().lock() { s.remove(nkr_name); }
+        return IpcResponse::error(500, "job_file_create_failed", Some(&e.to_string()));
+    }
+    // chmod 0640 + group nkr-api para que el api-server lo lea
+    let _ = chmod_644_chgrp_nkr_api(&job_file);
+
+    // Despachar background thread que corre el script y actualiza el job file
+    let job_id_owned = job_id.clone();
+    let nkr_name_owned = nkr_name.to_string();
+    let format_owned = format.clone();
+    let job_file_owned = job_file.clone();
+
+    let spawn = std::thread::Builder::new()
+        .name(format!("nkr-backup-{}", job_id))
+        .spawn(move || {
+            let _guard = InflightActionGuard(nkr_name_owned.clone());
+            run_backup_and_update_job(&nkr_name_owned, &format_owned, &job_id_owned, &job_file_owned);
+        });
+
+    if let Err(e) = spawn {
+        if let Ok(mut s) = inflight_actions().lock() { s.remove(nkr_name); }
+        let _ = std::fs::remove_file(&job_file);
+        return IpcResponse::error(503, "spawn_failed", Some(&e.to_string()));
+    }
+
+    IpcResponse::json(202, serde_json::json!({
+        "job_id": job_id,
+        "status": "accepted",
+        "format": format,
+        "poll": format!("/api/v1/backups/{}/status", job_id),
+        "download": format!("/api/v1/backups/{}/download", job_id),
+    }))
+}
+
+/// Permisos uniformes en los archivos del backup: root:nkr-api 0640.
+/// El api-server corre como nkr-api group y necesita leer pero no escribir.
+fn chmod_644_chgrp_nkr_api(path: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)?;
+    let mut perm = meta.permissions();
+    perm.set_mode(0o640);
+    std::fs::set_permissions(path, perm)?;
+    // chgrp nkr-api
+    let gid = unsafe {
+        let cname = std::ffi::CString::new("nkr-api").unwrap();
+        let grp = libc::getgrnam(cname.as_ptr());
+        if grp.is_null() { return Ok(()); } // sin group nkr-api, omitimos
+        (*grp).gr_gid
+    };
+    let cpath = std::ffi::CString::new(path).map_err(|_|
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has NUL"))?;
+    let ret = unsafe { libc::chown(cpath.as_ptr(), u32::MAX, gid) }; // u32::MAX = -1 = keep owner
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Ejecuta `/usr/local/bin/nkr-backup` con el formato correcto. Cuando termina,
+/// actualiza el job file con `status=ready` + size_bytes + path del archivo.
+/// Si falla, actualiza con `status=failed` + error.
+fn run_backup_and_update_job(nkr_name: &str, format: &str, job_id: &str, job_file: &str) {
+    let started = std::time::Instant::now();
+    let mut cmd = std::process::Command::new("/usr/local/bin/nkr-backup");
+    cmd.arg(nkr_name);
+    match format {
+        "odoo" => { cmd.arg("--odoo-only"); }
+        "nkr"  => { cmd.arg("--nkr-only"); }
+        _ => {} // "both" — sin flag
+    }
+
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            update_job_failed(job_file, "spawn_failed", &e.to_string());
+            return;
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let msg = format!("nkr-backup exit {}: stderr={} stdout={}",
+            output.status, stderr, stdout);
+        update_job_failed(job_file, "backup_script_failed", &msg);
+        return;
+    }
+
+    // Parse stdout para encontrar el path final (el script imprime
+    // "✅ Backup completado: /mnt/nkr/backups/<tenant>/<ts>")
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let backup_dir = stdout.lines()
+        .find(|l| l.contains("✅ Backup completado:"))
+        .and_then(|l| l.split(':').nth(1))
+        .map(|s| s.trim().to_string());
+
+    let backup_dir = match backup_dir {
+        Some(d) => d,
+        None => {
+            update_job_failed(job_file, "output_parse_failed",
+                "no pude parsear el path del backup completado del stdout");
+            return;
+        }
+    };
+
+    // Encontrar los archivos finales según el formato
+    let mut files: Vec<(String, String, u64)> = Vec::new(); // (format, path, size)
+    if format == "odoo" || format == "both" {
+        // backup_dir/odoo/*.zip
+        let odoo_dir = format!("{}/odoo", backup_dir);
+        if let Ok(entries) = std::fs::read_dir(&odoo_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map(|e| e == "zip").unwrap_or(false) {
+                    if let Ok(meta) = entry.metadata() {
+                        let _ = chmod_644_chgrp_nkr_api(&path.to_string_lossy());
+                        files.push(("odoo".to_string(),
+                                    path.to_string_lossy().to_string(),
+                                    meta.len()));
+                    }
+                }
+            }
+        }
+    }
+    if format == "nkr" || format == "both" {
+        // backup_dir/nkr/ es un dir, no un archivo. Para download lo serializamos
+        // como tar al vuelo? No, mejor: el download del formato nkr devuelve un tar
+        // que el operador crea aparte. En esta etapa el panel no lo usa.
+        // Por ahora exponemos el path del DIR para el panel CLI/manual.
+        let nkr_dir = format!("{}/nkr", backup_dir);
+        if std::path::Path::new(&nkr_dir).is_dir() {
+            // chmod 0640 + chgrp en cada archivo del dir
+            if let Ok(entries) = std::fs::read_dir(&nkr_dir) {
+                for entry in entries.flatten() {
+                    let _ = chmod_644_chgrp_nkr_api(&entry.path().to_string_lossy());
+                }
+            }
+            files.push(("nkr".to_string(), nkr_dir, 0));
+        }
+    }
+
+    if files.is_empty() {
+        update_job_failed(job_file, "no_output_files",
+            "el script terminó OK pero no encontré archivos en el output dir");
+        return;
+    }
+
+    // Calcular sha256 + size del file principal (el "odoo" si existe, sino el "nkr")
+    let primary = files.iter().find(|(f, _, _)| f == "odoo")
+        .or_else(|| files.iter().find(|(f, _, _)| f == "nkr"))
+        .cloned()
+        .unwrap_or_else(|| files[0].clone());
+
+    let sha256 = compute_file_sha256(&primary.1).unwrap_or_default();
+    let filename = std::path::Path::new(&primary.1)
+        .file_name().map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let finished_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+
+    let status = serde_json::json!({
+        "job_id": job_id,
+        "status": "ready",
+        "format": format,
+        "tenant": nkr_name,
+        "started_at": finished_at - started.elapsed().as_secs(),
+        "finished_at": finished_at,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+        "size_bytes": primary.2,
+        "filename": filename,
+        "sha256": sha256,
+        // Mapping de formato → path (para que el handle_backup_file lo use)
+        "files": files.iter().map(|(f, p, s)| serde_json::json!({
+            "format": f, "path": p, "size_bytes": s,
+        })).collect::<Vec<_>>(),
+    });
+    let _ = std::fs::write(job_file, status.to_string());
+    let _ = chmod_644_chgrp_nkr_api(job_file);
+    eprintln!("[NKR-BACKUP] ✅ job {} completed in {:.1}s ({} bytes)",
+        job_id, started.elapsed().as_secs_f32(), primary.2);
+}
+
+fn update_job_failed(job_file: &str, error: &str, message: &str) {
+    eprintln!("[NKR-BACKUP] ❌ job failed: {} — {}", error, message);
+    // Conservar lo que ya estaba y agregar el error
+    let existing = std::fs::read_to_string(job_file).ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mut v = existing;
+    v["status"] = serde_json::Value::String("failed".to_string());
+    v["error"] = serde_json::Value::String(error.to_string());
+    v["message"] = serde_json::Value::String(message.to_string());
+    v["finished_at"] = serde_json::json!(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0));
+    let _ = std::fs::write(job_file, v.to_string());
+    let _ = chmod_644_chgrp_nkr_api(job_file);
+}
+
+fn compute_file_sha256(path: &str) -> Option<String> {
+    use sha2::{Sha256, Digest};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+pub fn handle_backup_status(job_id: &str) -> IpcResponse {
+    if !is_safe_backup_job_id(job_id) {
+        return IpcResponse::error(400, "invalid_job_id", None);
+    }
+    let job_file = format!("{}/{}.json", BACKUPS_JOBS_DIR, job_id);
+    match std::fs::read_to_string(&job_file) {
+        Ok(content) => {
+            // Devolver tal cual (ya es JSON)
+            IpcResponse {
+                status: 200,
+                content_type: "application/json".to_string(),
+                body: content,
+            }
+        }
+        Err(_) => IpcResponse::error(404, "job_not_found",
+            Some("job_id no existe — puede haber sido limpiado por el cron 1 AM")),
+    }
+}
+
+/// Devuelve metadata necesaria para que el api-server haga streaming directo
+/// del archivo. Body contiene: path, filename, size_bytes, content_type, sha256.
+pub fn handle_backup_file_meta(job_id: &str, format: &str) -> IpcResponse {
+    if !is_safe_backup_job_id(job_id) {
+        return IpcResponse::error(400, "invalid_job_id", None);
+    }
+    if !matches!(format, "odoo" | "nkr") {
+        return IpcResponse::error(400, "invalid_format",
+            Some("format must be 'odoo' or 'nkr'"));
+    }
+    let job_file = format!("{}/{}.json", BACKUPS_JOBS_DIR, job_id);
+    let content = match std::fs::read_to_string(&job_file) {
+        Ok(c) => c,
+        Err(_) => return IpcResponse::error(404, "job_not_found", None),
+    };
+    let v: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return IpcResponse::error(500, "job_file_corrupted", None),
+    };
+    let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    if status == "in_progress" {
+        return IpcResponse::json(409, serde_json::json!({
+            "error": "not_ready",
+            "message": "backup still in progress — poll /status until ready",
+        }));
+    }
+    if status == "failed" {
+        return IpcResponse::json(409, serde_json::json!({
+            "error": "failed",
+            "message": v.get("message").and_then(|m| m.as_str()).unwrap_or("unknown"),
+        }));
+    }
+    if status != "ready" {
+        return IpcResponse::error(500, "unknown_status", Some(status));
+    }
+
+    // Buscar el file del formato solicitado
+    let files = v.get("files").and_then(|f| f.as_array());
+    let target = match files {
+        Some(arr) => arr.iter().find(|f|
+            f.get("format").and_then(|s| s.as_str()) == Some(format)),
+        None => None,
+    };
+    let target = match target {
+        Some(t) => t,
+        None => return IpcResponse::error(404, "format_not_available",
+            Some(&format!("formato '{}' no fue generado en este backup", format))),
+    };
+    let path = target.get("path").and_then(|s| s.as_str()).unwrap_or("");
+    let size = target.get("size_bytes").and_then(|s| s.as_u64()).unwrap_or(0);
+    if path.is_empty() || !std::path::Path::new(path).exists() {
+        return IpcResponse::error(500, "file_disappeared",
+            Some("el archivo existió en el job pero ya no está (race con cleanup?)"));
+    }
+
+    let filename = std::path::Path::new(path)
+        .file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let content_type = if path.ends_with(".zip") {
+        "application/zip"
+    } else {
+        "application/octet-stream"
+    };
+
+    IpcResponse::json(200, serde_json::json!({
+        "path": path,
+        "filename": filename,
+        "size_bytes": size,
+        "content_type": content_type,
+        "sha256": v.get("sha256").and_then(|s| s.as_str()).unwrap_or(""),
+        "format": format,
+    }))
+}
+
+fn is_safe_backup_job_id(s: &str) -> bool {
+    // bkp_<12 hex chars>
+    s.len() == 16 && s.starts_with("bkp_") && s[4..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
