@@ -2417,16 +2417,16 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ---
 
-### 4.20 Backups — `POST /backup` + `GET /backups/{id}/status` + `GET /backups/{id}/download`
+### 4.21 Backups — `POST /backup` + `GET /backups/{id}/status` + `GET /backups/{id}/download`
 
-Genera y entrega backups de tenants on-demand. **Diseñado para que el panel solicite y proxee la descarga al usuario final sin exponer el hostname de NKR** (ver `NKR_Backup_Panel_Integration.md` para el flujo completo del panel).
+Genera y entrega backups de tenants on-demand. **Diseñado para que el panel solicite y proxee la descarga al usuario final sin exponer el hostname de NKR.** El flujo completo del panel + pseudocódigo + decisiones de seguridad están en §4.21.7+.
 
 **Formatos disponibles:**
 - `odoo` — ZIP estándar Odoo (`dump.sql` + `filestore/` + `manifest.json`). Restorable en cualquier Odoo del mundo vía `/web/database/restore`. **Único formato que el panel debe usar en esta etapa.**
 - `nkr` — interno NKR (`tar.zst` + `pg_dump -Fc` + meta). Para respawn rápido cross-cell vía `nkr-restore-nkr`. **Disponible vía API pero no usado por el panel.**
 - `both` — genera ambos formatos.
 
-#### 4.20.1 `POST /api/v1/cells/{cell}/instances/{nkr_name}/backup` — Iniciar backup
+#### 4.21.1 `POST /api/v1/cells/{cell}/instances/{nkr_name}/backup` — Iniciar backup
 
 **Asíncrono.** Despacha el backup en background y devuelve `job_id` al toque.
 
@@ -2461,7 +2461,7 @@ curl -X POST -H "Authorization: Bearer $TOK" -H "Content-Type: application/json"
 - `409 action_in_progress` — hay un delete/restart/backup en curso para esta instancia
 - `503 spawn_failed`
 
-#### 4.20.2 `GET /api/v1/backups/{job_id}/status` — Polling del job
+#### 4.21.2 `GET /api/v1/backups/{job_id}/status` — Polling del job
 
 ```bash
 curl -H "Authorization: Bearer $TOK" \
@@ -2512,7 +2512,7 @@ curl -H "Authorization: Bearer $TOK" \
 
 **Polling sugerido:** cada 2 s. Backups pequeños (~80 MB) terminan en <10 s; backups de prod (1-5 GB) tardan 1-5 min.
 
-#### 4.20.3 `GET /api/v1/backups/{job_id}/download` — Descargar el archivo
+#### 4.21.3 `GET /api/v1/backups/{job_id}/download` — Descargar el archivo
 
 **Streaming directo del archivo binario** (`application/zip` o `application/octet-stream`). NO carga el archivo a RAM en el api-server — usa `io::copy` del FS al socket TCP.
 
@@ -2541,7 +2541,7 @@ X-NKR-Backup-Format: odoo
 
 **Para `format=both`:** el endpoint sirve el formato `odoo` por default (el ZIP). Para descargar el formato `nkr` con un `job_id` que generó both, usar `?format=nkr` en la query string.
 
-#### 4.20.4 Diferencia entre `backup_nkr` y `backup_odoo` (para el panel)
+#### 4.21.4 Diferencia entre `backup_nkr` y `backup_odoo` (para el panel)
 
 | Aspecto | `backup_odoo` (PANEL) | `backup_nkr` (operador NKR, no panel) |
 |---|---|---|
@@ -2552,18 +2552,302 @@ X-NKR-Backup-Format: odoo
 | Tiempo de generación | ~4 s | ~2 s |
 | ¿Panel descarga? | **SÍ** | **NO en esta etapa** (disponible via API pero no integrado al panel) |
 
-#### 4.20.5 Retention
+#### 4.21.5 Retention
 
 **1 día**. Cron `nkr-backup-cleanup` (1 AM) borra TODO en `/mnt/nkr/backups/`. El panel debe:
 - Generar y descargar dentro de las 24 h.
 - NO confiar en que un `job_id` exista después del cleanup.
 - Para retención long-term, el panel guarda el ZIP descargado en su propia infraestructura.
 
-#### 4.20.6 Concurrencia
+#### 4.21.6 Concurrencia
 
 - Un solo backup en curso por tenant (lock vía InstanceLock, mismo que delete/restart).
 - Si el operador llama `nkr-backup` por CLI mientras el panel hace `POST /backup` → el segundo recibe `409 action_in_progress`.
 - Backups concurrentes entre tenants distintos: permitido. Solo limitado por carga de PG (recomendado ≤4 concurrentes).
+
+#### 4.21.7 Integración con el panel — arquitectura "panel-proxy de streaming"
+
+El panel **NO debe exponer las URLs de NKR al browser del usuario**. En su lugar, actúa como proxy de streaming: recibe la petición del user, llama a NKR server-side con su Bearer token, y re-streama los bytes al user. Resultado: el hostname/IP de NKR queda oculto, y el panel mantiene auth + audit completo.
+
+```
+┌──────────────┐                              ┌────────────────┐
+│   Usuario    │                              │ NKR backend    │
+│   (browser)  │                              │ (privado)      │
+└──────┬───────┘                              └────────┬───────┘
+       │                                               │
+       │ 1. clic "Descargar"                           │
+       ▼                                               │
+┌──────────────────────────────┐                       │
+│   Panel backend              │                       │
+│   - Verifica perms user      │                       │
+│   - Llama NKR (Bearer) ──────┼──── POST /backup ─────┤
+│                              │◄─── 202 {job_id} ─────┤
+│   - Polling cada 2s ─────────┼──── GET /status ──────┤
+│                              │◄─── ready ────────────┤
+│   - Streaming proxy ─────────┼──── GET /download ────┤
+│       (resp.body.pipe(res))  │     (stream bytes)    │
+│                              │◄══════════════════════│
+└──────┬───────────────────────┘                       │
+       │ stream bytes del ZIP                          │
+       ▼                                               │
+┌──────────────┐                                       │
+│   Usuario    │ ve solo URL del panel                 │
+│   descarga   │ (NKR invisible)                       │
+└──────────────┘                                       │
+```
+
+**Lo que el usuario ve**: `https://panel.systemouts.com/api/tenants/<id>/backup/download`.
+**Lo que el panel hace server-side**: auth con Bearer token NKR (NUNCA en el browser), streaming proxy con `pipe()`, audit log en su DB.
+
+#### 4.21.8 Pseudocódigo backend panel (Node.js + Express)
+
+```javascript
+const NKR_API   = process.env.NKR_API_URL;    // ej: http://10.0.0.1:9090
+const NKR_TOKEN = process.env.NKR_API_TOKEN;  // Bearer, server-side only
+
+async function fetchNKR(path, opts = {}) {
+    return fetch(`${NKR_API}${path}`, {
+        ...opts,
+        headers: {
+            ...opts.headers,
+            'Authorization': `Bearer ${NKR_TOKEN}`,
+            ...(opts.body && { 'Content-Type': 'application/json' }),
+        },
+    });
+}
+
+// 1. Trigger del backup (llamado por la UI al clic "Descargar")
+router.post('/api/tenants/:tenantId/backup/start', requireAuth, async (req, res) => {
+    const tenant = await db.tenants.findById(req.params.tenantId);
+    if (!tenant || !req.user.canDownloadBackup(tenant)) {
+        return res.status(403).json({ error: 'forbidden' });
+    }
+    const nkrResp = await fetchNKR(
+        `/api/v1/cells/${tenant.cell}/instances/${tenant.nkr_name}/backup`,
+        { method: 'POST', body: JSON.stringify({ format: 'odoo' }) }
+    );
+    if (!nkrResp.ok) return res.status(nkrResp.status).json(await nkrResp.json());
+    const { job_id } = await nkrResp.json();
+
+    // Guardar job en DB del panel (audit + UI state)
+    await db.backupJobs.create({
+        id: job_id, tenant_id: tenant.id, user_id: req.user.id,
+        status: 'in_progress', created_at: new Date(),
+    });
+    res.json({ job_id, panel_status_url: `/api/tenants/${tenant.id}/backup/${job_id}/status` });
+});
+
+// 2. Polling — la UI consulta este, NO el de NKR directo
+router.get('/api/tenants/:tenantId/backup/:jobId/status', requireAuth, async (req, res) => {
+    const tenant = await db.tenants.findById(req.params.tenantId);
+    if (!req.user.canDownloadBackup(tenant)) return res.status(403).json({ error: 'forbidden' });
+
+    const nkrResp = await fetchNKR(`/api/v1/backups/${req.params.jobId}/status`);
+    const body = await nkrResp.json();
+    await db.backupJobs.update(req.params.jobId, { status: body.status });
+
+    // Filtrar info sensible antes de devolver al frontend
+    res.json({
+        status: body.status,
+        size_bytes: body.size_bytes,
+        filename: body.filename,
+        // NO devolver paths internos ni job_id de NKR raw
+    });
+});
+
+// 3. Streaming proxy del download
+router.get('/api/tenants/:tenantId/backup/:jobId/download', requireAuth, async (req, res) => {
+    const tenant = await db.tenants.findById(req.params.tenantId);
+    if (!req.user.canDownloadBackup(tenant)) return res.status(403).json({ error: 'forbidden' });
+
+    const nkrResp = await fetchNKR(`/api/v1/backups/${req.params.jobId}/download`);
+    if (!nkrResp.ok) return res.status(nkrResp.status).json(await nkrResp.json());
+
+    // Forward headers seguros (NO Authorization)
+    res.setHeader('Content-Type', nkrResp.headers.get('content-type') || 'application/zip');
+    res.setHeader('Content-Length', nkrResp.headers.get('content-length'));
+    res.setHeader('Content-Disposition', nkrResp.headers.get('content-disposition'));
+
+    await db.backupJobs.update(req.params.jobId, { downloaded_at: new Date() });
+
+    nkrResp.body.pipe(res);  // streaming, NO buffer to RAM
+});
+```
+
+#### 4.21.9 Pseudocódigo frontend (Vue/React/Angular)
+
+```javascript
+async function downloadBackup(tenantId) {
+    // 1. Trigger
+    const startResp = await fetch(`/api/tenants/${tenantId}/backup/start`, {
+        method: 'POST', credentials: 'include',
+    });
+    if (!startResp.ok) { showError("No se pudo iniciar el backup"); return; }
+    const { job_id } = await startResp.json();
+
+    // 2. Polling con UI de progreso
+    showSpinner("Generando backup...");
+    let status;
+    do {
+        await new Promise(r => setTimeout(r, 2000));
+        const sresp = await fetch(`/api/tenants/${tenantId}/backup/${job_id}/status`, {
+            credentials: 'include',
+        });
+        status = await sresp.json();
+        updateSpinnerMessage(`Estado: ${status.status}`);
+    } while (status.status === 'in_progress');
+
+    if (status.status !== 'ready') {
+        showError(`Backup falló: ${status.error || 'unknown'}`);
+        return;
+    }
+
+    // 3. Warning si > 1 GB
+    const SIZE_WARN = 1024 * 1024 * 1024;
+    if (status.size_bytes > SIZE_WARN) {
+        const sizeGB = (status.size_bytes / 1024 / 1024 / 1024).toFixed(2);
+        const ok = await showModal({
+            title: 'Backup grande',
+            message: `Este backup pesa ${sizeGB} GB. La descarga puede tardar varios minutos. ¿Continuar?`,
+            buttons: ['Cancelar', 'Descargar igual'],
+        });
+        if (!ok) return;
+    }
+
+    // 4. Trigger descarga
+    hideSpinner();
+    window.location = `/api/tenants/${tenantId}/backup/${job_id}/download`;
+    // Alternativa con Blob (mejor UX para mostrar progress bar):
+    /*
+    const dlResp = await fetch(`/api/tenants/${tenantId}/backup/${job_id}/download`, {
+        credentials: 'include',
+    });
+    const blob = await dlResp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = status.filename; a.click();
+    URL.revokeObjectURL(url);
+    */
+}
+```
+
+#### 4.21.10 Decisiones de seguridad — qué hacer y qué NO
+
+✅ **Hacer**:
+- **Bearer token NKR server-side**. El frontend NUNCA llama NKR directo.
+- **Re-verify perms en CADA request** (start, status, download). Sin esto, un user con `job_id` ajeno bajaría backup de otro tenant.
+- **Audit log en la DB del panel** — quién bajó qué y cuándo.
+- **Streaming proxy** con `response.body.pipe(res)` (Node) o equivalente. No buffer a RAM.
+- **Mapping `job_id → tenant_id`** en la DB del panel; verificar en cada request.
+- **Mostrar progreso** durante el polling — backups prod tardan 1–5 min.
+
+❌ **NO hacer**:
+- **NO exponer endpoint NKR directo al browser**. Aunque requiere Bearer, el hostname leakea en DevTools.
+- **NO usar `res.redirect('http://nkr/...')`** — expone hostname.
+- **NO confiar en el `job_id` del frontend sin cross-check** contra la DB del panel.
+- **NO cachear backups en el panel** sin TTL explícito (NKR retiene 24 h, cachear más allá deja URLs muertas).
+- **NO incluir el Bearer NKR en Cookie/localStorage** del browser. Vive solo en env vars del backend.
+
+#### 4.21.11 Manejo de errores — qué hacer el panel en cada caso
+
+| Error de NKR | Status | Significado | Qué debe hacer el panel |
+|---|---|---|---|
+| `404 instance_not_found` | 404 | El tenant fue borrado | "tenant no existe", refrescar lista |
+| `409 action_in_progress` | 409 | Hay delete/restart/backup en curso | "operación en curso, reintenta en X seg" |
+| `400 invalid_format` | 400 | El panel mandó format != odoo (bug del panel) | Loggear bug — nunca debería pasar |
+| `503 spawn_failed` | 503 | NKR no pudo spawnear thread | Reintentar tras 5s, escalar si persiste |
+| `404 job_not_found` | 404 | Job cleanup (>24 h) o id inventado | "backup expirado, generar uno nuevo" |
+| `409 not_ready` (en /download) | 409 | User llegó al download antes de status=ready | Poll status hasta ready, reintentar |
+| `409 failed` | 409 | El backup falló al generarse | Mostrar `error`/`message` al operador panel |
+| `500 file_disappeared` | 500 | Race entre download y cleanup 1 AM | "backup expirado, generar nuevo" + alarma interna |
+
+#### 4.21.12 Performance esperada por tamaño de tenant
+
+Baseline medido con `intech-devp` (DB 77 MB, filestore 108 MB):
+
+| Fase | Tiempo |
+|---|---:|
+| `POST /backup` → 202 | <200 ms |
+| Polling (4× cada 2s) hasta `ready` | ~8 s |
+| `GET /download` headers (streaming start) | <100 ms |
+| Descarga real del ZIP (24 MB en LAN) | <2 s |
+| **Total UX usuario (clic → descarga completa)** | **~10–12 s** |
+
+Proyección por tipo:
+
+| Tenant | DB | Backup time | Download (LAN) | Total UX |
+|---|---:|---:|---:|---:|
+| dev (intech-devp) | 80 MB | ~6 s | ~2 s | **~10 s** |
+| staging | 1 GB | ~30 s | ~5 s | **~40 s** |
+| prod 1 año | 5 GB | ~2 min | ~30 s | **~2.5 min** |
+| prod 3 años | 15 GB | ~5 min | ~2 min | **~7 min** |
+
+Para backups prod grandes (5+ GB) el panel debe permitir cancelar el polling, mostrar progreso real (`size_bytes`), y mantener keep-alive del socket.
+
+#### 4.21.13 Warning UX 1 GB (recomendación)
+
+NKR **NO impone límite de tamaño** server-side. Pero el panel **debería mostrar warning** cuando `size_bytes > 1 GB`:
+
+```javascript
+const SIZE_WARN_THRESHOLD = 1024 * 1024 * 1024; // 1 GB
+if (status.size_bytes > SIZE_WARN_THRESHOLD) {
+    const sizeGB = (status.size_bytes / 1024 / 1024 / 1024).toFixed(2);
+    const confirm = await showModal({
+        title: 'Backup grande',
+        message: `Este backup pesa ${sizeGB} GB. ¿Continuar?`,
+    });
+    if (!confirm) return;
+}
+```
+
+No es hard limit — el user puede continuar si confirma. Solo evita downloads gigantes accidentales en mobile/cellular.
+
+**Si en el futuro se necesita hard limit server-side**: agregar env var `NKR_MAX_BACKUP_DOWNLOAD_BYTES` en NKR daemon → `413 Payload Too Large` con mensaje "use CLI access". No implementado hoy.
+
+#### 4.21.14 Por qué NO direct-link (link directo firmado)
+
+La primera opción analizada fue link directo HMAC-firmado tipo `https://nkr/backups/<id>?sig=...&exp=...`. Rechazada por 3 razones:
+
+1. **Hostname NKR visible en el browser** (URL bar, DevTools Network, clipboard si copia el link). Eso revela infra interna que NKR está diseñada para esconder.
+2. **URLs firmadas son reenviables dentro del TTL**. Aunque expiren en 30s, alguien con DevTools la copia y manda a otro. IP-locking rompe en mobile (NAT).
+3. **No hay audit en el panel**. Con links firmados, NKR ve la descarga pero el panel no — pierde el rastro.
+
+El proxy del panel cuesta un poco de bandwidth pero gana visibility completa.
+
+#### 4.21.15 Variantes futuras (no para esta etapa)
+
+**Subdomain reverse-proxy nginx**: si los backups crecen a 10+ GB y el bandwidth del panel se vuelve issue:
+
+```nginx
+# panel-edge config
+server {
+    listen 443 ssl;
+    server_name downloads.panel.systemouts.com;
+    location ~ ^/(?<jobid>bkp_[a-z0-9]+)/(?<token>[a-z0-9]+)$ {
+        # Pre-auth: validar HMAC del panel (lua/openresty)
+        proxy_pass http://nkr-backend/api/v1/backups/$jobid/download;
+        proxy_set_header Authorization "Bearer $NKR_TOKEN";
+        proxy_buffering off;
+    }
+}
+```
+
+User ve `downloads.panel.systemouts.com/bkp_xxx/abc123` y nginx reverse-proxea a NKR. Streaming sin pasar por el panel backend. Más complejo pero escalable.
+
+**Range requests para resumable downloads**: para 5+ GB en redes inestables. Requiere implementar `Content-Range` en NKR (no soportado hoy). v2 si hay queja real.
+
+#### 4.21.16 Checklist de implementación para el panel
+
+- [ ] Variables de entorno: `NKR_API_URL`, `NKR_API_TOKEN` (server-side only, NUNCA en frontend bundle)
+- [ ] 3 routes backend: `/start`, `/status`, `/download`
+- [ ] Auth middleware: verifica sesión user en cada uno
+- [ ] DB: tabla `backup_jobs` con `(id, tenant_id, user_id, status, created_at, downloaded_at)`
+- [ ] UI: spinner + estado del polling, mensaje "backup expira en 24h"
+- [ ] Warning 1 GB en frontend
+- [ ] Audit log: cada `start`/`status`/`download` con `user_id` + `tenant_id` + IP
+- [ ] Error handling: cubrir todos los códigos de §4.21.11
+- [ ] Streaming: `pipe()` o equivalente — NO buffer to RAM
+- [ ] Tests E2E con tenant dev, verificar ZIP válido (`unzip -t backup.zip`)
 
 ---
 
