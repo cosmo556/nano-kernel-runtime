@@ -1,0 +1,8 @@
+# =============================================================================
+# NKR Backup Cleanup — Retention = 1 día
+# =============================================================================
+# A la 1 AM borra TODO en /mnt/nkr/backups/.
+# El operador es responsable de transferir off-site antes de esta hora.
+# Ver NKR_Backup_Plan.md y MAINTENANCE.md §Backups.
+# =============================================================================
+0 1 * * * root /usr/local/bin/nkr-backup-cleanup >> /var/log/nkr-backup-cleanup.log 2>&1

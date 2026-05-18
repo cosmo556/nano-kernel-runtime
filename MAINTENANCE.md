@@ -597,7 +597,78 @@ curl -X POST "http://127.0.0.1:9090/api/v1/cells/<cell>/instances/<name>/reload"
 
 ---
 
-## 11. Contactos y artefactos
+## 11. Backups (on-demand, 1-day retention)
+
+Sistema operacional, no parte del daemon NKR. Scripts en `/usr/local/bin/`
+(versionados en `deploy/`).
+
+### Comandos del operador
+
+```bash
+# Crear backup on-demand (ambos formatos):
+nkr-backup odoo-v19-intech-devp
+# Output: /mnt/nkr/backups/<tenant>/<YYYY-MM-DD-HHMM>/{nkr,odoo}/
+
+# Solo formato interno NKR (más rápido, no para entregar):
+nkr-backup odoo-v19-intech-devp --nkr-only
+
+# Solo formato Odoo-standard (para entregar al panel/cliente):
+nkr-backup odoo-v19-intech-devp --odoo-only
+
+# Listar backups:
+nkr-backup-ls                          # todos
+nkr-backup-ls odoo-v19-intech-devp     # de un tenant
+
+# Borrar backup específico antes del cleanup automático:
+nkr-backup-rm odoo-v19-intech-devp/2026-05-18-1430
+nkr-backup-rm odoo-v19-intech-devp     # todos los del tenant
+
+# Restore backup_nkr (interno) — en cualquier cell de la misma versión:
+nkr-restore-nkr /mnt/nkr/backups/<tenant>/<ts>/nkr/                # in-place
+nkr-restore-nkr <backup> --as nuevo-nombre                         # con renombre
+nkr-restore-nkr <backup> --as nombre --to-cell odoo-v19-otra       # cross-cell
+nkr-restore-nkr <backup> --force                                   # overwrite
+
+# Restore backup_odoo (estándar) — usar UI nativa de Odoo:
+# /web/database/restore en cualquier Odoo de la versión correspondiente.
+```
+
+### Retention
+
+**1 día**. Cron `/etc/cron.d/nkr-backup-cleanup` ejecuta `/usr/local/bin/nkr-backup-cleanup`
+a la **1 AM** borrando TODO en `/mnt/nkr/backups/`. El operador es responsable de
+transferir los backups off-site (rsync/rclone/scp) antes de esa hora si los necesita.
+
+NKR es solo **staging temporal** — el sistema de retención long-term lo maneja un
+proceso externo fuera del scope de NKR.
+
+### Dos formatos distintos
+
+1. **`backup_nkr`** — interno, eficiente, NKR-specific. Para respawn rápido
+   dentro de NKR. Restorable en cualquier cell de la misma versión.
+2. **`backup_odoo`** — ZIP estándar Odoo (dump.sql + filestore + manifest.json).
+   Para entregar al cliente o panel. Restorable en cualquier Odoo del mundo
+   (no requiere NKR) vía `/web/database/restore`.
+
+### Tiempos de referencia (medido con `intech-devp`: DB 77 MB, filestore 108 MB)
+
+| Operación | Tiempo | Output |
+|---|---:|---:|
+| `nkr-backup` (ambos formatos) | ~6 s | ~80 MB total (nkr=57M, odoo=24M) |
+| `nkr-backup --nkr-only` | ~2 s | ~57 MB |
+| `nkr-backup --odoo-only` | ~4 s | ~24 MB |
+| `nkr-restore-nkr` E2E | ~47 s | (create + pg_restore + boot) |
+
+Para tenants prod con datos reales (1-5 GB DB), escala lineal: ~2–8 min backup,
+~5–15 min restore.
+
+### Doc completa
+
+`NKR_Backup_Plan.md` — diseño, decisiones, edge cases, riesgos.
+
+---
+
+## 12. Contactos y artefactos
 
 | Recurso                        | Ubicación                                                  |
 |--------------------------------|------------------------------------------------------------|
