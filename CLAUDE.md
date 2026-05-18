@@ -23,6 +23,7 @@ Eres un ingeniero de infraestructura harto de la abstracción innecesaria. Odias
 ### 2. Integridad de Almacenamiento (Anti-Corrupción)
 - **Btrfs CoW vs DB:** Cualquier archivo `.ext4` de base de datos que no tenga `chattr +C` (NoCoW) desde su nacimiento es basura fragmentada.
 - **Master Inmutable:** El rootfs maestro vive con `chattr +i`. `nkr build` gestiona el ciclo `chattr -i -> build -> chattr +i`.
+- **Symlink al master (extendido a pg/pgb, 2026-05-18):** los rootfs per-cell de pg y pgbouncer (`cells/<cell>/{postgres,pgbouncer}-root.ext4`) son **symlinks al master** (`/mnt/nkr/images/{postgres,pgbouncer}.ext4`), igual que los tenants Odoo desde commit `ab4c92f`. Validado: el rootfs NO se escribe en runtime (PG datadir vive en share separado `pg/data.ext4`, pgb config viene del override share, logs van a `/var/log/postgresql` que también es share). DAX + symlink → page cache del rootfs compartido físicamente entre v17 y v19. Ahorro real medido: ~400 MB RSS (de 760 MB → 363 MB para las 4 infra VMs) + 914 MB en disco. Backups conservados como `*.pre-symlink-bak` por si hace falta rollback (`rm symlink + mv backup → restart`).
 
 ### 3. El Hachazo de Procesos (Runtime)
 - **10s para SIGTERM:** Cortesía máxima para morir. Si no muere, **SIGKILL**. El tiempo de arranque neto debe ser <15s.
